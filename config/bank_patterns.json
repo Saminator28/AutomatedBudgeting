@@ -1,0 +1,26 @@
+{
+  "comment": "Add your bank or credit card patterns here. The key is what to search for in the PDF header (case-insensitive), and the value is what will appear in your CSV.",
+  "patterns": {
+    "CHASE": "Chase",
+    "BANK OF AMERICA": "Bank of America",
+    "WELLS FARGO": "Wells Fargo",
+    "DISCOVER": "Discover",
+    "CAPITAL ONE": "Capital One",
+    "AMERICAN EXPRESS": "American Express",
+    "AMEX": "American Express",
+    "CITI": "Citibank",
+    "CITIBANK": "Citibank",
+    "US BANK": "U.S. Bank",
+    "PNC": "PNC Bank",
+    "TD BANK": "TD Bank",
+    "FIFTH THIRD": "Fifth Third Bank",
+    "REGIONS BANK": "Regions Bank",
+    "NAVY FEDERAL": "Navy Federal Credit Union",
+    "USAA": "USAA",
+    "SCHEELS": "Scheels Visa",
+    "SYNCHRONY": "Synchrony",
+    "TARGET": "Target RedCard",
+    "AMAZON": "Amazon Store Card",
+    "COSTCO ANYWHERE": "Costco Anywhere Visa"
+  }
+}
