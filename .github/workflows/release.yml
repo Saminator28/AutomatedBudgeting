@@ -6,56 +6,58 @@ on:
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
-  test-and-report:
+  attach-test-report:
     runs-on: ubuntu-latest
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - name: Get latest test results from main branch
+      uses: dawidd6/action-download-artifact@v3
       with:
-        python-version: '3.8'
+        workflow: ci.yml
+        branch: main
+        name: test-results-*
+        name_is_regexp: true
+        path: ./test-results
+        check_artifacts: true
+        search_artifacts: true
     
-    - name: Install system dependencies
+    - name: Find latest test report
+      id: find-report
       run: |
-        sudo apt-get update
-        sudo apt-get install -y tesseract-ocr poppler-utils
-    
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        python -m spacy download en_core_web_sm
-    
-    - name: Run tests and generate report
-      run: |
-        python tests/run_tests.py -v > test_report.txt 2>&1 || true
+        # Find the most recent test report
+        LATEST_DIR=$(ls -t test-results/ | head -1)
+        echo "Using test results from: $LATEST_DIR"
         
-        # Also generate JSON report for programmatic access
-        python -m pytest tests/ --tb=short --junit-xml=test_results.xml -v || true
+        # Copy files to root for easier access
+        cp "test-results/$LATEST_DIR/test_report.txt" ./test_report.txt || echo "No detailed report found"
+        cp "test-results/$LATEST_DIR/test_summary.txt" ./test_summary.txt || echo "No summary found"
+        cp "test-results/$LATEST_DIR/badge.txt" ./badge.txt || echo "No badge found"
+        
+        # Check if files exist
+        if [ ! -f test_summary.txt ]; then
+          echo "⚠️ No test results found from CI - tests may not have run on main branch"
+          echo "Tests run: Unknown" > test_summary.txt
+          echo "Tests run: Unknown" > test_report.txt
+        fi
     
-    - name: Create test summary
+    - name: Create formatted test summary for release
       run: |
-        echo "# Test Report - Release ${{ github.event.release.tag_name }}" > test_summary.md
-        echo "" >> test_summary.md
-        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> test_summary.md
-        echo "**Commit:** ${{ github.sha }}" >> test_summary.md
-        echo "" >> test_summary.md
-        echo "## Test Results" >> test_summary.md
-        echo "\`\`\`" >> test_summary.md
-        cat test_report.txt >> test_summary.md
-        echo "\`\`\`" >> test_summary.md
-    
-    - name: Upload test report as artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: test-report-${{ github.event.release.tag_name }}
-        path: |
-          test_report.txt
-          test_summary.md
-          test_results.xml
+        echo "# Test Report - Release ${{ github.event.release.tag_name }}" > test_summary_release.md
+        echo "" >> test_summary_release.md
+        echo "**Release Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> test_summary_release.md
+        echo "**Commit:** ${{ github.sha }}" >> test_summary_release.md
+        echo "**Test Results From:** Latest CI run on main branch" >> test_summary_release.md
+        echo "" >> test_summary_release.md
+        echo "## Test Results" >> test_summary_release.md
+        echo "\`\`\`" >> test_summary_release.md
+        cat test_summary.txt >> test_summary_release.md
+        echo "\`\`\`" >> test_summary_release.md
+        echo "" >> test_summary_release.md
+        echo "---" >> test_summary_release.md
+        echo "*These tests were run automatically on the main branch via CI.*" >> test_summary_release.md
     
     - name: Attach test report to release
       uses: actions/upload-release-asset@v1
@@ -73,7 +75,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./test_summary.md
+        asset_path: ./test_summary_release.md
         asset_name: test-summary-${{ github.event.release.tag_name }}.md
         asset_content_type: text/markdown
     
@@ -83,11 +85,18 @@ jobs:
       with:
         script: |
           const fs = require('fs');
-          const testReport = fs.readFileSync('test_report.txt', 'utf8');
-          const lines = testReport.split('\n');
           
-          // Extract summary line
-          const summaryLine = lines.find(l => l.includes('Tests run:')) || 'Test results not found';
+          let testSummary = 'Test results not available';
+          if (fs.existsSync('test_summary.txt')) {
+            const testReport = fs.readFileSync('test_summary.txt', 'utf8');
+            const lines = testReport.split('\n');
+            testSummary = lines.find(l => l.includes('Tests run:')) || 'Test results not found';
+          }
+          
+          let badge = '';
+          if (fs.existsSync('badge.txt')) {
+            badge = fs.readFileSync('badge.txt', 'utf8').trim();
+          }
           
           const release = await github.rest.repos.getRelease({
             owner: context.repo.owner,
@@ -95,7 +104,8 @@ jobs:
             release_id: context.payload.release.id
           });
           
-          const newBody = `${release.data.body}\n\n---\n\n## 🧪 Test Report\n\n${summaryLine}\n\n📄 See attached test reports for details.`;
+          const testInfo = badge ? `**${badge}**` : testSummary;
+          const newBody = `${release.data.body}\n\n---\n\n## 🧪 Test Report\n\n${testInfo}\n\n📄 See attached test reports for full details.\n\n*Tests run automatically via CI on main branch.*`;
           
           await github.rest.repos.updateRelease({
             owner: context.repo.owner,
@@ -103,3 +113,4 @@ jobs:
             release_id: context.payload.release.id,
             body: newBody
           });
+
