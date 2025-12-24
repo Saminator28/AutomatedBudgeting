@@ -16,7 +16,7 @@ jobs:
     - name: Get latest test results from main branch
       uses: dawidd6/action-download-artifact@v3
       with:
-        workflow: ci.yml
+        workflow: automated-testing.yml
         branch: main
         name: test-results-*
         name_is_regexp: true
