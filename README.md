@@ -36,7 +36,7 @@ This tool reads your bank statement PDFs and creates spreadsheets (CSV files) wi
 ### What You Need
 
 - A computer (Windows, Mac, or Linux)
-- Python 3.8 or newer
+- Python 3.9 or newer
 - 15 minutes for setup (one-time)
 
 ### Installation
@@ -508,7 +508,7 @@ After installation, the tool works completely offline.
 ## Prerequisites
 
 ### System Requirements
-- Python 3.8+
+- Python 3.9+
 - Tesseract OCR installed on your system
 - spaCy language model (required for intelligent cleaning)
 - Ollama with dolphin-mistral model (optional, for enhanced LLM cleaning)
