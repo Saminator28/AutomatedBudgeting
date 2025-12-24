@@ -1,0 +1,14 @@
+Transaction Date,Place,Amount,category
+# Add your manual transactions below (cash purchases, etc.)
+# Date format: MM/DD/YYYY
+# Use negative amounts for refunds (e.g., -15.00)
+# Category is optional but recommended
+# 
+# Examples:
+# 11/26/2025,Farmer's Market,35.50,Groceries
+# 11/27/2025,Coffee Shop,6.25,Dining
+# 11/28/2025,Hardware Store,42.99,Shopping
+# 11/29/2025,Store Return,-15.00,Shopping
+#
+# Copy this file to: statements/YYYY-MM/manual_transactions.csv
+# Then run: python scripts/process_monthly.py --month YYYY-MM
