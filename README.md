@@ -97,7 +97,7 @@ source venv/bin/activate
 # Install required packages
 pip install -r requirements.txt
 
-# Download language model
+# Download required AI model
 python -m spacy download en_core_web_sm
 ```
 
@@ -119,7 +119,7 @@ venv\Scripts\activate
 REM Install required packages
 pip install -r requirements.txt
 
-REM Download language model
+REM Download required AI model
 python -m spacy download en_core_web_sm
 ```
 
@@ -488,8 +488,9 @@ MIT License - Free to use, modify, and share!
   - **Ollama LLM** (optional, 4GB) - Local uncensored language model for enhanced context-aware cleaning
 
 **To verify privacy:**
-- Disconnect from the internet and run the script - it will work fine
-- Review the source code - no network requests or API calls
+- Disconnect from the internet and run the script - it will work fine (after initial setup)
+- The tool automatically detects offline mode and uses cached models
+- Review the source code - no network requests or API calls during processing
 - Monitor network activity with `sudo nethogs` while processing - no outbound traffic
 
 **Additional security measures you can take:**
@@ -498,10 +499,13 @@ MIT License - Free to use, modify, and share!
 - Use full-disk encryption (LUKS on Linux, FileVault on macOS, BitLocker on Windows)
 - Add sensitive files to `.gitignore`: `statements/`, `*.pdf`, `*.csv`
 
-The only internet usage is during initial setup to download:
-1. Microsoft Table Transformer model weights (one-time, ~100MB)
-2. spaCy language model for NER (one-time, ~13MB)
-3. Ollama LLM model (optional, one-time, ~4GB for dolphin-mistral)
+**Internet usage:**
+- **During initial setup only:** Downloads AI models (one-time, ~115MB total)
+  1. Microsoft Table Transformer model (~100MB) - for PDF table detection
+  2. spaCy language model (~13MB) - for merchant name cleaning
+  3. Ollama LLM (optional, ~4GB) - for enhanced categorization
+- **After setup:** Works **100% offline** - models cached locally, auto-detects offline mode
+- **Model updates:** If online, automatically checks for model updates; if offline, uses cached versions
 
 After installation, the tool works completely offline.
 
@@ -563,14 +567,20 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Download the spaCy language model for intelligent merchant name cleaning:
+4. Download spaCy language model (required for merchant name cleaning):
 ```bash
 python -m spacy download en_core_web_sm
 ```
 
-This enables AI-powered location detection that automatically removes city names, states, and countries from merchant names without hardcoded lists.
+5. **(Optional but recommended)** Download Table Transformer model for PDF processing:
 
-5. **(Optional)** Install Ollama for enhanced LLM-based merchant name cleaning:
+```bash
+python -c "from transformers import AutoModelForObjectDetection, AutoImageProcessor; AutoModelForObjectDetection.from_pretrained('microsoft/table-transformer-detection', revision='no_timm'); AutoImageProcessor.from_pretrained('microsoft/table-transformer-detection', revision='no_timm'); print('✓ PDF processing model cached')"
+```
+
+**What does it do?** Enables AI-powered table detection to extract transactions from PDF statements. Downloads once (~100MB), then works 100% offline forever.
+
+6. **(Optional)** Install Ollama for enhanced LLM-based merchant name cleaning:
 
 **Linux/macOS:**
 ```bash

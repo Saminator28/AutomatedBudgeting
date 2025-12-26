@@ -1223,11 +1223,12 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             manual_income = income_df[income_df.get('_manual_category', False) == True].copy() if '_manual_category' in income_df.columns else pd.DataFrame()
             auto_income = income_df[income_df.get('_manual_category', False) != True] if '_manual_category' in income_df.columns else income_df
             
-            # Categorize only auto income
+            # Categorize income as 'Income' (not expense categories)
             auto_income = categorizer.categorize_dataframe(
                 auto_income,
                 description_column='Place',
-                amount_column='Amount'
+                amount_column='Amount',
+                is_income=True
             )
             
             # Merge back
@@ -1238,17 +1239,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 income_df = auto_income
             print(f"✓ Categorized {len(income_df)} income transaction(s)")
         
-        # Categorize manual review transactions if we have any
-        if not payment_apps_df.empty:
-            print(f"\nCategorizing manual review transactions...")
-            payment_apps_df = categorizer.categorize_dataframe(
-                payment_apps_df,
-                description_column='Place',
-                amount_column='Amount'
-            )
-            print(f"✓ Categorized {len(payment_apps_df)} manual review transaction(s)")
-        
-        # Extract uncategorized transactions from expenses and add to manual review
+        # Extract uncategorized transactions from expenses and add to manual review BEFORE categorization
         if 'category' in combined_df.columns:
             uncategorized_expenses = combined_df[combined_df['category'] == 'Uncategorized'].copy()
             if not uncategorized_expenses.empty:
@@ -1269,6 +1260,41 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                     payment_apps_df = uncategorized_expenses
                 
                 print(f"\n📋 Added {len(uncategorized_expenses)} uncategorized expense(s) to manual review")
+        
+        # Categorize manual review transactions AFTER adding uncategorized
+        if not payment_apps_df.empty:
+            print(f"\nCategorizing manual review transactions...")
+            payment_apps_df = categorizer.categorize_dataframe(
+                payment_apps_df,
+                description_column='Place',
+                amount_column='Amount'
+            )
+            print(f"✓ Categorized {len(payment_apps_df)} manual review transaction(s)")
+            
+            # Move successfully categorized transactions back to expenses
+            if 'category' in payment_apps_df.columns:
+                successfully_categorized = payment_apps_df[
+                    (payment_apps_df['category'] != 'Uncategorized') & 
+                    (payment_apps_df.get('_uncategorized', False) == True)
+                ].copy()
+                
+                if not successfully_categorized.empty:
+                    # Remove from manual review
+                    payment_apps_df = payment_apps_df[
+                        ~((payment_apps_df['category'] != 'Uncategorized') & 
+                          (payment_apps_df.get('_uncategorized', False) == True))
+                    ]
+                    
+                    # Clean up columns and add back to expenses
+                    successfully_categorized = successfully_categorized.drop(['Type', 'Classification', '_uncategorized'], axis=1, errors='ignore')
+                    combined_df = pd.concat([combined_df, successfully_categorized], ignore_index=True)
+                    
+                    # Re-sort by date
+                    combined_df['_sort_date'] = combined_df['Transaction Date'].apply(parse_date_for_sort)
+                    combined_df = combined_df.sort_values('_sort_date', na_position='last')
+                    combined_df = combined_df.drop('_sort_date', axis=1)
+                    
+                    print(f"✓ Moved {len(successfully_categorized)} LLM-categorized transaction(s) back to expenses")
         
         # Extract uncategorized transactions from income and add to manual review
         if not income_df.empty and 'category' in income_df.columns:

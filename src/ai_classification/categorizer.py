@@ -86,16 +86,38 @@ class TransactionCategorizer:
         if not self.llm_available:
             return None
         
-        # Build category list for prompt
-        category_list = ", ".join(self.categories.keys())
+        # Build category list with better examples and context
+        category_examples = []
+        for category, patterns in self.categories.items():
+            # Take first 3 examples - just enough for context
+            examples = ", ".join(patterns[:3]) if patterns else "no examples"
+            category_examples.append(f"- {category}: {examples}")
         
-        # Create prompt
-        amount_context = f" Amount: ${amount:.2f}." if amount else ""
-        prompt = f"""Categorize this transaction into ONE of these budget categories: {category_list}
+        categories_with_context = "\n".join(category_examples)
+        
+        # Create enhanced prompt emphasizing merchant knowledge
+        amount_context = f"\nAmount: ${amount:.2f}" if amount else ""
+        prompt = f"""You are a budget categorization expert with knowledge of retail stores, restaurants, and service providers.
 
+AVAILABLE CATEGORIES (with a few examples):
+{categories_with_context}
+
+TRANSACTION TO CATEGORIZE:
 Merchant: {merchant}{amount_context}
 
-Respond with ONLY the category name, nothing else. If none fit well, respond with "Uncategorized"."""
+INSTRUCTIONS:
+1. Use your knowledge of what this merchant/business typically sells or provides
+   - For well-known retailers (like Eddie Bauer, Cash Wise, Target, etc.), rely on what you know about them
+   - For example: Eddie Bauer = outdoor clothing, Cash Wise = grocery store, Costco = warehouse groceries
+2. Match it to the MOST SPECIFIC category (prefer "Clothing" over "Shopping", "Groceries" over "Shopping")
+3. The examples above are just for reference - you should categorize based on your understanding of the merchant
+4. If you don't recognize the merchant, use the transaction amount and name patterns as hints
+5. If you can't confidently match a specific category, choose the closest broader category from the list (e.g., Clothing → Shopping, Auto Maintenance → Transportation, etc.)
+6. If still unsure, use 'Shopping' as a general catch-all before 'Uncategorized'.
+
+Think about what the merchant is, then respond with ONLY the category name. If truly uncertain, respond with "Uncategorized".
+
+Category:"""
         
         try:
             response = requests.post(
@@ -106,15 +128,28 @@ Respond with ONLY the category name, nothing else. If none fit well, respond wit
                     "stream": False,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 20
+                        "num_predict": 200  # Allow sufficient room for reasoning + category
                     }
                 },
-                timeout=10
+                timeout=3600  # 1 hour - no rush for categorization
             )
             
             if response.status_code == 200:
                 result = response.json()
-                category = result.get("response", "").strip()
+                llm_response = result.get("response", "").strip()
+                
+                # Extract the category from the response
+                # LLM might respond with just "Utilities" or "Utilities: electric, power"
+                lines = llm_response.split('\n')
+                category = lines[-1].strip()
+                
+                # Clean up common prefixes/suffixes
+                if category.lower().startswith('category:'):
+                    category = category[9:].strip()
+                
+                # If LLM added explanation after colon (e.g., "Utilities: electric, power"), extract just the category
+                if ':' in category:
+                    category = category.split(':')[0].strip()
                 
                 # Validate the category is in our list
                 if category in self.categories:
@@ -129,6 +164,33 @@ Respond with ONLY the category name, nothing else. If none fit well, respond wit
             pass
         
         return None
+    
+    # Fallback mapping for broader categories
+    _category_fallback = {
+        'Clothing': 'Shopping',
+        'Auto Maintenance': 'Transportation',
+        'Personal Care': 'Shopping',
+        'Fitness': 'Shopping',
+        'Home Maintenance': 'Shopping',
+        'Education': 'Other',
+        'Childcare': 'Other',
+        'Pets': 'Other',
+        'Gifts & Charity': 'Other',
+        'Alcohol/Bar': 'Dining',
+        'Banking Fees': 'Other',
+        'Investment': 'Other',
+        # Add more as needed
+    }
+
+    def _fallback_to_broader(self, category: str) -> str:
+        """Map a too-specific or missing category to a broader one."""
+        checked = set()
+        while category and category not in self.categories and category not in checked:
+            checked.add(category)
+            category = self._category_fallback.get(category, None)
+        if category in self.categories:
+            return category
+        return 'Shopping' if 'Shopping' in self.categories else 'Uncategorized'
     
     def categorize_transaction(
         self, 
@@ -158,6 +220,9 @@ Respond with ONLY the category name, nothing else. If none fit well, respond wit
         if self.use_llm and self.llm_available:
             llm_category = self._categorize_with_llm(description, amount)
             if llm_category:
+                # Fallback to broader if LLM returns a too-specific or missing category
+                if llm_category not in self.categories:
+                    return self._fallback_to_broader(llm_category)
                 return llm_category
         
         return 'Uncategorized'
@@ -166,7 +231,8 @@ Respond with ONLY the category name, nothing else. If none fit well, respond wit
         self,
         df: pd.DataFrame,
         description_column: str = 'Merchant',
-        amount_column: str = 'Amount'
+        amount_column: str = 'Amount',
+        is_income: bool = False
     ) -> pd.DataFrame:
         """
         Add category column to a DataFrame of transactions.
@@ -175,12 +241,18 @@ Respond with ONLY the category name, nothing else. If none fit well, respond wit
             df: DataFrame with transactions
             description_column: Name of column containing merchant names
             amount_column: Name of column containing amounts (for LLM context)
+            is_income: If True, categorize as 'Income' instead of expense categories
             
         Returns:
             DataFrame with added 'category' column
         """
         if description_column not in df.columns:
             raise ValueError(f"Column '{description_column}' not found in DataFrame")
+        
+        # If this is income, just mark everything as Income
+        if is_income:
+            df['category'] = 'Income'
+            return df
         
         # Categorize with or without amount column
         if amount_column in df.columns and self.use_llm:

@@ -146,6 +146,15 @@ class PlaceCleaner:
         # Expand "SUPERCTR" or "SUPERCENTER" 
         cleaned = re.sub(r'\b(SUPERCTR|SUPERCENTR)\b', 'Supercenter', cleaned, flags=re.IGNORECASE)
         
+        # Remove store numbers after warehouse/supercenter (including optional # and direction words)
+        # Examples: "Costco Warehouse #1119 West" -> "Costco Warehouse"
+        #          "Walmart Supercenter 2456 South" -> "Walmart Supercenter"
+        cleaned = re.sub(r'(Warehouse|Supercenter)\s+#?\d{3,5}.*$', r'\1', cleaned, flags=re.IGNORECASE)
+        
+        # Remove redundant "Warehouse" from well-known warehouse stores
+        # "Costco Warehouse" -> "Costco" (everyone knows Costco is a warehouse)
+        cleaned = re.sub(r'\b(Costco|Sams Club|BJs)\s+Warehouse\b', r'\1', cleaned, flags=re.IGNORECASE)
+        
         # Step 7: Remove numbers embedded in middle of names (store codes)
         # But preserve numbers that are part of brand names
         # Remove standalone 4+ digit numbers in middle

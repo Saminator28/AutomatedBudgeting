@@ -143,9 +143,7 @@
       "best buy",
       "home depot",
       "lowes",
-      "bed bath"
-    ],
-    "Clothing": [
+      "bed bath",
       "clothing",
       "apparel",
       "fashion",
@@ -191,7 +189,8 @@
       "liberty mutual",
       "usaa",
       "policy",
-      "edward jones"
+      "edward jones",
+      "Catholic United Ins."
     ],
     "Personal Care": [
       "salon",
@@ -226,42 +225,38 @@
       "ace hardware",
       "true value"
     ],
-    "Rent/Mortgage": [
-      "rent",
-      "mortgage",
-      "lease",
-      "housing",
-      "apartment",
-      "property management"
-    ],
-    "Education": [
-      "tuition",
-      "school",
-      "college",
-      "university",
-      "books",
-      "course",
-      "training",
-      "udemy",
-      "coursera"
-    ],
-    "Childcare": [
-      "daycare",
-      "babysitter",
-      "nanny",
-      "preschool",
-      "kids",
-      "children"
-    ],
-    "Pets": [
-      "pet",
-      "veterinary",
-      "vet",
-      "petco",
-      "petsmart",
-      "dog",
-      "cat",
-      "groomer"
+    "Transportation": [
+      "gas",
+      "fuel",
+      "shell",
+      "chevron",
+      "exxon",
+      "bp",
+      "mobil",
+      "speedway",
+      "caseys",
+      "holiday",
+      "uber",
+      "lyft",
+      "parking",
+      "transit",
+      "metro",
+      "taxi",
+      "toll",
+      "oil change",
+      "auto repair",
+      "car wash",
+      "tire",
+      "jiffy lube",
+      "midas",
+      "meineke",
+      "pep boys",
+      "autozone",
+      "napa auto",
+      "o'reilly auto",
+      "o'reilly",
+      "oreilly",
+      "car wash express"
     ],
     "Gifts & Charity": [
       "focus",

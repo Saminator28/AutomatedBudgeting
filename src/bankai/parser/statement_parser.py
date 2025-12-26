@@ -49,9 +49,27 @@ class StatementParser:
         """
         print("Initializing Statement Parser...")
         
+        # Check if we're online by quickly testing HuggingFace connectivity
+        import socket
+        import urllib.request
+        
+        online = False
+        try:
+            # Quick connectivity check (1 second timeout)
+            urllib.request.urlopen('https://huggingface.co', timeout=1)
+            online = True
+        except:
+            print("⚠ Offline mode detected - using cached models")
+        
         # Load table detection model
-        self.image_processor = AutoImageProcessor.from_pretrained(model_name)
-        self.model = TableTransformerForObjectDetection.from_pretrained(model_name)
+        if online:
+            # Online: download latest if available
+            self.image_processor = AutoImageProcessor.from_pretrained(model_name)
+            self.model = TableTransformerForObjectDetection.from_pretrained(model_name)
+        else:
+            # Offline: use cached models only
+            self.image_processor = AutoImageProcessor.from_pretrained(model_name, local_files_only=True)
+            self.model = TableTransformerForObjectDetection.from_pretrained(model_name, local_files_only=True)
         
         # Load income keywords from config
         self.income_keywords = self._load_income_keywords()
@@ -820,6 +838,20 @@ REASON: Purchase from retail merchant"""
         if 'Amount' not in df_skipped.columns:
             df_skipped['Amount'] = None
         
+        # Deduplicate skipped transfers (same transaction can appear in multiple tables)
+        # Determine which amount column to use for deduplication
+        amount_col = None
+        for col in ['Credits', 'Debits', 'Amount']:
+            if col in df_skipped.columns and df_skipped[col].notna().any():
+                amount_col = col
+                break
+        
+        if amount_col:
+            initial_count = len(df_skipped)
+            df_skipped = df_skipped.drop_duplicates(subset=['Transaction Date', 'Place', amount_col], keep='first')
+            if len(df_skipped) < initial_count:
+                print(f"  ℹ Removed {initial_count - len(df_skipped)} duplicate skipped transfer(s)")
+        
         # Reorder columns
         cols = ['Transaction Date', 'Place', 'Amount']
         for col in df_skipped.columns:
@@ -828,7 +860,7 @@ REASON: Purchase from retail merchant"""
         
         df_skipped = df_skipped[cols]
         df_skipped.to_csv(output_path, index=False)
-        print(f"  💾 Saved {len(skipped_transfers_list)} skipped transfer(s) to: {output_path}")
+        print(f"  💾 Saved {len(df_skipped)} skipped transfer(s) to: {output_path}")
     
     def _parse_table_text_to_dataframe(self, text):
         """
