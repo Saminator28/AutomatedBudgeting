@@ -1,0 +1,40 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+timm>=0.9.0
+
+# PDF processing
+pdf2image>=1.16.0
+PyPDF2>=3.0.0
+
+# OCR
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# Data processing
+pandas>=2.0.0
+openpyxl>=3.1.0
+numpy>=1.24.0
+
+# NLP for intelligent merchant name cleaning and categorization
+spacy>=3.7.0
+
+# HTTP requests for Ollama LLM integration (local only)
+requests>=2.31.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Backend for Dashboard
+fastapi
+uvicorn
+
+# Note: The following are NOT needed and have been removed:
+# - openai (we use local Ollama instead, 100% private)
+# - langchain (not used in current implementation)
+# 
+# Optional external dependencies (install separately):
+# - Ollama with dolphin-mistral model (for enhanced LLM cleaning and categorization)
+# - spaCy language model: python -m spacy download en_core_web_sm
+
+# Frontend (React) requirements are managed in src/ui/package.json

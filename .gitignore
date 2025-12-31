@@ -1,0 +1,54 @@
+.env
+venv/
+env/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Generated output files
+output.xlsx
+output.csv
+visualization_*.jpg
+*.log
+config/merchant_cache.json
+
+# Statement data (sensitive financial information)
+statements/*
+!statements/.gitkeep
+*.pdf
+
+# Generated CSV files
+expenses.csv
+income.csv
+manual_review.csv
+manual_transactions.csv
+
+# Node/React dashboard (frontend)
+node_modules/
+build/
+.env
+*_rejected.csv
+test_*.csv
+debug_*.py
+
+# Note: Add statements/ to .gitignore to prevent accidentally committing financial data
+# If you need to version control your statement structure, use:
+# statements/
+# !statements/**/.gitkeep

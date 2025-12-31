@@ -1,0 +1,33 @@
+{
+  "_instructions": "Add keywords that indicate INCOME (money coming IN) to your bank account. These help correctly separate deposits from expenses when your bank statement has both Debits and Credits columns.",
+  "_examples": [
+    "If your paycheck shows as 'XYZ Corp Payroll' but appears in expenses, add 'PAYROLL' below",
+    "If direct deposits show as 'DD ACH' but appear in expenses, add 'DD' or 'DIRECT DEPOSIT' below",
+    "If tax refunds appear in expenses, add 'TAX REFUND' below"
+  ],
+  "_note": "Keywords are case-insensitive and will match if they appear ANYWHERE in the transaction description",
+  
+  "income_keywords": [
+    "DEPOSIT",
+    "MOBILE DEPOSIT",
+    "DIRECT DEPOSIT",
+    "DD ",
+    "INTEREST",
+    "INTEREST EARNED",
+    "TRANSFER FROM",
+    "PAYMENT RECEIVED",
+    "PAYROLL",
+    "SALARY",
+    "WAGE",
+    "WAGES",
+    "INCOME",
+    "REFUND",
+    "TAX REFUND",
+    "DIVIDEND",
+    "CREDIT ADJUSTMENT",
+    "REIMBURSEMENT",
+    "CASHBACK",
+    "CASH BACK",
+    "BONUS"
+  ]
+}

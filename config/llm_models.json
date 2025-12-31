@@ -1,0 +1,31 @@
+{
+  "primary_model": "qwen2.5:14b",
+  "secondary_model": "dolphin-mistral",
+  "use_multi_model": true,
+  "description": "LLM model configuration for merchant name cleaning",
+  "notes": {
+    "primary_model": "Used for prompts 1 and 3 (extraction and validation). Best reasoning capabilities.",
+    "secondary_model": "Used for prompt 2 (location removal). Provides diversity for ensemble.",
+    "use_multi_model": "If false, only primary_model is used for all 3 prompts."
+  },
+  "recommended_combinations": [
+    {
+      "primary": "qwen2.5:14b",
+      "secondary": "dolphin-mistral",
+      "accuracy": "95-98%",
+      "notes": "Best overall - qwen excels at details, dolphin is fast at filtering"
+    },
+    {
+      "primary": "qwen2.5:14b",
+      "secondary": "solar:10.7b",
+      "accuracy": "94-97%",
+      "notes": "Both large models - excellent reasoning but slower"
+    },
+    {
+      "primary": "qwen2.5:7b",
+      "secondary": "gemma2:9b",
+      "accuracy": "90-95%",
+      "notes": "Lighter weight option - faster but slightly less accurate"
+    }
+  ]
+}
