@@ -1,0 +1,50 @@
+.env
+.env.local
+.env.*.local
+venv/
+myenv/
+env/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Node / React
+node_modules/
+src/ui/build/
+
+# Runtime databases
+*.db
+*.sqlite
+
+# Statement PDFs (sensitive — may exist anywhere)
+*.pdf
+
+# User-specific LLM model config (contains your local model names)
+config/llm_models.json
+
+# All UI runtime data: statements, monthly_reports, transfer labels, manual entries
+# These all live under src/ui/data/ which is volume-mounted at runtime
+src/ui/data/
+
+# Logs (top-level logs/ dir and any *.log files elsewhere, e.g. src/ui/backend/backend.log)
+logs/
+*.log

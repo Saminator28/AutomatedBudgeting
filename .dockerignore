@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+myenv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Documentation
+*.md
+docs/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Personal financial data — mounted as volumes at runtime, never baked into the image
+statements/
+monthly_reports/
+*.pdf
+
+# UI runtime data — mounted as a volume at runtime
+src/ui/data/
+
+# User-specific config (model names etc.) — configured per-deployment
+config/llm_models.json
+
+# Shell setup helpers not needed inside the container
+QUICKSTART.sh
+docker-setup.sh
+
+# Node / React — npm install runs inside the Dockerfile; host node_modules must not shadow it
+node_modules/
+src/ui/node_modules/
+src/ui/build/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

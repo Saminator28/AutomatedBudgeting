@@ -1,0 +1,14 @@
+{
+  "_instructions": "Payment apps like Venmo, Zelle, Cash App, and Apple Pay can be either income, expenses, or reimbursements. Transactions matching these keywords will be saved to a separate 'payment_apps.csv' file for manual classification.",
+  "_note": "Keywords are case-insensitive and will match if they appear ANYWHERE in the transaction description",
+  
+  "payment_app_keywords": [
+    "VENMO",
+    "ZELLE",
+    "CASH APP",
+    "CASHAPP",
+    "APPLE PAY",
+    "APPLE CASH",
+    "PAYPAL"
+  ]
+}

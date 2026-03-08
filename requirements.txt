@@ -1,0 +1,55 @@
+# ============================================================
+# Python dependencies for Automated Budgeting
+# Install: pip install -r requirements.txt
+#
+# External system dependencies (install separately):
+#   Tesseract OCR:  sudo apt install tesseract-ocr  (or brew install tesseract)
+#   Poppler:        sudo apt install poppler-utils   (or brew install poppler)
+#   Ollama:         https://ollama.com/download
+#   spaCy model:    python -m spacy download en_core_web_sm
+# ============================================================
+
+# PDF Processing
+pdf2image>=1.16.0
+PyPDF2>=3.0.0
+pdfplumber>=0.7.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+PyMuPDF>=1.23.0
+wordninja>=1.5.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+tabulate>=0.9.0
+
+# LLM Integration (requires Ollama running separately)
+ollama>=0.6.1
+requests>=2.31.0
+
+# NLP
+spacy>=3.7.0
+
+# Web Backend
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Utilities
+python-dotenv>=1.0.0
+
+# ============================================================
+# OPTIONAL: Heavy ML dependencies (HuggingFace / FinGPT)
+# Only needed if using local transformer models instead of Ollama.
+# Uncomment to install.
+# ============================================================
+# torch>=2.0.0
+# transformers>=4.30.0
+# peft>=0.5.0
+# accelerate>=0.20.0
+# bitsandbytes>=0.41.0
+# sentencepiece>=0.1.99
+# protobuf>=3.20.0
+
+# Frontend (React) dependencies are managed in src/ui/package.json

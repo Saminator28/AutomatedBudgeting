@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  # Main application
+  app:
+    build: .
+    container_name: automated-budgeting
+    network_mode: "host"  # Use host network to access Ollama directly
+    volumes:
+      # Mount data directories for persistence
+      - ./src/ui/data:/app/src/ui/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OLLAMA_HOST=http://localhost:11434  # Direct access via host network
+    restart: unless-stopped
+
+  # Note: Ollama service disabled - using host Ollama instance instead
+  # If you want to run Ollama in Docker instead, uncomment below and remove network_mode above:
+  #
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: budgeting-ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   restart: unless-stopped
+
+# volumes:
+#   ollama-data:
+#     driver: local

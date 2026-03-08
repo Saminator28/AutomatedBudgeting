@@ -1,0 +1,83 @@
+name: Release with Test Report
+
+on:
+  release:
+    types: [created, published]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  test-and-report:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tesseract-ocr poppler-utils
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt pytest
+        python -m spacy download en_core_web_sm
+    
+    - name: Run tests and generate report
+      run: |
+        if [ -d "tests" ] && [ -n "$(ls tests/*.py 2>/dev/null)" ]; then
+          python -m pytest tests/ --tb=short --junit-xml=test_results.xml -v 2>&1 | tee test_report.txt || true
+        else
+          echo "No tests found — skipping." | tee test_report.txt
+          touch test_results.xml
+        fi
+    
+    - name: Create test summary
+      run: |
+        TAG="${{ github.event.release.tag_name }}"
+        echo "# Test Report${TAG:+ - Release $TAG}" > test_summary.md
+        echo "" >> test_summary.md
+        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> test_summary.md
+        echo "**Commit:** ${{ github.sha }}" >> test_summary.md
+        echo "" >> test_summary.md
+        echo "## Test Results" >> test_summary.md
+        echo "\`\`\`" >> test_summary.md
+        cat test_report.txt >> test_summary.md
+        echo "\`\`\`" >> test_summary.md
+    
+    - name: Upload test report as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-report-${{ github.event.release.tag_name || github.run_id }}
+        path: |
+          test_report.txt
+          test_summary.md
+          test_results.xml
+    
+    # Attach reports and update release notes only when triggered by an actual release
+    - name: Attach reports to release and update notes
+      if: github.event_name == 'release'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="${{ github.event.release.tag_name }}"
+        gh release upload "$TAG" test_report.txt#"test-report-${TAG}.txt" --clobber
+        gh release upload "$TAG" test_summary.md#"test-summary-${TAG}.md" --clobber
+        
+        SUMMARY=$(grep -E "passed|failed|error|no tests" test_report.txt | tail -1 || echo "Test results not found")
+        CURRENT_BODY=$(gh release view "$TAG" --json body -q .body)
+        gh release edit "$TAG" --notes "${CURRENT_BODY}
+
+---
+
+## Test Report
+
+${SUMMARY}
+
+See attached test reports for details."
