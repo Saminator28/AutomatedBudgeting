@@ -40,6 +40,43 @@ function EditableCell({ value, onSave, style = {} }) {
   );
 }
 
+// ─── Inline-editable amount cell ───────────────────────────────────────────
+function EditableAmountCell({ value, formatCurrency, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(String(value));
+  const ref = useRef();
+  useEffect(() => { if (editing) ref.current?.select(); }, [editing]);
+
+  const commit = () => {
+    setEditing(false);
+    const parsed = parseFloat(draft);
+    if (!isNaN(parsed) && Math.abs(parsed - value) > 0.001) onSave(parsed);
+    else setDraft(String(value));
+  };
+
+  return editing ? (
+    <input
+      ref={ref}
+      type="number"
+      min="0"
+      step="0.01"
+      value={draft}
+      onChange={e => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setEditing(false); setDraft(String(value)); } }}
+      style={{ ...cellInput, textAlign: 'right', width: 90 }}
+    />
+  ) : (
+    <span
+      onClick={() => { setDraft(String(value)); setEditing(true); }}
+      title="Click to edit amount"
+      style={{ cursor: 'text', borderBottom: '1px dashed #cbd5e1', paddingBottom: 1 }}
+    >
+      {formatCurrency(value)}
+    </span>
+  );
+}
+
 // ─── Inline-editable category select cell ───────────────────────────────────
 function EditableCategoryCell({ value, categories, onSave }) {
   const [editing, setEditing] = useState(false);
@@ -520,7 +557,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
             <div>
               <h3 style={{ margin: 0, color: '#0f172a', fontWeight: 700, fontSize: 16 }}>📋 All Transactions</h3>
               <p style={{ margin: '4px 0 0', fontSize: 12, color: '#64748b' }}>
-                Expenses and income in one view. Click any expense <strong>Merchant</strong> or <strong>Category</strong> cell to edit inline.
+                Expenses and income in one view. Click any expense <strong>Merchant</strong>, <strong>Amount</strong>, or <strong>Category</strong> cell to edit inline.
               </p>
             </div>
             <span style={{ background: '#e0e7ff', color: '#4f46e5', borderRadius: 20, padding: '4px 14px', fontSize: 13, fontWeight: 700 }}>
@@ -665,7 +702,11 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                               : <EditableCell value={row.place} onSave={v => editExpense(row, { new_place: v })} />}
                           </td>
                           <td style={{ ...td, textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap', color: (isIncome || isReimb) ? '#16a34a' : undefined }}>
-                            {isReimb ? `+${formatCurrency(Math.abs(row.amount))}` : formatCurrency(row.amount)}
+                            {isIncome
+                              ? formatCurrency(row.amount)
+                              : isReimb
+                                ? <EditableAmountCell value={Math.abs(row.amount)} formatCurrency={v => `+${formatCurrency(v)}`} onSave={v => editExpense(row, { new_amount: v })} />
+                                : <EditableAmountCell value={row.amount} formatCurrency={formatCurrency} onSave={v => editExpense(row, { new_amount: v })} />}
                           </td>
                           <td style={{ ...td, minWidth: 140 }}>
                             {isIncome

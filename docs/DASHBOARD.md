@@ -15,7 +15,7 @@ The landing page showing a snapshot of the selected month's finances:
 - **Income vs. Expenses** — bar chart comparison
 - **Spending by Category** — interactive pie chart; click a slice to filter the transaction list
 - **Month-over-month trend** — line chart showing expense history across recent months
-- **Summary cards** — total income, total expenses, net savings
+- **Summary cards** — total income, total expenses, net savings; **avg monthly income** uses the same last-12-months window as the income vs expenses chart
 
 Use the month selector at the top to switch between months.
 
@@ -31,11 +31,11 @@ A full, searchable, sortable table of every transaction for the selected month.
 | Type | DEBIT or CREDIT |
 | Merchant | Cleaned merchant name (editable inline) |
 | Category | Assigned category (editable via dropdown) |
-| Amount | Dollar amount |
+| Amount | Dollar amount (editable inline for expense rows) |
 | Label | expense / income / transfer |
 
 **Features:**
-- **Inline editing** — click any merchant name or category cell to edit it; changes save to CSV automatically
+- **Inline editing** — click any expense **Merchant**, **Amount**, or **Category** cell to edit it; changes save to CSV automatically
 - **Sort** — click any column header to sort ascending/descending
 - **Search / filter** — type in the search box to filter by merchant or category
 - **Needs Review section** — transactions flagged for manual attention appear at the top with an amber highlight
@@ -114,6 +114,7 @@ Query parameters used by most read endpoints: `?month=2025-06`
 | `POST` | `/api/upload-statement` | Upload a PDF file |
 | `POST` | `/api/process-statements` | Start background parsing job |
 | `PUT` | `/api/update-transaction` | Edit merchant name or category |
+| `PATCH` | `/api/expense/edit` | Edit merchant name, category, or amount for an expense row |
 | `POST` | `/api/manual-transactions` | Add a manual transaction entry |
 | `DELETE` | `/api/manual-transactions/{id}` | Remove a manual transaction |
 

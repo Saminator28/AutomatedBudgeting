@@ -162,7 +162,7 @@ class StatementParser:
 
         parts = []
         for token in text.split():
-            if re.match(r'^[A-Z]{14,}$', token):
+            if re.match(r'^[A-Z]{10,}$', token):
                 split_parts = _wn.split(token)
                 parts.append(' '.join(p.upper() for p in split_parts))
             else:
@@ -483,6 +483,20 @@ class StatementParser:
         # Check if this is a bare WITHDRAWAL (no merchant name)
         is_bare_withdrawal = desc_upper.strip() == 'WITHDRAWAL'
         
+        # Check if this is a known bank operation that the LLM can't improve on
+        # These all map directly to a canonical name without LLM involvement.
+        _BANK_OPS = {
+            'MOBILE DEPOSIT':  'Mobile Deposit',
+            'DIRECT DEPOSIT':  'Direct Deposit',
+            'ACH DEPOSIT':     'ACH Deposit',
+            'COUNTER DEPOSIT': 'Counter Deposit',
+            'NIGHT DEPOSIT':   'Night Deposit',
+        }
+        matched_bank_op = next(
+            (canonical for keyword, canonical in _BANK_OPS.items() if desc_upper.startswith(keyword)),
+            None
+        )
+        
         # Check if this is an ATM withdrawal (but NOT if there's a merchant name before it)
         # E.g., "XX8934 ATM WITHDRAWAL" → Yes
         desc_clean = re.sub(r'^XX\d+\s+', '', desc_upper).strip()
@@ -512,6 +526,10 @@ class StatementParser:
             manually_cleaned = True
         elif matched_payment_app:
             description = matched_payment_app
+            manually_cleaned = True
+        elif matched_bank_op:
+            # Known bank operation — use canonical name directly (LLM can't improve on it)
+            description = matched_bank_op
             manually_cleaned = True
         elif is_bare_withdrawal:
             # Keep bare "WITHDRAWAL" as "Withdrawal" (LLM often fails on this)
@@ -957,6 +975,7 @@ class StatementParser:
         # Look for transaction section
         in_transaction_section = False
         i = 0
+        _prev_balance_tracker = None  # tracks last Balance seen; used to detect balance-as-amount errors
         
         while i < len(lines):
             line = lines[i].strip()
@@ -993,6 +1012,26 @@ class StatementParser:
             # Try to parse transaction
             trans, consumed = self.parse_transaction_block(lines, i, statement_year)
             if trans and trans.get('Place'):
+                # Detect balance-as-amount: single extracted amount equals the previous row's running balance.
+                # This happens when pdfplumber collapses a multi-column layout and the transaction
+                # amount column is missing, leaving only the running balance on that row.
+                if (
+                    'Amount' in trans
+                    and 'Balance' not in trans
+                    and 'Credits' not in trans
+                    and 'Debits' not in trans
+                    and _prev_balance_tracker is not None
+                    and abs(trans['Amount'] - _prev_balance_tracker) < 0.01
+                ):
+                    trans['_suspicious_balance'] = True
+                    if hasattr(self, 'debug') and self.debug:
+                        print(f"  [SUSPICIOUS BALANCE] {trans['Transaction Date']} {trans.get('Place', '')[:25]}: "
+                              f"Amount ${trans['Amount']:.2f} == prev balance ${_prev_balance_tracker:.2f} — routing to manual review")
+
+                # Update balance tracker whenever a row carries a Balance field
+                if trans.get('Balance') and trans['Balance'] > 0:
+                    _prev_balance_tracker = trans['Balance']
+
                 transactions.append(trans)
             
             i += consumed if consumed > 0 else 1
@@ -1090,6 +1129,17 @@ class StatementParser:
 
             is_payment_app = any(app in place or app in place_original for app in self.payment_apps)
             
+            if trans.get('_suspicious_balance'):
+                # Amount equals the previous row's running balance — the real transaction amount
+                # was not captured (likely a PDF column-collapse issue). Route to manual review
+                # so the user can supply the correct amount.
+                trans['Type'] = 'Expense'  # conservative hint; user can correct
+                trans['_needs_manual_review'] = True
+                print(f"  ⚠ Suspicious amount (= prev balance ${trans['Amount']:.2f}): "
+                      f"{trans.get('Place', '')} {trans.get('Transaction Date', '')} — routed to manual review")
+                manual_review.append(trans)
+                continue
+
             if is_payment_app:
                 # Payment apps always go to manual review (user must classify)
                 # Try to hint the type based on Credits/Debits, keywords, or transaction description

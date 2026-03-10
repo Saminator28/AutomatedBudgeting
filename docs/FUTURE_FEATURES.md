@@ -131,7 +131,56 @@ Improvement: amount + date matching across statements to catch transfers not cau
 
 ---
 
-### 6. Export to Financial Software
+### 6. Monthly Report CSV Export
+**Priority:** Medium  
+**Complexity:** Low
+
+Allow users to export any processed month as a standalone CSV directly from the dashboard.
+
+- Select a month (e.g. January 2025) and click **Export CSV**
+- Exported file contains the columns: `Date`, `Type`, `Merchant`, `Amount`, `Category`, `Source`
+  - `Type` — `expense`, `income`, or `transfer`
+  - `Source` — the originating statement filename (e.g. `chase_jan2025.pdf`)
+- Export includes all transaction types for the month (expenses, income, transfers)
+- Option to filter by type before exporting (e.g. expenses only)
+- Backend endpoint: `GET /api/export/monthly?month=2025-01`
+- Filename format: `budget_export_2025-01.csv`
+
+**Implementation notes:**
+- Read from the existing `monthly_reports/` CSVs (or DB once migrated)
+- Use FastAPI's `StreamingResponse` with `text/csv` content type to return the file
+- Add an Export button to the dashboard's month selector toolbar
+
+---
+
+### 7. Data Encryption at Rest
+**Priority:** Medium  
+**Complexity:** Medium–High
+
+Encrypt sensitive financial data stored on disk to protect against unauthorized access.
+
+**Scope:**
+- Uploaded statement PDFs (`src/ui/data/statements/*/`)
+- Processed transaction CSVs (expenses, income, transfers, manual review)
+- Monthly report CSVs (`monthly_reports/`)
+- Merchant history cache
+
+**Proposed approach:**
+- Use AES-256 encryption (via Python's `cryptography` library — `Fernet` symmetric key)
+- User sets a passphrase on first launch; a derived key (PBKDF2 or Argon2) is used to encrypt/decrypt files
+- The key is held in memory only — never written to disk
+- Docker volume data remains encrypted at rest; decrypted in-memory only when needed
+- Files are re-encrypted after every write
+
+**Considerations:**
+- Passphrase prompt could be integrated into the dashboard startup screen
+- Without the passphrase, the Docker volume contents are unreadable even if the host machine is accessed
+- Adds complexity to the processing pipeline — all file reads/writes go through an encrypt/decrypt wrapper
+- Key rotation would require re-encrypting all stored files
+
+---
+
+### 8. Export to Financial Software
 **Priority:** Low  
 **Complexity:** Medium
 
@@ -144,7 +193,7 @@ Export processed transactions to popular formats:
 
 ---
 
-### 7. Mobile-Friendly Dashboard
+### 9. Mobile-Friendly Dashboard
 **Priority:** Medium  
 **Complexity:** Low–Medium
 
@@ -155,7 +204,7 @@ The current React UI works on desktop. Responsive design improvements for phone/
 
 ---
 
-### 8. Multi-Currency Support
+### 10. Multi-Currency Support
 **Priority:** Low  
 **Complexity:** Low–Medium
 
@@ -166,7 +215,7 @@ Handle statements that include foreign currency transactions:
 
 ---
 
-### 9. Receipt Attachment Linking
+### 11. Receipt Attachment Linking
 **Priority:** Low  
 **Complexity:** Medium
 
@@ -178,7 +227,7 @@ Allow users to attach receipt images or PDFs to individual transactions:
 
 ---
 
-### 10. Performance: Parallel LLM Processing
+### 12. Performance: Parallel LLM Processing
 **Priority:** Low  
 **Complexity:** Medium
 
@@ -190,7 +239,7 @@ Currently, transactions are processed one at a time through the LLM. Processing 
 
 ---
 
-### 11. Smart Cache Preloading
+### 13. Smart Cache Preloading
 **Priority:** Low  
 **Complexity:** Low
 
@@ -201,6 +250,67 @@ Bundle a `config/common_merchants.json` with the top 500 national merchants alre
 - Streaming services
 
 Benefit: instant recognition for common merchants on first run, before any CSV history exists.
+
+---
+
+### 14. PDF Preview Panel
+**Priority:** Medium  
+**Complexity:** Low–Medium
+
+Display the original statement PDF alongside parsed transactions so users can spot-check extraction accuracy directly in the dashboard.
+
+- Upload flow opens a split view: PDF viewer on the left, parsed transaction table on the right
+- Clicking a transaction row highlights the corresponding line in the PDF (where page/position metadata is available)
+- Helps users catch parser errors without hunting for the original file
+- PDF rendered using a lightweight viewer (e.g. `react-pdf`)
+- Stored PDFs already exist in `src/ui/data/statements/YYYY-MM/` — no new storage needed
+
+---
+
+### 15. Financial Goals Tracking
+**Priority:** Medium  
+**Complexity:** Medium
+
+Allow users to define savings or spending targets and track progress against real transaction data.
+
+- Create goals such as "Save $5,000 by June 2026" or "Keep Dining under $200/month"
+- Dashboard widget shows progress bar: amount saved or remaining vs. target
+- Goals stored in `config/goals.json`
+- Two goal types:
+  - **Savings goal** — tracks cumulative surplus (income − expenses) toward a target amount
+  - **Spending cap** — tracks a category's monthly spend against a ceiling (overlaps with Budget Limits feature — can be unified)
+- Automatically updates each time a month is processed
+
+---
+
+### 16. Chatbot Session History
+**Priority:** Medium  
+**Complexity:** Low
+
+Persist chatbot conversations so users can return to a previous analysis session.
+
+- Each session saved as a JSON file under `src/ui/data/chat_sessions/YYYY-MM-DD_HH-MM.json`
+- Session list shown in a sidebar with timestamps and auto-generated titles (based on first message)
+- Users can rename, delete, or resume any session
+- On resume, full message history is reloaded into the chat context
+- Sessions are scoped to the local machine — no cloud sync
+
+---
+
+### 17. Debt Payoff Tracker
+**Priority:** Low  
+**Complexity:** Medium
+
+Track outstanding loans and credit balances and project payoff timelines based on monthly income surplus.
+
+- User enters: debt name, current balance, interest rate (APR), minimum payment
+- Dashboard shows:
+  - Current balance and projected payoff date at minimum payment
+  - How much faster payoff would be with extra monthly contribution
+  - Total interest paid over the life of the debt
+- Multiple debts supported; ranked by highest-interest-first (avalanche) or lowest-balance-first (snowball)
+- Debt config stored in `config/debts.json`
+- Integrates with monthly income surplus calculated from processed statements
 
 ---
 

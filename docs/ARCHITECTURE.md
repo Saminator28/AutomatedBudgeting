@@ -45,7 +45,7 @@ This document describes how all components of Automated Budgeting fit together.
                             ┌──────────────────────┐
                             │       Ollama          │
                             │  (runs on host OS)    │
-                            │  qwen2.5:14b          │
+                            │  see llm_models.json  │
                             └──────────────────────┘
 ```
 
@@ -112,8 +112,8 @@ monthly_reports/ aggregate CSV
 |------|---------------|
 | `process_monthly.py` | CLI entry point for batch processing a month |
 | `setup_monthly.py` | First-run setup helper |
-| `compare_models.py` | Benchmarks different Ollama models |
-| `test_llm_direct.py` | Validates Ollama connectivity |
+| `aggregate_monthly.py` | Aggregates parsed CSVs into monthly summary reports |
+| `launch_dashboard.sh` | Convenience script to start the dashboard |
 
 ---
 

@@ -52,6 +52,10 @@ To add or rename a category, edit this file. The dashboard's pie chart and budge
 Cleaned merchant name
         │
         ▼
+0. Suspicious balance check
+        │ _suspicious_balance flag → route to manual review (skip all classification)
+        │ not flagged ↓
+        ▼
 1. Income keyword check (config/income_keywords.json)
         │ match → label: "income", category: "Income"
         │ no match ↓
@@ -64,7 +68,7 @@ Cleaned merchant name
         │ match → flag: "needs_review"
         │ no match ↓
         ▼
-4. Pattern matching (config/category_patterns.json)
+4. Pattern matching (in-memory merchant cache + category_patterns)
         │ match → assign category directly
         │ no match ↓
         ▼
@@ -73,6 +77,10 @@ Cleaned merchant name
         ▼
 Assign category → write to CSV
 ```
+
+### Stage 0: Suspicious Balance Routing
+
+Before any keyword checks, transactions flagged `_suspicious_balance = True` by the parser are routed directly to the manual review queue. These are transactions where the parser detected that the extracted amount equals the previous row's running balance — a sign of a PDF column-collapse issue where the real amount was not captured. See [PARSING.md](PARSING.md) for details.
 
 ---
 
@@ -138,21 +146,16 @@ These transactions are placed in a **needs_review** queue displayed in the dashb
 
 ## Stage 4: Pattern Matching
 
-`config/category_patterns.json` maps merchant name patterns to categories:
+The merchant cache (built from previously processed CSVs) and in-memory category-to-keyword maps are checked before calling the LLM. Common merchant name substrings are matched case-insensitively:
 
-```json
-{
-  "Groceries": ["Whole Foods", "Kroger", "Safeway", "Trader Joe", "Publix", "Aldi"],
-  "Fuel": ["Shell", "BP", "Chevron", "Exxon", "Mobil", "Circle K"],
-  "Dining": ["McDonald", "Starbucks", "Chipotle", "Subway", "Domino"],
-  ...
-}
+```
+Groceries: ["Whole Foods", "Kroger", "Safeway", "Trader Joe", "Publix", "Aldi"]
+Fuel:      ["Shell", "BP", "Chevron", "Exxon", "Mobil", "Circle K"]
+Dining:    ["McDonald", "Starbucks", "Chipotle", "Subway", "Domino"]
+...
 ```
 
 Matching is case-insensitive and substring-based. A merchant only needs to contain the pattern (e.g., `"Starbucks Coffee"` matches `"Starbucks"`).
-
-**To add a new pattern:**  
-Open `config/category_patterns.json` and add the merchant name substring to the appropriate category's array.
 
 ---
 

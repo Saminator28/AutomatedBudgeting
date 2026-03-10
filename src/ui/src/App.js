@@ -205,7 +205,12 @@ function App() {
   // Use only recurring income for the budget baseline average
   const totalRecurringIncome = incomeData.reduce((sum, d) => sum + (d.income || 0), 0);
   const totalBonusIncome = incomeData.reduce((sum, d) => sum + (d.bonus || 0), 0);
-  const avgMonthlyIncome = incomeData.length > 0 ? totalRecurringIncome / incomeData.length : 0;
+  // avgMonthlyIncome uses the same last-12-months window as the income vs expenses chart
+  const last12IncomeMonths = incomeData.map(d => d.month).sort().slice(-12);
+  const last12IncomeData = incomeData.filter(d => last12IncomeMonths.includes(d.month));
+  const avgMonthlyIncome = last12IncomeData.length > 0
+    ? last12IncomeData.reduce((sum, d) => sum + (d.income || 0), 0) / last12IncomeData.length
+    : 0;
   
   // Prepare line chart data: group by month, each category as a line
   const months = Array.from(new Set(lineData.map(d => d.month))).sort();
@@ -223,8 +228,9 @@ function App() {
     return entry;
   });
 
-  // Combine income and expense data for comparison chart
-  const incomeVsExpenseData = months.map(month => {
+  // Combine income and expense data for comparison chart — last 12 months only
+  const last12Months = months.slice(-12);
+  const incomeVsExpenseData = last12Months.map(month => {
     const expense = lineChartData.find(d => d.month === month);
     const income = incomeData.find(d => d.month === month);
     return {
