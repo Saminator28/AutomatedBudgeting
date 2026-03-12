@@ -705,7 +705,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                             {isIncome
                               ? formatCurrency(row.amount)
                               : isReimb
-                                ? <EditableAmountCell value={Math.abs(row.amount)} formatCurrency={v => `+${formatCurrency(v)}`} onSave={v => editExpense(row, { new_amount: v })} />
+                                ? <EditableAmountCell value={Math.abs(row.amount)} formatCurrency={v => `+${formatCurrency(v)}`} onSave={v => editExpense(row, { new_amount: -Math.abs(v) })} />
                                 : <EditableAmountCell value={row.amount} formatCurrency={formatCurrency} onSave={v => editExpense(row, { new_amount: v })} />}
                           </td>
                           <td style={{ ...td, minWidth: 140 }}>
