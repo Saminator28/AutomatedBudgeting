@@ -24,36 +24,36 @@ The cleaning pipeline uses a local LLM (via Ollama) to handle the wide variety o
 
 ## Pipeline Overview
 
-```
-Raw merchant string
-        │
-        ▼
-_strip_trailing_state()       ← removes "City ST" suffixes
-        │
-        ▼
-Cache lookup                  ← check merchant history (CSVs)
-        │ miss                │ hit → return cached result
-        ▼
-clean_merchant_with_ensemble()
-        │
-        ├─ Primary model:  qwen2.5:14b
-        │       │
-        │       ▼
-        │   response + confidence
-        │
-        ├─ (if use_multi_model=true)
-        │   Secondary model: llama3.1:8b
-        │       │
-        │       ▼
-        │   response + confidence
-        │
-        ▼
-Ensemble reconciliation
-        │  both agree → primary result (high confidence)
-        │  disagree   → primary result (if confidence > threshold)
-        │             → secondary result (if primary < threshold)
-        ▼
-Cache write + return
+```mermaid
+flowchart TD
+    raw["Raw merchant string"]
+    strip["_strip_trailing_state()<br/>remove City ST suffixes"]
+    ninja["Wordninja pre-split<br/>ALL CAPS ≥10 chars → spaced words"]
+    bankops{"`_BANK_OPS
+bypass?`"}
+    canonical["Return canonical name<br/>e.g. Mobile Deposit<br/>manually_cleaned = True"]
+    cache{"`Cache
+hit?`"}
+    cached["Return cached result"]
+    primary["Primary model<br/>response + confidence"]
+    secondary{"`secondary_model
+configured?`"}
+    sec_model["Secondary model<br/>response + confidence"]
+    reconcile["Ensemble reconciliation<br/>both agree → primary result<br/>disagree → higher-confidence result"]
+    cache_write["Cache write + return"]
+
+    raw --> strip
+    strip --> ninja
+    ninja --> bankops
+    bankops -->|yes| canonical
+    bankops -->|no| cache
+    cache -->|hit| cached
+    cache -->|miss| primary
+    primary --> secondary
+    secondary -->|yes| sec_model
+    sec_model --> reconcile
+    secondary -->|no| reconcile
+    reconcile --> cache_write
 ```
 
 ---
@@ -87,12 +87,12 @@ The `think` parameter is set to `false` to suppress chain-of-thought output (fas
 
 ## Multi-Model Ensemble
 
-When `use_multi_model: true` in `config/llm_models.json`, two models are queried:
+When `secondary_model` is set (non-empty) in `config/llm_models.json`, two models are queried:
 
 | Setting | Value |
-|---------|-------|
-| Primary model | `qwen2.5:14b` |
-| Secondary model | `llama3.1:8b` |
+|---------|------|
+| Primary model | configured `primary_model` |
+| Secondary model | configured `secondary_model` |
 
 **Reconciliation logic:**
 1. If both models return the same cleaned name → high confidence result
@@ -101,7 +101,7 @@ When `use_multi_model: true` in `config/llm_models.json`, two models are queried
    - Primary model confidence < threshold → use secondary (or flag for review)
 
 **When to use single-model mode:**  
-Set `"use_multi_model": false` if you only have the primary model installed or want faster processing. Single-model mode still works well; the ensemble primarily helps with ambiguous merchant names.
+Set `"secondary_model": ""` (empty string) to disable the ensemble and use only the primary model. Single-model mode still works well; the ensemble primarily helps with ambiguous merchant names.
 
 ---
 
@@ -136,14 +136,20 @@ Normalization is minimal (uppercase, stripped whitespace) to maximize hit rate w
 
 ```json
 {
-  "primary_model": "qwen2.5:14b",
-  "secondary_model": "llama3.1:8b",
-  "use_multi_model": true
+  "primary_model": "qwen3.5:9b",
+  "secondary_model": "",
+  "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor"
 }
 ```
 
+| Key | Purpose |
+|-----|---------|
+| `primary_model` | Merchant cleaning + transaction categorization + chatbot intent parsing |
+| `secondary_model` | Optional second model for ensemble cleaning. Set to `""` to disable. |
+| `financial_analysis_model` | Conversational financial advice in the chatbot (step 2 responses) |
+
 **Changing models:**  
-Any model installed in Ollama can be used. Larger models (14b, 32b) produce better cleaning results but are slower. For fast machines, `qwen2.5:14b` is the recommended balance of quality and speed.
+Any model installed in Ollama can be used. Larger models (14b, 32b) produce better cleaning results but are slower. Update this file and restart the container — the entrypoint auto-pulls any model listed here that is not yet present.
 
 Browse all available models at [https://ollama.com/search](https://ollama.com/search).
 
@@ -152,7 +158,7 @@ To check installed models:
 ollama list
 ```
 
-To install a different model:
+To install a model manually:
 ```bash
 ollama pull mistral:7b
 ```
@@ -187,25 +193,7 @@ The minimal response format (name only) keeps processing fast and avoids JSON pa
 
 ## Debugging Merchant Cleaning
 
-To test the LLM pipeline directly without processing a full statement:
-
-```bash
-source myenv/bin/activate
-python scripts/test_llm_direct.py
-```
-
-To test a single merchant name through the full clean pipeline:
-
-```bash
-source myenv/bin/activate
-python scripts/test_single_clean.py "WHOLEFDS #00123 AUSTIN TX"
-```
-
-To compare how different models clean the same merchants:
-
-```bash
-python scripts/compare_models.py
-```
+To test a single merchant name through the full clean pipeline, use the CLI processor on a test month, or temporarily add a print statement to `_clean_merchant_name_with_llm()` in `parser.py` for local debugging.
 
 ---
 

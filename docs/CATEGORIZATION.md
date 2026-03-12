@@ -48,31 +48,45 @@ To add or rename a category, edit this file. The dashboard's pie chart and budge
 
 ## Classification Pipeline
 
+```mermaid
+flowchart TD
+    merchant["Cleaned merchant name"]
+    balcheck{"`_suspicious_balance
+flagged?`"}
+    manual_review["Manual review queue"]
+    income_check{"`Income keyword
+match?`"}
+    label_income["label: income<br/>category: Income"]
+    transfer_check{"`Transfer keyword
+match?`"}
+    label_transfer["label: transfer<br/>excluded from expenses"]
+    payapp_check{"`Payment app
+match?`"}
+    needs_review["Flag: needs_review"]
+    pattern_check{"`Cache / pattern
+match?`"}
+    assign_pattern["Assign category directly"]
+    llm["LLM classification<br/>Ollama · returns category name"]
+    assign["Assign category → write to CSV"]
+
+    merchant --> balcheck
+    balcheck -->|yes| manual_review
+    balcheck -->|no| income_check
+    income_check -->|match| label_income
+    income_check -->|no match| transfer_check
+    transfer_check -->|match| label_transfer
+    transfer_check -->|no match| payapp_check
+    payapp_check -->|match| needs_review
+    payapp_check -->|no match| pattern_check
+    pattern_check -->|match| assign_pattern
+    pattern_check -->|no match| llm
+    assign_pattern --> assign
+    llm --> assign
 ```
-Cleaned merchant name
-        │
-        ▼
-1. Income keyword check (config/income_keywords.json)
-        │ match → label: "income", category: "Income"
-        │ no match ↓
-        ▼
-2. Transfer keyword check (config/transfer_keywords.json)
-        │ match → label: "transfer", skip from expenses
-        │ no match ↓
-        ▼
-3. Payment app check (config/payment_apps.json)
-        │ match → flag: "needs_review"
-        │ no match ↓
-        ▼
-4. Pattern matching (config/category_patterns.json)
-        │ match → assign category directly
-        │ no match ↓
-        ▼
-5. LLM classification (Ollama)
-        │ returns category name from the categories list
-        ▼
-Assign category → write to CSV
-```
+
+### Stage 0: Suspicious Balance Routing
+
+Before any keyword checks, transactions flagged `_suspicious_balance = True` by the parser are routed directly to the manual review queue. These are transactions where the parser detected that the extracted amount equals the previous row's running balance — a sign of a PDF column-collapse issue where the real amount was not captured. See [PARSING.md](PARSING.md) for details.
 
 ---
 
@@ -138,21 +152,16 @@ These transactions are placed in a **needs_review** queue displayed in the dashb
 
 ## Stage 4: Pattern Matching
 
-`config/category_patterns.json` maps merchant name patterns to categories:
+The merchant cache (built from previously processed CSVs) and in-memory category-to-keyword maps are checked before calling the LLM. Common merchant name substrings are matched case-insensitively:
 
-```json
-{
-  "Groceries": ["Whole Foods", "Kroger", "Safeway", "Trader Joe", "Publix", "Aldi"],
-  "Fuel": ["Shell", "BP", "Chevron", "Exxon", "Mobil", "Circle K"],
-  "Dining": ["McDonald", "Starbucks", "Chipotle", "Subway", "Domino"],
-  ...
-}
+```
+Groceries: ["Whole Foods", "Kroger", "Safeway", "Trader Joe", "Publix", "Aldi"]
+Fuel:      ["Shell", "BP", "Chevron", "Exxon", "Mobil", "Circle K"]
+Dining:    ["McDonald", "Starbucks", "Chipotle", "Subway", "Domino"]
+...
 ```
 
 Matching is case-insensitive and substring-based. A merchant only needs to contain the pattern (e.g., `"Starbucks Coffee"` matches `"Starbucks"`).
-
-**To add a new pattern:**  
-Open `config/category_patterns.json` and add the merchant name substring to the appropriate category's array.
 
 ---
 
@@ -198,9 +207,8 @@ This is the primary mechanism by which the system improves over time: the more c
 ## Configuration Summary
 
 | File | Controls |
-|------|---------|
-| `config/categories.json` | List of valid category names |
-| `config/category_patterns.json` | Merchant → category pattern rules |
+|------|----------|
+| `config/categories.json` | Flat list of valid category names + `hierarchy` dict for parent→child subcategory rollup |
 | `config/income_keywords.json` | Income detection keywords |
 | `config/payment_apps.json` | Payment apps to flag for review |
 | `config/transfer_keywords.json` | Transfer detection keywords |
@@ -210,12 +218,21 @@ This is the primary mechanism by which the system improves over time: the more c
 
 ## Adding a New Category
 
-1. Add the name to `config/categories.json`
-2. Add merchant patterns to `config/category_patterns.json`:
+### Top-level category
+
+1. Add the name to the `categories` array in `config/categories.json`
+2. Reprocess your statements, or manually re-categorize existing transactions in the UI
+
+### Subcategory (rolls up to a parent in charts)
+
+1. Add the subcategory name to the `categories` array in `config/categories.json`
+2. Add it to the `hierarchy` dict under its parent category:
    ```json
-   "New Category": ["Merchant A", "Merchant B"]
+   "hierarchy": {
+     "Transportation": ["Gas/Fuel", "Auto Maintenance", "Your New Subcategory"]
+   }
    ```
-3. Reprocess your statements, or manually re-categorize existing transactions in the UI
+3. The dashboard automatically rolls subcategories up to their parent in pie charts and trend lines
 
 ---
 

@@ -543,8 +543,8 @@ For everything else, answer naturally with specific details from the data."""
 
     def _parse_intent(self, user_message: str, conversation_history: List[Dict]) -> Dict:
         """
-        Use the intent model (gemma3:27b / primary_model) to parse the user's
-        message into a structured JSON intent.  Falls back to a regex-based
+        Use the intent model (primary_model from config/llm_models.json) to parse
+        the user's message into a structured JSON intent.  Falls back to a regex-based
         parser if the model is unavailable or the JSON is malformed.
         """
         if not self.intent_model:

@@ -43,15 +43,24 @@ else
     echo "🔍 Checking for configured models..."
     TAGS=$(curl -s "${OLLAMA_URL}/api/tags")
 
-    for MODEL_ENTRY in "$PRIMARY_MODEL:primary" "$SECONDARY_MODEL:secondary (ensemble)" "$FINANCIAL_MODEL:financial analysis"; do
-        MODEL="${MODEL_ENTRY%%:*}"
-        ROLE="${MODEL_ENTRY#*:}"
+    for MODEL_ENTRY in "${PRIMARY_MODEL}||primary" "${SECONDARY_MODEL}||secondary (ensemble)" "${FINANCIAL_MODEL}||financial analysis"; do
+        MODEL="${MODEL_ENTRY%%||*}"
+        ROLE="${MODEL_ENTRY##*||}"
         [ -z "$MODEL" ] && continue
-        if echo "$TAGS" | grep -q "\"${MODEL}\""; then
+        if echo "$TAGS" | grep -F -q "\"${MODEL}\"" || echo "$TAGS" | grep -F -q "\"${MODEL}:"; then
             echo "✅ Model found: ${MODEL} (${ROLE})"
         else
-            echo "⚠️  Model not found: ${MODEL} (${ROLE})"
-            echo "   Pull it on host with: ollama pull ${MODEL}"
+            echo "📥 Model not found: ${MODEL} (${ROLE}) — pulling now..."
+            echo "   This may take several minutes for large models."
+            LAST_PULL_LINE=$(curl -s -X POST "${OLLAMA_URL}/api/pull" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\": \"${MODEL}\"}" | tail -1)
+            if echo "$LAST_PULL_LINE" | grep -q '"success"'; then
+                echo "✅ Successfully pulled: ${MODEL}"
+            else
+                echo "⚠️  Pull may have failed for ${MODEL}"
+                echo "   If AI features are missing, pull manually on host: ollama pull ${MODEL}"
+            fi
         fi
     done
 

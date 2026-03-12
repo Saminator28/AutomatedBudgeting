@@ -21,5 +21,6 @@ Welcome to the Automated Budgeting documentation.
 | [PARSING.md](PARSING.md) | PDF parsing engine — how bank statements are read |
 | [LLM_MERCHANT_CLEANING.md](LLM_MERCHANT_CLEANING.md) | LLM-based merchant name cleaning pipeline |
 | [CATEGORIZATION.md](CATEGORIZATION.md) | Transaction categorization system |
+| [CHATBOT_PIPELINE.md](CHATBOT_PIPELINE.md) | Chatbot two-model pipeline — intent parsing, pandas computation, finance advisor |
 | [DASHBOARD.md](DASHBOARD.md) | Web UI and backend API reference |
 | [FUTURE_FEATURES.md](FUTURE_FEATURES.md) | Planned features and technical roadmap |

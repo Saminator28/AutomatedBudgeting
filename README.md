@@ -6,17 +6,22 @@
 
 ## What Is This?
 
-Automated Budgeting reads your bank and credit card statement PDFs and turns them into a clean, interactive dashboard where you can see exactly where your money is going.
+Automated Budgeting reads your bank and credit card statement PDFs and turns them into a clean, interactive dashboard where you can see exactly where your money is going — without any spreadsheets, subscriptions, or accounts.
+
+If you've ever looked at your bank statement and thought *"where did all my money go this month?"* — this is for you.
 
 **What you get:**
 - A web dashboard showing your spending by category (groceries, dining, gas, etc.)
 - Separate breakdowns for income and expenses
 - Charts tracking your spending month over month
+- An AI chatbot that answers questions like "how much did I spend on dining last month?"
 - The ability to upload statements, edit transactions, and re-categorize anything
 
-**Who is it for?** Anyone who downloads PDF statements from their bank and wants a simple way to track their finances — no spreadsheets required.
+**Who is it for?** Anyone who downloads PDF statements from their bank and wants a clear picture of their finances without paying for a budgeting app or handing their data to a third party.
 
-**Works with any bank** — Chase, Bank of America, Wells Fargo, Discover, credit unions, and more.
+> **Bank compatibility note:** The parser has been tested with a selection of US bank and credit card statement formats. Most standard PDF statements work well, but not every bank or format has been verified. If your statement doesn't parse correctly, see [Troubleshooting](#troubleshooting) or open a GitHub issue.
+
+**Works with many banks** — Chase, Bank of America, Wells Fargo, Discover, credit unions, and more.
 
 ---
 
@@ -360,6 +365,38 @@ Transactions are automatically sorted into these categories:
 | Return/Reimbursement | Refunds, credits |
 
 If a transaction ends up in the wrong category, click it in the Transactions tab to change it. The app learns from your corrections.
+
+### Customising Categories
+
+All categories are defined in `config/categories.json`. You can add, rename, or remove categories by editing that file.
+
+**Add a top-level category:**
+1. Open `config/categories.json`
+2. Add the new name to the `"categories"` array:
+   ```json
+   "categories": [
+     "Groceries",
+     "Dining",
+     "Your New Category"
+   ]
+   ```
+3. Restart the app (`docker compose up -d`). The new category will appear in dropdowns and charts immediately.
+
+**Add a subcategory (rolls up to a parent in charts):**
+1. Add the subcategory to the `"categories"` array
+2. Add it under its parent in the `"hierarchy"` dict:
+   ```json
+   "hierarchy": {
+     "Transportation": ["Gas/Fuel", "Auto Maintenance", "Your Subcategory"]
+   }
+   ```
+Subcategories appear individually in transaction lists but are grouped under their parent in pie charts and budget summaries.
+
+**Remove a category:**
+1. Remove it from the `"categories"` array (and from `"hierarchy"` if it's listed there)
+2. Any existing transactions with that category will keep the old label — re-categorize them from the Transactions tab
+
+> **Tip:** Category names are case-sensitive. `"Groceries"` and `"groceries"` are treated as different categories.
 
 ---
 

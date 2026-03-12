@@ -38,9 +38,6 @@ src/ui/build/
 # Statement PDFs (sensitive — may exist anywhere)
 *.pdf
 
-# User-specific LLM model config (contains your local model names)
-config/llm_models.json
-
 # All UI runtime data: statements, monthly_reports, transfer labels, manual entries
 # These all live under src/ui/data/ which is volume-mounted at runtime
 src/ui/data/

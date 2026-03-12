@@ -45,7 +45,7 @@ This document describes how all components of Automated Budgeting fit together.
                             ┌──────────────────────┐
                             │       Ollama          │
                             │  (runs on host OS)    │
-                            │  qwen2.5:14b          │
+                            │  see llm_models.json  │
                             └──────────────────────┘
 ```
 
@@ -53,31 +53,39 @@ This document describes how all components of Automated Budgeting fit together.
 
 ## Data Flow: Statement Processing
 
-```
-PDF file
-   │
-   ▼
-pdf_extractor.py (pdfplumber)
-   │  raw text
-   ▼
-parser.py - StatementParser
-   │  detects bank, parses date/amount/merchant rows
-   ▼
-_strip_trailing_state()
-   │  removes "City ST" suffixes from raw merchant strings
-   ▼
-llm_utils.py - clean_merchant_with_ensemble()
-   │  Ollama: qwen2.5:14b [+ llama3.1:8b if multi-model]
-   │  returns cleaned merchant name + confidence score
-   ▼
-categorizer.py - TransactionCategorizer
-   │  pattern matching → Ollama classification
-   │  checks income_keywords, payment_apps, transfer_keywords
-   ▼
-Output CSV (same folder as PDF)
-   │  columns: date, type, merchant, category, amount, label
-   ▼
-monthly_reports/ aggregate CSV
+```mermaid
+flowchart TD
+    PDF[PDF file]
+    ext["pdf_extractor.py<br/>pdfplumber"]
+    ocr["pytesseract<br/>OCR fallback"]
+    parser["parser.py — StatementParser<br/>detects bank · parses date/amount/merchant rows"]
+    strip["_strip_trailing_state()<br/>City ST suffixes removed"]
+    ninja["Wordninja pre-split<br/>ALL CAPS ≥10 chars → spaced words"]
+    bankops{"`_BANK_OPS
+bypass?`"}
+    canonical["Canonical name assigned<br/>manually_cleaned = True"]
+    cache{"`Cache
+hit?`"}
+    llm["llm_utils.py<br/>clean_merchant_with_ensemble()"]
+    cat["categorizer.py<br/>TransactionCategorizer<br/>pattern matching → Ollama classification"]
+    csv["Output CSV<br/>statements/YYYY-MM/"]
+    report["monthly_reports/<br/>aggregate CSV"]
+
+    PDF --> ext
+    ext -->|blank text| ocr
+    ext -->|raw text| parser
+    ocr -->|raw text| parser
+    parser --> strip
+    strip --> ninja
+    ninja --> bankops
+    bankops -->|yes| canonical
+    canonical --> cat
+    bankops -->|no| cache
+    cache -->|hit| cat
+    cache -->|miss| llm
+    llm -->|cache write| cache
+    cat --> csv
+    csv --> report
 ```
 
 ---
@@ -112,8 +120,8 @@ monthly_reports/ aggregate CSV
 |------|---------------|
 | `process_monthly.py` | CLI entry point for batch processing a month |
 | `setup_monthly.py` | First-run setup helper |
-| `compare_models.py` | Benchmarks different Ollama models |
-| `test_llm_direct.py` | Validates Ollama connectivity |
+| `aggregate_monthly.py` | Aggregates parsed CSVs into monthly summary reports |
+| `launch_dashboard.sh` | Convenience script to start the dashboard |
 
 ---
 
@@ -174,16 +182,27 @@ Read endpoints remain unauthenticated.
 
 Statement processing is CPU and I/O heavy. When triggered from the UI, FastAPI runs the job in a background thread and returns a `job_id` immediately. The client polls `/api/jobs/{job_id}` to check status.
 
-```
-POST /api/process-statements
-   │  returns { "job_id": "abc123", "status": "running" }
-   │
-   ▼ (background thread)
-StatementParser.parse() + categorizer.categorize()
-   │
-   ▼
-job state → "completed" or "failed"
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant API as FastAPI Backend
+    participant Thread as Background Thread
 
-GET /api/jobs/abc123
-   │  returns { "status": "completed", "result": {...} }
+    Browser->>API: POST /api/process-statements
+    API->>Thread: Spawn background job
+    API-->>Browser: { job_id, status: "running" }
+
+    loop Poll every few seconds
+        Browser->>API: GET /api/jobs/{job_id}
+        API-->>Browser: { status: "running" }
+    end
+
+    Thread->>Thread: StatementParser.parse()
+    Thread->>Thread: categorizer.categorize()
+    Note over Thread: Writes output CSVs to disk
+    Thread-->>API: job state → "completed"
+
+    Browser->>API: GET /api/jobs/{job_id}
+    API-->>Browser: { status: "completed", result: {...} }
+    Browser->>Browser: Refresh transaction list
 ```

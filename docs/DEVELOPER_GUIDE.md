@@ -101,10 +101,12 @@ On macOS curl is pre-installed. On Windows use the [Ollama Windows installer](ht
 
 ```bash
 ollama serve          # if not already running as a service
-ollama pull qwen2.5:14b
+ollama pull qwen3.5:9b   # or whichever model is set in config/llm_models.json
 ```
 
-Browse available models at [https://ollama.com/search](https://ollama.com/search). Larger models (e.g. `qwen2.5:32b`) produce cleaner merchant names but require more RAM. Update `config/llm_models.json` after pulling a different model.
+Check `config/llm_models.json` for the current `primary_model` setting. Browse available models at [https://ollama.com/search](https://ollama.com/search). Larger models (e.g. `qwen2.5:32b`) produce cleaner merchant names but require more RAM. Update `config/llm_models.json` after pulling a different model.
+
+> **Docker mode:** The container entrypoint auto-pulls any configured model that is not already present — no manual pull needed.
 
 ### 6. Start the backend
 
@@ -150,14 +152,11 @@ This will:
 ### Other useful scripts
 
 ```bash
-# Test LLM connection
-python scripts/test_llm_direct.py
+# Run the statement processor on a specific month
+python scripts/process_monthly.py --month 2025-06
 
-# Compare model accuracy
-python scripts/compare_models.py
-
-# Test normalize pipeline
-python scripts/test_normalize.py
+# Aggregate parsed CSVs into monthly summary reports
+python scripts/aggregate_monthly.py --month 2025-06
 ```
 
 ---
@@ -169,13 +168,13 @@ Controls which Ollama model(s) are used.
 
 ```json
 {
-  "primary_model": "qwen2.5:14b",
-  "secondary_model": "llama3.1:8b",
-  "use_multi_model": true
+  "primary_model": "qwen3.5:9b",
+  "secondary_model": "",
+  "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor"
 }
 ```
 
-Set `use_multi_model` to `false` to use only the primary model.
+Set `secondary_model` to a non-empty model name to enable ensemble merchant cleaning. Set to `""` to use only the primary model.
 
 ### `config/categories.json`
 The list of categories used for classification. Add, remove, or rename categories here.

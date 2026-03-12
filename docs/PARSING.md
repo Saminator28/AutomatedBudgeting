@@ -27,10 +27,17 @@ Uses **pdfplumber** to extract raw text from each page. pdfplumber preserves the
 
 The OCR fallback (`pytesseract`) is used when pdfplumber returns empty or near-empty text — typically for scanned PDFs (photos of paper statements).
 
-```
-PDF → pdfplumber → raw text string
-               ↓ (if blank)
-            pytesseract (OCR) → raw text string
+```mermaid
+flowchart LR
+    PDF[PDF file]
+    plumber["pdfplumber\nextract text"]
+    ocr["pytesseract\nOCR fallback"]
+    text["Raw text string"]
+
+    PDF --> plumber
+    plumber -->|text found| text
+    plumber -->|blank / empty| ocr
+    ocr --> text
 ```
 
 ### 2. Bank / Institution Detection
@@ -102,6 +109,30 @@ Before sending a merchant name to the LLM, state/province abbreviations are stri
 - City prefix must be ≥ 4 characters (prevents false positives like `"OK"` for Oklahoma)
 - Runs before all other cleaning to reduce noise in LLM prompts
 
+### 7a. Wordninja Pre-split
+
+All-caps merchant strings that are 10 or more characters long and contain no spaces are split into words using wordninja before being passed to the LLM:
+
+```
+"FIXITFORWARD"  →  "Fix It Forward"
+```
+
+This prevents the LLM from receiving a single unbroken uppercase token it cannot decode.
+
+### 7b. Bank Operation Bypass (`_BANK_OPS`)
+
+Certain well-known bank operation descriptions are assigned canonical names directly, bypassing the LLM entirely:
+
+| Raw description | Canonical name |
+|-----------------|---------------|
+| `MOBILE DEPOSIT` | `Mobile Deposit` |
+| `DIRECT DEPOSIT` | `Direct Deposit` |
+| `ACH DEPOSIT` | `ACH Deposit` |
+| `COUNTER DEPOSIT` | `Counter Deposit` |
+| `NIGHT DEPOSIT` | `Night Deposit` |
+
+Matching is done with `str.startswith()` on the uppercased description, so variants like `"MOBILE DEPOSIT 11/05"` are caught. These are marked `manually_cleaned = True` and skip all LLM validation.
+
 ### 8. Transfer Detection: `filter_transfers()`
 
 Reads `config/transfer_keywords.json`. Any transaction whose description contains a listed keyword is labeled `transfer` and excluded from expense and income totals.
@@ -117,6 +148,18 @@ These appear in the UI's **Review** queue for manual merchant/category assignmen
 ### 10. Income Detection
 
 Reads `config/income_keywords.json`. If the merchant/description matches an income keyword (e.g., employer name, `"DIRECT DEPOSIT"`, `"PAYROLL"`), the transaction is labeled `income` instead of `expense`.
+
+Note: `_BANK_OPS` entries such as `Direct Deposit` are resolved before this stage — they bypass the LLM and arrive at income detection with a clean canonical name already set.
+
+### 11. Balance-as-Amount Detection
+
+When pdfplumber collapses a multi-column PDF layout, a transaction row may contain the running account balance rather than the transaction amount. The parser detects this by comparing each extracted amount to the previous row's running balance:
+
+- If `amount == previous_balance` (within \$0.01), the transaction is flagged `_suspicious_balance = True`
+- Flagged transactions are routed to the **manual review** queue instead of expenses or income
+- A warning is printed: `⚠ Suspicious amount (= prev balance $X.XX): Merchant Date — routed to manual review`
+
+The user can then supply the correct amount via the dashboard's Transactions tab.
 
 ---
 
@@ -137,6 +180,7 @@ StatementParser(pdf_path: str, month: str)
 | `filter_transfers(transactions)` | Removes inter-account transfers |
 | `_fix_date_parsing_errors(date_str)` | Normalizes edge-case date formats |
 | `_load_user_corrections_from_csvs()` | Loads merchant history from existing CSVs for cache seeding |
+| `classify_transactions(transactions, is_bank_account)` | Routes transactions to income, expenses, or manual review |
 
 ---
 
@@ -146,3 +190,4 @@ StatementParser(pdf_path: str, month: str)
 - **Scanned PDFs**: OCR accuracy depends on scan quality. Poor scans may produce garbled merchant names.
 - **No table extraction**: pdfplumber table mode is not used; line-by-line parsing handles most formats but can be confused by complex multi-column layouts.
 - **Single page per PDF**: If a long statement spans many pages, the date-inference logic assumes year continuity across pages.
+- **Balance column collapse**: Some PDFs (e.g., FNBO) produce a layout where pdfplumber reads the running balance column instead of the transaction amount column. The balance-as-amount detector (step 11) catches the most obvious case but cannot guarantee detection for every bank format.
