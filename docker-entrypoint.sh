@@ -47,7 +47,7 @@ else
         MODEL="${MODEL_ENTRY%%||*}"
         ROLE="${MODEL_ENTRY##*||}"
         [ -z "$MODEL" ] && continue
-        if echo "$TAGS" | grep -q "\"${MODEL}\"" || echo "$TAGS" | grep -q "\"${MODEL}:"; then
+        if echo "$TAGS" | grep -F -q "\"${MODEL}\"" || echo "$TAGS" | grep -F -q "\"${MODEL}:"; then
             echo "✅ Model found: ${MODEL} (${ROLE})"
         else
             echo "📥 Model not found: ${MODEL} (${ROLE}) — pulling now..."
