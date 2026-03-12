@@ -145,13 +145,13 @@ class StatementParser:
     def _presplit_merged_tokens(text: str) -> str:
         """Split all-uppercase tokens that look like concatenated words using wordninja.
 
-        Targets tokens that are ALL-CAPS, contain no digits, and are ≥ 14 characters
+        Targets tokens that are ALL-CAPS, contain no digits, and are ≥ 10 characters
         — the signature of a merged merchant name from a PDF with no inter-word spaces.
 
         Example:
           THECOFFEEHOUSE       → THE COFFEE HOUSE
 
-        Tokens under the 14-char threshold (STARBUCKS, WALMART, WHOLEFDS …) are left
+        Tokens under the 10-char threshold (WALMART, WHOLEFDS …) are left
         alone — they are recognisable brand abbreviations, not concatenated phrases.
         Silently returns the original text unchanged if wordninja is not installed.
         """
@@ -1028,8 +1028,8 @@ class StatementParser:
                         print(f"  [SUSPICIOUS BALANCE] {trans['Transaction Date']} {trans.get('Place', '')[:25]}: "
                               f"Amount ${trans['Amount']:.2f} == prev balance ${_prev_balance_tracker:.2f} — routing to manual review")
 
-                # Update balance tracker whenever a row carries a Balance field
-                if trans.get('Balance') and trans['Balance'] > 0:
+                # Update balance tracker whenever a row carries a Balance field (any numeric value, including 0/negative)
+                if 'Balance' in trans and isinstance(trans['Balance'], (int, float)):
                     _prev_balance_tracker = trans['Balance']
 
                 transactions.append(trans)
