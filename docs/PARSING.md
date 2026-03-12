@@ -27,10 +27,17 @@ Uses **pdfplumber** to extract raw text from each page. pdfplumber preserves the
 
 The OCR fallback (`pytesseract`) is used when pdfplumber returns empty or near-empty text — typically for scanned PDFs (photos of paper statements).
 
-```
-PDF → pdfplumber → raw text string
-               ↓ (if blank)
-            pytesseract (OCR) → raw text string
+```mermaid
+flowchart LR
+    PDF[PDF file]
+    plumber["pdfplumber\nextract text"]
+    ocr["pytesseract\nOCR fallback"]
+    text["Raw text string"]
+
+    PDF --> plumber
+    plumber -->|text found| text
+    plumber -->|blank / empty| ocr
+    ocr --> text
 ```
 
 ### 2. Bank / Institution Detection

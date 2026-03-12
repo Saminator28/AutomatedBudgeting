@@ -24,42 +24,36 @@ The cleaning pipeline uses a local LLM (via Ollama) to handle the wide variety o
 
 ## Pipeline Overview
 
-```
-Raw merchant string
-        │
-        ▼
-_strip_trailing_state()       ← removes "City ST" suffixes
-        │
-        ▼
-Wordninja pre-split           ← splits all-caps strings ≥10 chars (e.g. FIXITFORWARD → FIX IT FORWARD)
-        │
-        ▼
-_BANK_OPS bypass              ← MOBILE DEPOSIT, DIRECT DEPOSIT, etc. → canonical name, no LLM
-        │
-        ▼
-Cache lookup                  ← check merchant history (CSVs)
-        │ miss                │ hit → return cached result
-        ▼
-clean_merchant_with_ensemble()
-        │
-        ├─ Primary model  (from config/llm_models.json)
-        │       │
-        │       ▼
-        │   response + confidence
-        │
-        ├─ (if secondary_model is set)
-        │   Secondary model (from config/llm_models.json)
-        │       │
-        │       ▼
-        │   response + confidence
-        │
-        ▼
-Ensemble reconciliation
-        │  both agree → primary result (high confidence)
-        │  disagree   → primary result (if confidence > threshold)
-        │             → secondary result (if primary < threshold)
-        ▼
-Cache write + return
+```mermaid
+flowchart TD
+    raw["Raw merchant string"]
+    strip["_strip_trailing_state()<br/>remove City ST suffixes"]
+    ninja["Wordninja pre-split<br/>ALL CAPS ≥10 chars → spaced words"]
+    bankops{"`_BANK_OPS
+bypass?`"}
+    canonical["Return canonical name<br/>e.g. Mobile Deposit<br/>manually_cleaned = True"]
+    cache{"`Cache
+hit?`"}
+    cached["Return cached result"]
+    primary["Primary model<br/>response + confidence"]
+    secondary{"`secondary_model
+configured?`"}
+    sec_model["Secondary model<br/>response + confidence"]
+    reconcile["Ensemble reconciliation<br/>both agree → primary result<br/>disagree → higher-confidence result"]
+    cache_write["Cache write + return"]
+
+    raw --> strip
+    strip --> ninja
+    ninja --> bankops
+    bankops -->|yes| canonical
+    bankops -->|no| cache
+    cache -->|hit| cached
+    cache -->|miss| primary
+    primary --> secondary
+    secondary -->|yes| sec_model
+    sec_model --> reconcile
+    secondary -->|no| reconcile
+    reconcile --> cache_write
 ```
 
 ---

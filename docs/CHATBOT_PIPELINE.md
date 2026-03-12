@@ -20,102 +20,35 @@ Python + pandas sits between them and performs all actual calculations — neith
 
 ## Pipeline Diagram
 
-```
-User message
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────┐
-│  ConversationState                                          │
-│  Carries forward: active_period, active_category,          │
-│  active_merchant, savings_goals, budget_targets            │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ (updated each turn)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Step 1: Intent Parsing                                     │
-│                                                             │
-│  Model: primary_model  (temp = 0.0, max 400 tokens)        │
-│                                                             │
-│  Input:  user message + last 4 messages + today's date     │
-│  Output: JSON intent object                                 │
-│                                                             │
-│  {                                                          │
-│    "type": "expense_query | budget_request |               │
-│             savings_goal | income_query | general_advice", │
-│    "period": "YYYY-MM | YYYY | null",                      │
-│    "months_window": 6,                                      │
-│    "category": "Dining | Groceries | ...",                  │
-│    "action": "total | average | max | list | ...",         │
-│    "goal_amount": 5000,                                     │
-│    "goal_purpose": "car"                                    │
-│  }                                                          │
-│                                                             │
-│  Fallback: regex parser (used if model fails or is slow)   │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ structured intent
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Step 2: Context Resolution                                 │
-│                                                             │
-│  _apply_conversation_context()                              │
-│  • Merges intent into ConversationState                     │
-│  • Applies period filter to expenses + income DataFrames   │
-│  • Applies category filter (expands parent → subcategories)│
-│                                                             │
-│  "what restaurant most?" → inherits period from prior turn │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ filtered DataFrames
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Step 3: Pandas Computation  (NO LLM involved)              │
-│                                                             │
-│  Dispatches to one of:                                      │
-│                                                             │
-│  _calculate_facts_with_pandas()  ← expense / income query  │
-│    • totals, averages, top merchants, category breakdown    │
-│    • full transaction list for the filtered period          │
-│                                                             │
-│  _calculate_budget_suggestion()  ← budget_request          │
-│    • averages last 3–6 months by category                  │
-│    • compares to income and 50/30/20 rule benchmarks        │
-│                                                             │
-│  _calculate_savings_plan()       ← savings_goal            │
-│    • computes months-to-goal given avg income vs expenses   │
-│    • stores / updates goals in ConversationState           │
-│                                                             │
-│  Output: rich plain-text data block (100% accurate figures)│
-└──────────────────────────┬──────────────────────────────────┘
-                           │ verified data block
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Step 4: Finance Advisor Response                           │
-│                                                             │
-│  Model: financial_analysis_model  (temp = 0.7, max 1200 t) │
-│                                                             │
-│  System prompt contains:                                    │
-│   • The user's question                                     │
-│   • The verified pandas data block (numbers it MUST use)   │
-│   • Conversation context summary                            │
-│   • Style rules (direct, no filler, lead with answer)      │
-│   • Role rules (never invent numbers, flag 50/30/20 gaps)  │
-│                                                             │
-│  Message list: system + last 8 turns + current user msg    │
-│                                                             │
-│  Normal response  → plain conversational text              │
-│  Update request   → JSON { "action": "update_expense", … } │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-              ┌────────────────────────┐
-              │  Update request?       │
-              │  _execute_action()     │
-              │  Writes to CSV,        │
-              │  returns confirmation  │
-              └──────────┬─────────────┘
-                         │ otherwise
-                         ▼
-                  Response text
-                  returned to UI
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as React UI
+    participant API as FastAPI Backend
+    participant State as ConversationState
+    participant Parser as Intent Parser (primary_model)
+    participant Pandas as Python / Pandas
+    participant Finance as Finance Advisor (financial_analysis_model)
+
+    User->>UI: Types message
+    UI->>API: POST /api/chat
+    API->>State: Restore context from prior turns
+    API->>Parser: message + last 4 turns + today's date
+    Note over Parser: temp=0.0 · max 400 tokens<br/>Returns JSON: type, period,<br/>category, action, goal_amount ...
+    Parser-->>API: Structured intent JSON
+    API->>State: Update active_period, active_category, etc.
+    API->>Pandas: Filter DataFrames + compute facts
+    Note over Pandas: _calculate_facts_with_pandas()<br/>_calculate_budget_suggestion()<br/>_calculate_savings_plan()
+    Pandas-->>API: Verified data block (no LLM arithmetic)
+    API->>Finance: System prompt + data block + last 8 turns
+    Note over Finance: temp=0.7 · max 1200 tokens
+    Finance-->>API: Conversational response
+    alt Update request (mark expense / add note)
+        API->>Pandas: _execute_action() — write CSV
+        Pandas-->>API: Confirmation message
+    end
+    API-->>UI: response + actions_taken + model_name
+    UI-->>User: Displays answer
 ```
 
 ---
