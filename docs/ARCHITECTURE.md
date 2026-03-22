@@ -30,14 +30,14 @@ This document describes how all components of Automated Budgeting fit together.
 │  ├─ statements/      │◄───┤  1. PDF Upload (browser)       │
 │  │  └─ YYYY-MM/      │    │  2. StatementParser            │
 │  │     ├─ *.pdf      │    │     src/statement_parser/      │
-│  │     ├─ *.csv      │    │     parser.py                  │
-│  │     └─ ...        │    │  3. LLM Merchant Cleaning      │
-│  └─ monthly_reports/ │    │     src/statement_parser/      │
-│     └─ *.csv         │    │     llm_utils.py               │
-└──────────────────────┘    │  4. TransactionCategorizer     │
+│  │     └─ *.csv      │    │     parser.py                  │
+│  └─ budget.db        │    │  3. LLM Merchant Cleaning      │
+│     (SQLite)         │    │     src/statement_parser/      │
+└──────────────────────┘    │     llm_utils.py               │
+                            │  4. TransactionCategorizer     │
                             │     src/ai_classification/     │
                             │     categorizer.py             │
-                            │  5. Write output CSVs          │
+                            │  5. Write to SQLite DB         │
                             └──────────┬─────────────────────┘
                                        │
                                        │ HTTP (localhost:11434)
@@ -68,8 +68,7 @@ bypass?`"}
 hit?`"}
     llm["llm_utils.py<br/>clean_merchant_with_ensemble()"]
     cat["categorizer.py<br/>TransactionCategorizer<br/>pattern matching → Ollama classification"]
-    csv["Output CSV<br/>statements/YYYY-MM/"]
-    report["monthly_reports/<br/>aggregate CSV"]
+    csv["Statement CSV<br/>statements/YYYY-MM/"]
 
     PDF --> ext
     ext -->|blank text| ocr
@@ -85,7 +84,7 @@ hit?`"}
     cache -->|miss| llm
     llm -->|cache write| cache
     cat --> csv
-    csv --> report
+    csv --> db[(SQLite DB<br/>budget.db)]
 ```
 
 ---
@@ -118,9 +117,9 @@ hit?`"}
 
 | File | Responsibility |
 |------|---------------|
-| `process_monthly.py` | CLI entry point for batch processing a month |
+| `process_monthly.py` | CLI entry point for batch processing a month; writes to DB |
 | `setup_monthly.py` | First-run setup helper |
-| `aggregate_monthly.py` | Aggregates parsed CSVs into monthly summary reports |
+| `aggregate_monthly.py` | Re-classifies all DB transactions and writes results back |
 | `launch_dashboard.sh` | Convenience script to start the dashboard |
 
 ---
@@ -132,17 +131,14 @@ src/ui/data/
 ├── statements/
 │   ├── 2025-01/
 │   │   ├── bank_checking_jan.pdf     ← uploaded PDF
-│   │   ├── bank_checking_jan.csv     ← parsed output
+│   │   ├── bank_checking_jan.csv     ← parsed statement CSV (kept as source record)
 │   │   └── ...
 │   ├── 2025-02/
 │   └── ...
-└── monthly_reports/
-    ├── expenses_2025-01.csv          ← aggregated month report
-    ├── expenses_2025-02.csv
-    └── ...
+└── budget.db                         ← SQLite database (sole authoritative data store)
 ```
 
-The React dashboard reads from this data directory. Any CSV written here by the parser immediately becomes available in the UI (after page refresh or next data fetch).
+All transactions, merchant metadata, keyword lists, and transfer records are stored in `budget.db`. The API reads exclusively from the database. Statement CSVs in `statements/YYYY-MM/` are kept as source records for re-processing but are not read back by the API.
 
 ---
 
@@ -199,7 +195,7 @@ sequenceDiagram
 
     Thread->>Thread: StatementParser.parse()
     Thread->>Thread: categorizer.categorize()
-    Note over Thread: Writes output CSVs to disk
+    Note over Thread: Writes transactions to budget.db
     Thread-->>API: job state → "completed"
 
     Browser->>API: GET /api/jobs/{job_id}

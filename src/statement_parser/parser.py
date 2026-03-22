@@ -3,6 +3,7 @@
 Clean PDF statement parser with LLM merchant name cleaning.
 """
 
+import hashlib
 import pandas as pd
 import re
 from pathlib import Path
@@ -56,16 +57,23 @@ class StatementParser:
                 # If running from project root
                 self.config_dir = Path('config')
         
-        # Load configs
-        self.income_keywords = self._load_config('income_keywords.json', 'income_keywords')
-        self.transfer_keywords = self._load_config('transfer_keywords.json', 'keywords')
-        self.payment_apps = self._load_config('payment_apps.json', 'payment_app_keywords')
-        self.ignore_keywords = self._load_config('ignore_transactions.json', 'ignore_keywords')
-        # Convert to uppercase for matching
-        self.income_keywords = [k.upper() for k in self.income_keywords]
-        self.transfer_keywords = [k.upper() for k in self.transfer_keywords]
-        self.payment_apps = [k.upper() for k in self.payment_apps]
-        self.ignore_keywords = [k.upper() for k in self.ignore_keywords]
+        # Load keyword lists from DB (inline sqlite3, same pattern as detect_bank_name)
+        import sqlite3 as _sqlite3
+        from pathlib import Path as _KWPath
+        _kw_db = _KWPath(__file__).parent.parent / 'ui' / 'data' / 'budget.db'
+        try:
+            _con = _sqlite3.connect(_kw_db)
+            self.income_keywords   = [r[0].upper() for r in _con.execute('SELECT keyword FROM income_keywords').fetchall()]
+            self.transfer_keywords = [r[0].upper() for r in _con.execute('SELECT keyword FROM transfer_keywords').fetchall()]
+            self.payment_apps      = [r[0].upper() for r in _con.execute('SELECT keyword FROM payment_app_keywords').fetchall()]
+            self.ignore_keywords   = [r[0].upper() for r in _con.execute('SELECT keyword FROM ignore_keywords').fetchall()]
+            _con.close()
+        except Exception as _kw_exc:
+            print(f"⚠ Could not load keywords from DB ({_kw_exc}). Keyword matching will be limited.")
+            self.income_keywords   = []
+            self.transfer_keywords = []
+            self.payment_apps      = []
+            self.ignore_keywords   = []
         
         # Load LLM model configuration - STRICT VALIDATION (no defaults)
         llm_config_file = self.config_dir / 'llm_models.json'
@@ -112,7 +120,31 @@ class StatementParser:
         self.raw_to_clean_cache = {}   # normalize(Place_Original) -> Place
         self.clean_name_fp = {}        # normalize(Place) -> Place (for prefix lookup)
         self._load_user_corrections_from_csvs()  # Load from CSV files
+
+
     
+    @staticmethod
+    def _institution_fingerprint(header_text: str) -> str:
+        """Stable 16-char hex key for the same account across statement months.
+
+        Strips dates and dollar amounts (the only parts that change month-to-month)
+        before hashing, so January and February statements for the same card produce
+        the same key.
+        """
+        s = header_text
+        # Strip dates: MM/DD/YY, MM/DD/YYYY
+        s = re.sub(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b', '', s)
+        # Strip written dates: "January 2026", "Jan. 31, 2026" etc.
+        s = re.sub(
+            r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b',
+            '', s, flags=re.IGNORECASE
+        )
+        # Strip dollar amounts
+        s = re.sub(r'\$[\d,]+\.\d{2}', '', s)
+        # Normalise whitespace; take first 1000 chars
+        s = re.sub(r'\s+', ' ', s).strip()[:1000]
+        return hashlib.md5(s.encode()).hexdigest()[:16]
+
     def _load_config(self, filename: str, key: str):
         """Load configuration from JSON file."""
         config_file = self.config_dir / filename
@@ -337,55 +369,61 @@ class StatementParser:
         return card_score > bank_score
     
     def detect_bank_name(self, text: str) -> str:
-        """Extract bank/institution name from statement text using generic pattern matching."""
+        """Identify the issuing institution using the LLM with a DB-backed cache.
+
+        The institution_cache table is keyed by a stable header fingerprint so the
+        same account always returns the same name regardless of which month's
+        statement is being parsed.
+        """
+        import sqlite3
+        from pathlib import Path as _Path
+
         lines = text.split('\n')
         header_lines = [re.sub(r'\s+', ' ', ln).strip() for ln in lines[:80] if ln.strip()]
         header_text = ' '.join(header_lines)
+        fp = self._institution_fingerprint(header_text)
+
+        db_path = _Path(__file__).parent.parent / 'ui' / 'data' / 'budget.db'
+        try:
+            con = sqlite3.connect(db_path)
+            row = con.execute(
+                'SELECT institution_name FROM institution_cache WHERE header_fp=?', (fp,)
+            ).fetchone()
+            if row:
+                if getattr(self, 'debug', False):
+                    print(f'  [institution] DB cache hit: {repr(row[0])}')
+                con.close()
+                return row[0]
+        except Exception:
+            con = None
+
+        # Not cached — ask the LLM
+        from .llm_utils import detect_institution_with_llm
+        name = detect_institution_with_llm(
+            header_text,
+            model=self.primary_model,
+            debug=getattr(self, 'debug', False),
+        )
+        if name and con is not None:
+            try:
+                con.execute(
+                    'INSERT OR REPLACE INTO institution_cache (header_fp, institution_name) VALUES (?,?)',
+                    (fp, name)
+                )
+                con.commit()
+            except Exception:
+                pass
+
+        if con is not None:
+            con.close()
+
+        if name:
+            return name
+
+        # Minimal fallback
         text_upper = text.upper()
-
-        def _clean_name(raw: str) -> str:
-            name = re.sub(r'\s+', ' ', str(raw or '')).strip(" .,:;-\t")
-            name = re.sub(r'\b(MEMBER FDIC|EQUAL HOUSING LENDER|N\.?A\.?)\b', '', name, flags=re.IGNORECASE)
-            name = re.sub(r'\s+', ' ', name).strip(" .,:;-")
-            return name.title() if name else ''
-
-        # 1) Strong signal: "Issued by <institution>"
-        issuer_match = re.search(
-            r'ISSUED\s+BY\s+([A-Z][A-Z0-9&.,\- ]{2,80}?(?:BANK|FINANCIAL|CREDIT UNION|NATIONAL BANK|SAVINGS BANK|TRUST))\b',
-            header_text.upper()
-        )
-        if issuer_match:
-            issuer_name = _clean_name(issuer_match.group(1))
-            if issuer_name:
-                return issuer_name
-
-        # 2) Institution phrase in header lines
-        for line in header_lines:
-            phrase_match = re.search(
-                r'\b([A-Z][A-Z0-9&.,\- ]{2,80}?(?:BANK|FINANCIAL|CREDIT UNION|NATIONAL BANK|SAVINGS BANK|TRUST))\b',
-                line.upper()
-            )
-            if phrase_match:
-                candidate = _clean_name(phrase_match.group(1))
-                if candidate:
-                    return candidate
-
-        # 3) Domain fallback (www.example.com or example.com)
-        domain_matches = re.findall(
-            r'\b(?:https?://)?(?:www\.)?([a-z0-9-]{3,})\.(com|org|net|bank|creditunion)\b',
-            text.lower()
-        )
-        for domain, _tld in domain_matches:
-            if domain in {'google', 'youtube', 'facebook', 'twitter', 'instagram'}:
-                continue
-            parts = [p for p in domain.split('-') if p and p not in {'www', 'my', 'online', 'secure'}]
-            if parts:
-                return ' '.join(parts).title()
-
-        # 4) Generic card fallback
-        if any(network in text_upper for network in ['VISA', 'MASTERCARD', 'AMEX', 'DISCOVER', 'CREDIT CARD']):
+        if any(n in text_upper for n in ['VISA', 'MASTERCARD', 'AMEX', 'DISCOVER', 'CREDIT CARD']):
             return 'Card Issuer'
-
         return 'Unknown Institution'
     
     def _fix_date_parsing_errors(self, date_str: str) -> str:

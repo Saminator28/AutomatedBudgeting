@@ -384,16 +384,16 @@ All categories are defined in `config/categories.json`. You can add, rename, or 
 
 **Add a subcategory (rolls up to a parent in charts):**
 1. Add the subcategory to the `"categories"` array
-2. Add it under its parent in the `"hierarchy"` dict:
+2. Add it under its parent in the `"subcategories"` dict:
    ```json
-   "hierarchy": {
+   "subcategories": {
      "Transportation": ["Gas/Fuel", "Auto Maintenance", "Your Subcategory"]
    }
    ```
 Subcategories appear individually in transaction lists but are grouped under their parent in pie charts and budget summaries.
 
 **Remove a category:**
-1. Remove it from the `"categories"` array (and from `"hierarchy"` if it's listed there)
+1. Remove it from the `"categories"` array (and from `"subcategories"` if it's listed there)
 2. Any existing transactions with that category will keep the old label — re-categorize them from the Transactions tab
 
 > **Tip:** Category names are case-sensitive. `"Groceries"` and `"groceries"` are treated as different categories.

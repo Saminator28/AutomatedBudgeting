@@ -198,7 +198,7 @@ For each review item, you can:
 
 ## Learning from Corrections
 
-Every time you correct a merchant name or category in the UI, that correction is written to the CSV. The next time the same raw merchant string appears (in any future month), `_load_user_corrections_from_csvs()` picks it up and uses your correction directly — the LLM is not called again.
+Every time you correct a merchant name or category in the UI, that correction is persisted to the SQLite database with the `user_corrected = 1` flag on the transaction row. The next time the same raw merchant string appears (in any future month), the correction is read directly from DB merchant metadata — the LLM is not called again.
 
 This is the primary mechanism by which the system improves over time: the more corrections you make, the fewer manual reviews you need in future months.
 
@@ -208,7 +208,7 @@ This is the primary mechanism by which the system improves over time: the more c
 
 | File | Controls |
 |------|----------|
-| `config/categories.json` | Flat list of valid category names + `hierarchy` dict for parent→child subcategory rollup |
+| `config/categories.json` | Flat list of valid category names + `subcategories` dict for parent→child subcategory rollup |
 | `config/income_keywords.json` | Income detection keywords |
 | `config/payment_apps.json` | Payment apps to flag for review |
 | `config/transfer_keywords.json` | Transfer detection keywords |
@@ -226,9 +226,9 @@ This is the primary mechanism by which the system improves over time: the more c
 ### Subcategory (rolls up to a parent in charts)
 
 1. Add the subcategory name to the `categories` array in `config/categories.json`
-2. Add it to the `hierarchy` dict under its parent category:
+2. Add it to the `subcategories` dict under its parent category:
    ```json
-   "hierarchy": {
+   "subcategories": {
      "Transportation": ["Gas/Fuel", "Auto Maintenance", "Your New Subcategory"]
    }
    ```

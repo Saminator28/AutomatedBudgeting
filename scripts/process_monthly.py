@@ -303,6 +303,31 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
     csv_dir = month_dir
     csv_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── DB engine init (primary store; CSVs only written when debug=True) ──────
+    _db_engine = None
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from src.database.session import init_db as _init_db
+        from src.database.db_utils import write_month_to_db as _write_month, write_transfers_to_db as _write_transfers
+        _db_engine = _init_db()
+    except ImportError:
+        pass  # SQLAlchemy not installed
+    except Exception as _dbe:
+        print(f"⚠  DB init failed: {_dbe}")
+
+    # Detect if this month has already been processed in the DB
+    _has_db_data = False
+    if _db_engine is not None:
+        try:
+            from sqlalchemy import text as _sql_text
+            with _db_engine.connect() as _conn:
+                _cnt = _conn.execute(_sql_text(
+                    "SELECT COUNT(*) FROM transactions WHERE report_month=:m"
+                ), {'m': month_name}).scalar()
+            _has_db_data = (_cnt or 0) > 0
+        except Exception:
+            pass
+
     # Load previously classified transactions from manual review (skip if forcing reprocess)
     manual_review_file = csv_dir / 'manual_review.csv'
     previously_classified_income = []
@@ -484,16 +509,16 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         except Exception as e:
             print(f"⚠ Warning: Could not read previous manual_review.csv: {e}")
     
-    # Check if expenses.csv already exists and we're not forcing
+    # Check if this month is already processed (DB first, CSV fallback)
     output_file = csv_dir / "expenses.csv"
-    if output_file.exists() and not force and not manual_only:
+    if (output_file.exists() or _has_db_data) and not force and not manual_only:
         # Don't skip completely - we still need to process manual_review.csv updates
         # Jump to manual-only processing instead of continuing to PDFs
-        print(f"✓ expenses.csv exists - will only process manual_review.csv updates")
+        print(f"✓ Month {month_name} already processed - will only update manual_review.csv")
         # Fall through to manual-only section below by NOT returning
-    
-    # If manual-only mode OR auto-detected (expenses.csv exists), process updates without PDFs
-    if manual_only or (output_file.exists() and not force):
+
+    # If manual-only mode OR already processed, update classifications without re-parsing PDFs
+    if manual_only or ((output_file.exists() or _has_db_data) and not force):
         has_work = False
         
         # Load existing expenses and income files
@@ -511,41 +536,54 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 expenses_df = expenses_df[
                     ~expenses_df['Place'].str.contains('--- EXPENSE BREAKDOWN ---|Total:|GRAND TOTAL', case=False, na=False, regex=True)
                 ]
+        elif _db_engine is not None:
+            try:
+                from sqlalchemy import text as _sql_text
+                with _db_engine.connect() as _conn:
+                    _rows = _conn.execute(_sql_text(
+                        "SELECT tx_date, place, amount, category, label, statement "
+                        "FROM transactions WHERE tx_type='expense' AND report_month=:m ORDER BY tx_date"
+                    ), {'m': month_name}).fetchall()
+                if _rows:
+                    expenses_df = pd.DataFrame(_rows, columns=['Transaction Date', 'Place', 'Amount', 'category', 'Label', 'Statement'])
+                    expenses_df['Amount'] = pd.to_numeric(expenses_df['Amount'], errors='coerce').fillna(0.0)
+            except Exception as _e:
+                print(f"⚠  DB read for expenses failed: {_e}")
+
+        # Validate and correct categories (handles manual edits after initial parse)
+        if not expenses_df.empty and 'category' in expenses_df.columns:
+            corrected_categories = []
+            corrections_made = []
             
-            # Validate and correct categories in existing expenses.csv (handles manual edits)
-            if not expenses_df.empty and 'category' in expenses_df.columns:
-                corrected_categories = []
-                corrections_made = []
+            for idx, row in expenses_df.iterrows():
+                original_category = row.get('category', 'Uncategorized')
+                place = row.get('Place', 'unknown')
                 
-                for idx, row in expenses_df.iterrows():
-                    original_category = row.get('category', 'Uncategorized')
-                    place = row.get('Place', 'unknown')
-                    
-                    corrected_category, is_valid = validate_and_correct_category(
-                        original_category, 
-                        valid_categories, 
-                        use_llm=use_llm
-                    )
-                    
-                    # Track if category was corrected
-                    if str(original_category).strip() != '' and corrected_category != original_category:
-                        corrections_made.append({
-                            'place': place,
-                            'original': original_category,
-                            'corrected': corrected_category
-                        })
-                    
-                    corrected_categories.append(corrected_category)
+                corrected_category, is_valid = validate_and_correct_category(
+                    original_category, 
+                    valid_categories, 
+                    use_llm=use_llm
+                )
                 
-                # Update the category column with corrected values
-                if corrections_made:
-                    expenses_df = expenses_df.copy()
-                    expenses_df['category'] = corrected_categories
-                    has_work = True  # Mark that we have work to save
-                    
-                    print(f"\n📝 Corrected {len(corrections_made)} category name(s) in expenses.csv:")
-                    for correction in corrections_made:
-                        print(f"  ✓ '{correction['original']}' → '{correction['corrected']}' ({correction['place']})")
+                # Track if category was corrected
+                if str(original_category).strip() != '' and corrected_category != original_category:
+                    corrections_made.append({
+                        'place': place,
+                        'original': original_category,
+                        'corrected': corrected_category
+                    })
+                
+                corrected_categories.append(corrected_category)
+            
+            # Update the category column with corrected values
+            if corrections_made:
+                expenses_df = expenses_df.copy()
+                expenses_df['category'] = corrected_categories
+                has_work = True  # Mark that we have work to save
+                
+                print(f"\n📝 Corrected {len(corrections_made)} category name(s) in expenses:")
+                for correction in corrections_made:
+                    print(f"  ✓ '{correction['original']}' → '{correction['corrected']}' ({correction['place']})")
         
         if income_file.exists():
             income_df = pd.read_csv(income_file)
@@ -554,6 +592,19 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             # Remove total row to avoid duplication
             if not income_df.empty and 'Place' in income_df.columns:
                 income_df = income_df[~income_df['Place'].str.contains('TOTAL INCOME', case=False, na=False)]
+        elif _db_engine is not None:
+            try:
+                from sqlalchemy import text as _sql_text
+                with _db_engine.connect() as _conn:
+                    _rows = _conn.execute(_sql_text(
+                        "SELECT tx_date, place, amount, label, statement "
+                        "FROM transactions WHERE tx_type='income' AND report_month=:m ORDER BY tx_date"
+                    ), {'m': month_name}).fetchall()
+                if _rows:
+                    income_df = pd.DataFrame(_rows, columns=['Transaction Date', 'Place', 'Amount', 'Label', 'Statement'])
+                    income_df['Amount'] = pd.to_numeric(income_df['Amount'], errors='coerce').fillna(0.0)
+            except Exception as _e:
+                print(f"⚠  DB read for income failed: {_e}")
         
         # Process manual_transactions.csv if it exists
         manual_file = csv_dir / 'manual_transactions.csv'
@@ -721,8 +772,9 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             
             # Save without breakdown summary (summary will be in monthly_reports)
             expenses_df = expenses_df.drop(['one_time_purchase', 'user_notes'], axis=1, errors='ignore')
-            expenses_df.to_csv(output_file, index=False)
-        
+            if debug:
+                expenses_df.to_csv(output_file, index=False)
+
         if previously_classified_income:
             prev_inc_df = pd.DataFrame(previously_classified_income)
             prev_inc_df = prev_inc_df.drop(['Classification', '_manual_category', 'Type', '_classification', '_statement_beginning_balance'], axis=1, errors='ignore')
@@ -737,10 +789,8 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             # Always remove category from income (income doesn't need categories)
             income_df = income_df.drop(['_sort_date', 'category'], axis=1, errors='ignore')
             income_df = income_df.drop_duplicates(subset=['Transaction Date', 'Place', 'Amount'], keep='first')
-            
-            income_df.to_csv(income_file, index=False)
-        
-        # Update manual_review.csv to keep unclassified + invalid classified transactions
+            if debug:
+                income_df.to_csv(income_file, index=False)
         if manual_review_file.exists():
             try:
                 manual_review_df = pd.read_csv(manual_review_file, sep=None, engine='python')
@@ -856,17 +906,22 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 for correction in corrections_made:
                     print(f"  ✓ '{correction['original']}' → '{correction['corrected']}' ({correction['place']})")
         
-        # Save updated files
+        # Save updated files to DB primary; write CSV only in debug mode
         if not expenses_df.empty:
-            # Save without breakdown summary (summary will be in monthly_reports)
             expenses_df = expenses_df.drop(['one_time_purchase', 'user_notes'], axis=1, errors='ignore')
-            expenses_df.to_csv(output_file, index=False)
-            print(f"✓ Updated expenses.csv with {len(expenses_df)} transaction(s)")
-        
+            if _db_engine is not None:
+                _write_month(_db_engine, month_name, expenses_df=expenses_df)
+            if debug:
+                expenses_df.to_csv(output_file, index=False)
+            print(f"✓ Updated {len(expenses_df)} expense(s)")
+
         if not income_df.empty:
             income_df = income_df.drop_duplicates(subset=['Transaction Date', 'Place', 'Amount'], keep='first')
-            income_df.to_csv(income_file, index=False)
-            print(f"✓ Updated income.csv with {len(income_df)} transaction(s)")
+            if _db_engine is not None:
+                _write_month(_db_engine, month_name, income_df=income_df)
+            if debug:
+                income_df.to_csv(income_file, index=False)
+            print(f"✓ Updated {len(income_df)} income transaction(s)")
         
         # Summary
         if previously_classified_income or previously_classified_expenses:
@@ -1516,12 +1571,18 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 for correction in corrections_made:
                     print(f"  ✓ '{correction['original']}' → '{correction['corrected']}' ({correction['place']})")
         
-        # Save without breakdown summary (summary will be in monthly_reports)
+        # Write to DB using the statement folder month as report_month so all
+        # transactions from this statement appear under the month it was uploaded for.
         if not expenses_to_save.empty:
             grand_total = round(expenses_to_save['Amount'].sum(), 2)
             expenses_to_save = expenses_to_save.drop(['one_time_purchase', 'user_notes'], axis=1, errors='ignore')
-            expenses_to_save.to_csv(output_file, index=False)
-            print(f"✓ Saved {len(expenses_to_save)} expense(s) to {output_file}")
+            if _db_engine is not None:
+                _write_month(_db_engine, month_name, expenses_df=expenses_to_save)
+            if debug:
+                expenses_to_save.to_csv(output_file, index=False)
+                print(f"✓ Saved {len(expenses_to_save)} expense(s) to {output_file}")
+            else:
+                print(f"✓ Processed {len(expenses_to_save)} expense(s)")
             print(f"  Total expenses: ${grand_total:.2f}")
         else:
             print(f"✓ No expenses to save")
@@ -1545,8 +1606,13 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             income_df = income_df.drop(['_sort_date', '_is_bank_account', 'Credits', 'Debits', '_needs_manual_review', 'category', 'Type', 'Balance', '_classification', '_statement_beginning_balance'], axis=1, errors='ignore')
             income_df = income_df.drop_duplicates(subset=['Transaction Date', 'Place', 'Amount'], keep='first')
             
-            income_df.to_csv(income_file, index=False)
-            print(f"✓ Saved {len(income_df)} income transaction(s) to {income_file}")
+            if _db_engine is not None:
+                _write_month(_db_engine, month_name, income_df=income_df)
+            if debug:
+                income_df.to_csv(income_file, index=False)
+                print(f"✓ Saved {len(income_df)} income transaction(s) to {income_file}")
+            else:
+                print(f"✓ Processed {len(income_df)} income transaction(s)")
         
         # Save investment transfers (separate from income/expenses)
         if all_month_transfers:
@@ -1555,12 +1621,25 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             combined_transfers = combined_transfers.sort_values('_sort_date', na_position='last')
             combined_transfers = combined_transfers.drop(
                 ['_sort_date', '_is_bank_account', 'Credits', 'Debits', '_needs_manual_review',
-                 'category', 'Type', 'Balance', '_classification', '_statement_beginning_balance'],
+                 'category', 'Type', 'Balance', '_classification', '_statement_beginning_transfer'],
                 axis=1, errors='ignore'
             )
-            transfers_file = csv_dir / 'transfers.csv'
-            combined_transfers.to_csv(transfers_file, index=False)
-            print(f"✓ Saved {len(combined_transfers)} investment transfer(s) to {transfers_file}")
+            if _db_engine is not None:
+                _rows_list = [
+                    {'tx_date': str(r.get('Transaction Date', '')),
+                     'place':   str(r.get('Place', '')),
+                     'amount':  float(r.get('Amount', 0) or 0),
+                     'direction': str(r.get('Direction', 'Out')),
+                     'statement': str(r.get('Statement', ''))}
+                    for _, r in combined_transfers.iterrows()
+                ]
+                _write_transfers(_db_engine, month_name, _rows_list)
+            if debug:
+                transfers_file = csv_dir / 'transfers.csv'
+                combined_transfers.to_csv(transfers_file, index=False)
+                print(f"✓ Saved {len(combined_transfers)} investment transfer(s) to {transfers_file}")
+            else:
+                print(f"✓ Processed {len(combined_transfers)} investment transfer(s)")
 
         # Save manual review transactions (payment apps + uncategorized + previously unprocessed)
         # Merge new manual review transactions with ones that need to stay from previous run

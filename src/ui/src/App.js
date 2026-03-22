@@ -48,7 +48,7 @@ function App() {
     d.setMonth(d.getMonth() - 1);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
   }); // Default to previous complete month
-  const [hierarchy, setHierarchy] = useState({});
+  const [subcategories, setSubcategories] = useState({});
   const [expandedParents, setExpandedParents] = useState(new Set());
   const [activeTab, setActiveTab] = useState(() => localStorage.getItem('activeTab') || 'overview');
   const setActiveTabPersisted = (tab) => { localStorage.setItem('activeTab', tab); setActiveTab(tab); };
@@ -81,6 +81,7 @@ function App() {
   const [stmtDragOver, setStmtDragOver] = useState(false);
   const [stmtError, setStmtError] = useState('');
   const [availableCategories, setAvailableCategories] = useState([]);
+  const [investmentKeywords, setInvestmentKeywords] = useState([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [goals, setGoals] = useState(() => {
     try { return JSON.parse(localStorage.getItem('budgetGoals') || '{}'); }
@@ -89,16 +90,18 @@ function App() {
 
   useEffect(() => {
     Promise.all([
-      fetch('http://localhost:8000/api/category-hierarchy').then(r => r.json()),
+      fetch('http://localhost:8000/api/category-subcategories').then(r => r.json()),
       fetch('http://localhost:8000/api/categories').then(r => r.json()),
       fetch('http://localhost:8000/api/available-months').then(r => r.json()),
+      fetch('http://localhost:8000/api/investment-keywords').then(r => r.json()),
     ])
-      .then(([hier, cats, months]) => {
-        setHierarchy(hier || {});
+      .then(([hier, cats, months, invKw]) => {
+        setSubcategories(hier || {});
         setAvailableCategories(Array.isArray(cats) ? cats.map(c => c.category || c).filter(Boolean) : []);
         if (Array.isArray(months) && months.length > 0) {
           setSelectedMonth(prev => months.includes(prev) ? prev : months[0]);
         }
+        if (Array.isArray(invKw)) setInvestmentKeywords(invKw.map(k => k.keyword ?? k));
       })
       .catch(err => console.error('Failed to load config:', err));
   }, []);
@@ -176,7 +179,7 @@ function App() {
 
   // Build sub→parent reverse map
   const parentMap = {};
-  for (const [parent, subs] of Object.entries(hierarchy)) {
+  for (const [parent, subs] of Object.entries(subcategories)) {
     for (const sub of subs) parentMap[sub] = parent;
   }
 
@@ -343,7 +346,7 @@ function App() {
             forcedTab="plan"
             selectedMonth={selectedMonth}
             onMonthChange={setSelectedMonth}
-            hierarchy={hierarchy}
+            subcategories={subcategories}
             goals={goals}
             setGoals={setGoals}
             groupedData={groupedData}
@@ -402,7 +405,7 @@ function App() {
         <InsightsPanel 
           selectedMonth={selectedMonth}
           onMonthChange={setSelectedMonth}
-          hierarchy={hierarchy}
+          subcategories={subcategories}
           goals={goals}
           setGoals={setGoals}
           groupedData={groupedData}
@@ -653,13 +656,10 @@ function App() {
                 {(() => {
                   // Find income entries for invFilterMonth that are from investment-likely sources
                   // and not yet tagged as Investment Return
-                  const INVESTMENT_PLACES = ['investment', 'brokerage', 'trading', 'portfolio', 'securities', 'fund',
-                    'robinhood', 'edward jones', 'cash app', 'vanguard', 'fidelity', 'schwab', 'ameritrade',
-                    'webull', 'acorns', 'stash', 'betterment', 'wealthfront', 'sofi'];
                   const potential = incomeEntries.filter(e =>
                     e.month === invFilterMonth &&
                     e.category !== 'Investment Return' &&
-                    INVESTMENT_PLACES.some(p => e.place.toLowerCase().includes(p))
+                    investmentKeywords.some(p => e.place.toLowerCase().includes(p.toLowerCase()))
                   );
                   const alreadyTagged = incomeEntries.filter(e =>
                     e.month === invFilterMonth && e.category === 'Investment Return'
@@ -932,7 +932,7 @@ function App() {
                   <tbody>
                     {statementsData.map(s => {
                       const pdfCount = s.files.filter(f => f.type === 'pdf').length;
-                      const hasCSV = s.files.some(f => f.type === 'csv' && f.name === 'expenses.csv');
+                      const hasCSV = s.is_processed || s.files.some(f => f.type === 'csv' && f.name === 'expenses.csv');
                       return (
                         <tr
                           key={s.month}
