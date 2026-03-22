@@ -175,7 +175,7 @@ class TransactionCategorizer:
         # Dynamically build subcategory disambiguation hints from subcategories
         dynamic_hints = []
         for parent, subs in self.subcategories.items():
-            subs_str = ', '.join(f'"{{s}}"' for s in subs)
+            subs_str = ', '.join(f'"{s}"' for s in subs)
             dynamic_hints.append(
                 f'- If it fits "{parent}", prefer the more specific subcategory instead: {subs_str}. '
                 f'Only use "{parent}" if none of those subcategories apply.'
