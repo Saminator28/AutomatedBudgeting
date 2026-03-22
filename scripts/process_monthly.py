@@ -1621,7 +1621,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             combined_transfers = combined_transfers.sort_values('_sort_date', na_position='last')
             combined_transfers = combined_transfers.drop(
                 ['_sort_date', '_is_bank_account', 'Credits', 'Debits', '_needs_manual_review',
-                 'category', 'Type', 'Balance', '_classification', '_statement_beginning_transfer'],
+                 'category', 'Type', 'Balance', '_classification', '_statement_beginning_balance'],
                 axis=1, errors='ignore'
             )
             if _db_engine is not None:

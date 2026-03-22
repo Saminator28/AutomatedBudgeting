@@ -8,7 +8,6 @@ Imported by all route modules to access:
   - Reload helpers         (_reload_investment_keywords, …)
   - Data access utility    (_query_df)
   - Validation helpers     (_is_valid_month, _safe_statement_path)
-  - Transaction helpers    (_load_deleted_hashes, _persist_deleted_hash)
   - Domain logic           (_rebuild_transfers_for_month, _update_csv_label)
 
 Keyword lists are mutated in-place by their respective reload functions so that
@@ -49,7 +48,6 @@ _DATA_ROOT       = _BACKEND_DIR.parent / "data"         # …/src/ui/data/
 _DATA_ROOT.mkdir(parents=True, exist_ok=True)
 _STATEMENTS_BASE = _DATA_ROOT / "statements"
 _WRITE_API_KEY   = os.environ.get("AUTOBUDGET_API_KEY", "").strip()
-_DELETED_TX_FILE = _CONFIG_ROOT / "deleted_tx_hashes.json"
 
 # ── Background job store ──────────────────────────────────────────────────────
 _jobs: dict      = {}   # job_id → {status, output, errors, started_at}
@@ -131,29 +129,6 @@ def _reload_transfer_keywords() -> None:
         _TRANSFER_KEYWORDS[:] = [r[0].upper() for r in rows]
     except Exception as exc:
         logging.warning(f'Could not reload transfer keywords: {exc}')
-
-
-# ── Deleted-hash helpers ──────────────────────────────────────────────────────
-
-def _load_deleted_hashes() -> set:
-    """Return the set of tx_hashes the user has permanently deleted."""
-    if not _DELETED_TX_FILE.exists():
-        return set()
-    try:
-        with open(_DELETED_TX_FILE) as f:
-            data = _json.load(f)
-        return set(data) if isinstance(data, list) else set()
-    except Exception:
-        return set()
-
-
-def _persist_deleted_hash(tx_hash: str) -> None:
-    """Append a tx_hash to the persistent deleted set."""
-    existing = _load_deleted_hashes()
-    existing.add(tx_hash)
-    _DELETED_TX_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(_DELETED_TX_FILE, 'w') as f:
-        _json.dump(sorted(existing), f, indent=2)
 
 
 # ── Validation helpers ────────────────────────────────────────────────────────

@@ -139,7 +139,7 @@ def add_manual_transfer(payload: dict = Body(...)):
 
         dt = datetime.strptime(payload['date'], '%Y-%m-%d')
         month = dt.strftime('%Y-%m')
-        csv_date = dt.strftime('%-m/%-d/%Y')
+        csv_date = f"{dt.month}/{dt.day}/{dt.year}"
 
         record = {
             'id':        str(uuid.uuid4()),

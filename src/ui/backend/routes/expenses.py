@@ -15,7 +15,6 @@ from fastapi.responses import JSONResponse
 from src.ui.backend.deps import (
     _DB_AVAILABLE, get_engine,
     _DATA_ROOT, _CONFIG_ROOT, _STATEMENTS_BASE,
-    _load_deleted_hashes, _persist_deleted_hash,
     _query_df,
     _update_csv_label,
     _rebuild_transfers_for_month,
@@ -120,7 +119,6 @@ def get_all_expenses(month: str = None, category: str = None, search: str = None
     if _DB_AVAILABLE:
         try:
             from sqlalchemy import text as _text
-            deleted = _load_deleted_hashes()
             query = (
                 "SELECT tx_hash, tx_date, place, amount, category, label, statement, "
                 "report_month, rowid AS row_idx "
@@ -152,7 +150,6 @@ def get_all_expenses(month: str = None, category: str = None, search: str = None
                     'row_idx':   r[8],
                 }
                 for r in result
-                if (r[0] or '') not in deleted
             ]
         except Exception as exc:
             logging.warning(f"DB all-expenses query failed: {exc}")
@@ -179,7 +176,6 @@ def delete_transaction(tx_hash: str):
                 return JSONResponse(status_code=404, content={'error': 'Transaction not found'})
             conn.execute(_text("DELETE FROM transactions WHERE tx_hash = :h"), {'h': tx_hash})
             conn.commit()
-        _persist_deleted_hash(tx_hash)
         logging.info(f"🗑️ Deleted transaction {tx_hash} ({row[0]} ${row[1]})")
         return {'success': True}
     except Exception as exc:

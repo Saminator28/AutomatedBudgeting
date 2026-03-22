@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse
 from src.ui.backend.deps import (
     _DB_AVAILABLE, get_engine,
     _STATEMENTS_BASE,
-    _load_deleted_hashes,
     _update_csv_label,
     _rebuild_transfers_for_month,
     _INVESTMENT_PLATFORM_KEYWORDS,
@@ -90,7 +89,6 @@ def get_income_entries(month: str = ''):
     if _DB_AVAILABLE:
         try:
             from sqlalchemy import text as _text
-            deleted = _load_deleted_hashes()
             query = (
                 "SELECT tx_hash, tx_date, place, amount, report_month, statement, label, category "
                 "FROM transactions WHERE tx_type='income'"
@@ -118,7 +116,6 @@ def get_income_entries(month: str = ''):
                     'category':  _clean(r[7]),
                 }
                 for r in db_rows
-                if (r[0] or '') not in deleted
             ]
         except Exception as exc:
             logging.warning(f"DB income-entries query failed: {exc}")

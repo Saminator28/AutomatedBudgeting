@@ -21,7 +21,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # ── Shared state from deps ───────────────────────────────────────────────────
 from src.ui.backend.deps import (  # noqa: E402
     _DB_AVAILABLE, get_engine,
-    _load_deleted_hashes,
 )
 
 
@@ -51,7 +50,6 @@ def export_transactions(month: str = ''):
         from openpyxl.utils import get_column_letter
         from sqlalchemy import text as _text
 
-        deleted = _load_deleted_hashes()
         _eng = get_engine()
         params: dict = {}
         month_filter = " AND report_month = :month" if month else ""
@@ -65,7 +63,6 @@ def export_transactions(month: str = ''):
                 " ORDER BY report_month ASC, tx_date ASC, place ASC"
             ), params).fetchall()
 
-        tx_rows = [r for r in tx_rows if (r[0] or '') not in deleted]
         label_month = month if month else 'All Months'
 
         # ── Shared style helpers ──────────────────────────────────────────────

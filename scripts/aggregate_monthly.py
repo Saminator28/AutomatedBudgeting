@@ -236,6 +236,11 @@ def aggregate_by_transaction_month(debug: bool = False):
         )
         combined_expenses['_month'] = combined_expenses['_parsed_date'].dt.strftime('%Y-%m')
 
+        if _db_engine is not None:
+            with _db_engine.connect() as conn:
+                conn.execute(_text("DELETE FROM transactions WHERE tx_type='expense'"))
+                conn.commit()
+
         months_written = 0
         for month, group in combined_expenses.groupby('_month'):
             if pd.isna(month):
@@ -300,6 +305,11 @@ def aggregate_by_transaction_month(debug: bool = False):
             combined_income['Transaction Date'], format='mixed', errors='coerce'
         )
         combined_income['_month'] = combined_income['_parsed_date'].dt.strftime('%Y-%m')
+
+        if _db_engine is not None:
+            with _db_engine.connect() as conn:
+                conn.execute(_text("DELETE FROM transactions WHERE tx_type='income'"))
+                conn.commit()
 
         months_written = 0
         for month, group in combined_income.groupby('_month'):
@@ -384,6 +394,9 @@ def aggregate_by_transaction_month(debug: bool = False):
             combined_transfers['Transaction Date'], format='mixed', errors='coerce'
         )
         combined_transfers['_month'] = combined_transfers['_parsed_date'].dt.strftime('%Y-%m')
+        with _db_engine.connect() as conn:
+            conn.execute(_text("DELETE FROM transfers"))
+            conn.commit()
         months_saved = 0
         for month, group in combined_transfers.groupby('_month'):
             if pd.isna(month):

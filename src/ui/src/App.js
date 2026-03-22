@@ -101,7 +101,8 @@ function App() {
         if (Array.isArray(months) && months.length > 0) {
           setSelectedMonth(prev => months.includes(prev) ? prev : months[0]);
         }
-        if (Array.isArray(invKw)) setInvestmentKeywords(invKw.map(k => k.keyword ?? k));
+        const invKwList = Array.isArray(invKw?.keywords) ? invKw.keywords : Array.isArray(invKw) ? invKw : [];
+        if (invKwList.length > 0) setInvestmentKeywords(invKwList.map(k => k.keyword ?? k));
       })
       .catch(err => console.error('Failed to load config:', err));
   }, []);

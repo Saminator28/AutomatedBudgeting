@@ -330,25 +330,6 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep]
 
 
-def _purge_deleted_hashes(engine) -> None:
-    """Remove any transactions whose tx_hash has been marked deleted by the user."""
-    deleted_file = _CONFIG_ROOT / 'deleted_tx_hashes.json'
-    if not deleted_file.exists():
-        return
-    try:
-        with open(deleted_file) as _f:
-            hashes = json.load(_f)
-        if not isinstance(hashes, list) or not hashes:
-            return
-        with engine.connect() as conn:
-            placeholders = ','.join(f':h{i}' for i in range(len(hashes)))
-            params = {f'h{i}': h for i, h in enumerate(hashes)}
-            conn.execute(text(f"DELETE FROM transactions WHERE tx_hash IN ({placeholders})"), params)
-            conn.commit()
-    except Exception as exc:
-        logger.warning(f"Could not purge deleted hashes: {exc}")
-
-
 def write_month_to_db(engine,
                       month: str,
                       expenses_df=None,
@@ -424,10 +405,6 @@ def write_month_to_db(engine,
 
     keywords = _load_investment_keywords_from_db(engine)
     _sync_merchant_metadata(engine, keywords, normalised['place'].dropna().tolist())
-
-    # Purge any tx_hashes the user has permanently deleted so they don't
-    # survive a re-aggregate cycle.
-    _purge_deleted_hashes(engine)
 
     logger.info(f"migrate: wrote {len(normalised)} rows for {month} ({', '.join(types_to_replace)}) directly to DB")
     return len(normalised)
