@@ -82,7 +82,7 @@ All keyword lists that were previously stored as JSON config files are now store
 
 Each table has `id` (INTEGER PK) and `keyword` (TEXT UNIQUE).
 
-On first startup the lifespan hook seeds each table from its corresponding JSON file (no-op if the table already has rows).
+On first startup, the application is responsible for ensuring these tables are populated with an initial keyword set (if desired). The exact seeding mechanism is implementation-defined and may change over time; consult the current application configuration or release notes for details. New installations can also be initialized manually via the UI or SQL migrations.
 
 ---
 
