@@ -13,7 +13,7 @@ const getThisMonth = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 };
 
-function InsightsPanel({ selectedMonth, onMonthChange, hierarchy = {}, goals = {}, setGoals, groupedData = [], totalExpenses = 0, avgMonthlyIncome = 0, COLORS = [], formatCurrency, forcedTab }) {
+function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, goals = {}, setGoals, groupedData = [], totalExpenses = 0, avgMonthlyIncome = 0, COLORS = [], formatCurrency, forcedTab }) {
   const [currentMonth, setCurrentMonth] = useState(selectedMonth || getPrevMonth());
   const [tempMonth, setTempMonth] = useState(selectedMonth || getPrevMonth());
   const [insights, setInsights] = useState(null);
@@ -64,9 +64,9 @@ function InsightsPanel({ selectedMonth, onMonthChange, hierarchy = {}, goals = {
     }
   }, [budgetSuggestions]); // intentionally omit goals/setGoals to avoid loops
 
-  // Build sub→parent reverse map from hierarchy
+  // Build sub→parent reverse map from subcategories
   const parentMap = {};
-  for (const [parent, subs] of Object.entries(hierarchy)) {
+  for (const [parent, subs] of Object.entries(subcategories)) {
     for (const sub of subs) parentMap[sub] = parent;
   }
 
@@ -1014,8 +1014,8 @@ function InsightsPanel({ selectedMonth, onMonthChange, hierarchy = {}, goals = {
                 if (seen.has(cat) || parentMap[cat]) continue;
                 reordered.push([cat, data]);
                 seen.add(cat);
-                if (hierarchy[cat]) {
-                  for (const sub of hierarchy[cat]) {
+                if (subcategories[cat]) {
+                  for (const sub of subcategories[cat]) {
                     if (trends[sub] && !seen.has(sub)) { reordered.push([sub, trends[sub]]); seen.add(sub); }
                   }
                 }

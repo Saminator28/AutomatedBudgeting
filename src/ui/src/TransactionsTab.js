@@ -382,6 +382,24 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
     }
   }, [editIncomeLabelFn, editExpense]);
 
+  // ── Permanently delete a transaction ─────────────────────────────────────
+  const deleteTx = useCallback(async (row) => {
+    const label = `${row.place} ${row.amount < 0 ? '-' : ''}$${Math.abs(row.amount).toFixed(2)}`;
+    if (!window.confirm(`Permanently delete "${label}"?\n\nThis cannot be undone.`)) return;
+    try {
+      const res = await fetch(`${API}/api/transactions/${row.tx_hash}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Delete failed');
+      if (row._type === 'income') {
+        setIncome(prev => prev.filter(r => r.tx_hash !== row.tx_hash));
+      } else {
+        setExpenses(prev => prev.filter(r => r.tx_hash !== row.tx_hash));
+      }
+    } catch (err) {
+      alert('Delete failed: ' + err.message);
+    }
+  }, []);
+
 
 
   // ── Shared styles ─────────────────────────────────────────────────────────
@@ -563,6 +581,19 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
             <span style={{ background: '#e0e7ff', color: '#4f46e5', borderRadius: 20, padding: '4px 14px', fontSize: 13, fontWeight: 700 }}>
               {filteredWithSearch.length} rows{filterType !== 'all' || filterMonth || filterCategory || search ? ` (filtered from ${allRows.length})` : ''}
             </span>
+            <button
+              onClick={() => {
+                const url = `${API}/api/transactions/export${filterMonth ? `?month=${filterMonth}` : ''}`;
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `transactions_${filterMonth || 'all'}.xlsx`;
+                a.click();
+              }}
+              title={filterMonth ? `Export ${filterMonth} to Excel` : 'Export all transactions to Excel'}
+              style={{ background: '#16a34a', color: '#fff', border: 'none', borderRadius: 8, padding: '7px 16px', fontSize: 13, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}
+            >
+              ⬇️ Export Excel
+            </button>
           </div>
 
           {expError && <div style={{ background: '#fef2f2', border: '1px solid #fca5a5', borderRadius: 7, padding: '9px 13px', marginBottom: 14, color: '#dc2626', fontSize: 13 }}>{expError}</div>}
@@ -614,6 +645,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                       <th onClick={() => toggleSort('category')} style={th}>Category{sortIcon('category')}</th>
                       <th style={{ ...th, cursor: 'default' }}>Label</th>
                       <th style={{ ...th, cursor: 'default', color: '#94a3b8' }}>Source</th>
+                      <th style={{ ...th, cursor: 'default', width: 36 }}></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -675,6 +707,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                             </td>
                             <td style={{ ...td, color: '#94a3b8', fontSize: 12 }}>—</td>
                             <td style={{ ...td, color: '#94a3b8', fontSize: 11 }}>{row.statement}</td>
+                            <td style={td}></td>
                           </tr>
                         );
                       }
@@ -735,6 +768,17 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                             )}
                           </td>
                           <td style={{ ...td, color: '#94a3b8', fontSize: 11 }}>{row.statement}</td>
+                          <td style={{ ...td, padding: '4px 6px' }}>
+                            <button
+                              onClick={() => deleteTx(row)}
+                              title="Delete transaction"
+                              style={{ background: 'none', color: '#cbd5e1', border: 'none', borderRadius: 4, padding: '2px 5px', fontSize: 14, cursor: 'pointer', lineHeight: 1 }}
+                              onMouseEnter={e => e.currentTarget.style.color = '#dc2626'}
+                              onMouseLeave={e => e.currentTarget.style.color = '#cbd5e1'}
+                            >
+                              🗑️
+                            </button>
+                          </td>
                         </tr>
                       );
                     })}

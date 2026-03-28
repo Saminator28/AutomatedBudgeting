@@ -31,17 +31,20 @@ AutomatedBudgeting/
 │   ├── ignore_transactions.json # Transactions to always skip
 │   └── llm_models.json         # Ollama model selection
 ├── scripts/                    # CLI scripts and utilities
-│   ├── process_monthly.py      # Main CLI entry point
+│   ├── process_monthly.py      # Main CLI entry point — processes PDFs and writes to DB
 │   ├── setup_monthly.py        # First-time setup helper
-│   └── compare_models.py       # Model benchmarking
+│   └── aggregate_monthly.py    # Re-classifies all DB transactions and writes results back
 ├── src/
+│   ├── database/               # DB schema, session, and utilities
+│   │   ├── models.py           # SQLAlchemy table definitions
+│   │   ├── session.py          # Engine and init_db()
+│   │   └── db_utils.py         # Hash utilities, seed functions, DataFrame writers
 │   ├── statement_parser/       # PDF parsing pipeline
 │   │   ├── parser.py           # StatementParser class
 │   │   ├── llm_utils.py        # LLM merchant cleaning
 │   │   └── pdf_extractor.py    # pdfplumber wrapper
 │   ├── ai_classification/      # Transaction categorization
 │   │   └── categorizer.py      # TransactionCategorizer class
-│   ├── bankai/                 # OCR-based parser (legacy/experimental)
 │   └── ui/
 │       ├── backend/
 │       │   └── main.py         # FastAPI server
@@ -50,7 +53,6 @@ AutomatedBudgeting/
 │       │   ├── TransactionsTab.js
 │       │   └── ...
 │       └── public/
-└── statements/                 # (Legacy) Raw statement input directory
 ```
 
 ---
@@ -147,16 +149,14 @@ This will:
 2. Extract transactions using `StatementParser`
 3. Clean merchant names via Ollama
 4. Categorize transactions via `TransactionCategorizer`
-5. Write output CSVs back to the same folder
+5. Write transactions directly to `budget.db` via `write_month_to_db`
+6. Write a reference copy of parsed rows to `statements/YYYY-MM/` (not read back by the API)
 
 ### Other useful scripts
 
 ```bash
-# Run the statement processor on a specific month
-python scripts/process_monthly.py --month 2025-06
-
-# Aggregate parsed CSVs into monthly summary reports
-python scripts/aggregate_monthly.py --month 2025-06
+# Re-classify all existing DB transactions and update categories in place
+python scripts/aggregate_monthly.py
 ```
 
 ---

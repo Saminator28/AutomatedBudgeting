@@ -28,18 +28,18 @@ class TransactionCategorizer:
             llm_host: Ollama server URL
             merchant_history: MerchantHistory instance for learning from past corrections (recommended)
         """
-        # Load valid categories and hierarchy from categories.json
+        # Load valid categories and subcategories from categories.json
         categories_config_path = Path(__file__).parent.parent.parent / 'config' / 'categories.json'
-        self.hierarchy = {}   # parent → [subcategories]
+        self.subcategories = {}   # parent → [subcategories]
         self.sub_to_parent = {}  # subcategory → parent
         if categories_config_path.exists():
             with open(categories_config_path, 'r') as f:
                 config = json.load(f)
                 valid_categories = config.get('categories', [])
-                self.hierarchy = config.get('hierarchy', {})
+                self.subcategories = config.get('subcategories', {})
                 self.sub_to_parent = {
                     sub: parent
-                    for parent, subs in self.hierarchy.items()
+                    for parent, subs in self.subcategories.items()
                     for sub in subs
                 }
                 # Convert list to dict with empty patterns (for compatibility)
@@ -172,15 +172,15 @@ class TransactionCategorizer:
         # Build category list for prompt - use numbered list for clarity
         categories_numbered = "\n".join([f"{i+1}. {cat}" for i, cat in enumerate(self.categories.keys())])
 
-        # Dynamically build subcategory disambiguation hints from hierarchy
+        # Dynamically build subcategory disambiguation hints from subcategories
         dynamic_hints = []
-        for parent, subs in self.hierarchy.items():
+        for parent, subs in self.subcategories.items():
             subs_str = ', '.join(f'"{s}"' for s in subs)
             dynamic_hints.append(
                 f'- If it fits "{parent}", prefer the more specific subcategory instead: {subs_str}. '
                 f'Only use "{parent}" if none of those subcategories apply.'
             )
-        hierarchy_hints = "\n".join(dynamic_hints)
+        subcategory_hints = "\n".join(dynamic_hints)
 
         # Create prompt demanding exact match with examples
         amount_context = f" (${amount:.2f})" if amount else ""
@@ -197,7 +197,7 @@ DISAMBIGUATION HINTS (use these to pick the right category when in doubt):
 - "Groceries": Grocery stores, supermarkets, and warehouse clubs — but NOT liquor stores.
 - "Subscriptions": Streaming services, software subscriptions, and memberships — NOT gym memberships (use "Entertainment").
 - "Shopping": General retail — use this when no more specific category fits.
-{hierarchy_hints}
+{subcategory_hints}
 
 Examples of CORRECT responses:
 - Dining
@@ -313,9 +313,9 @@ Your answer:"""
             historical_category = self.merchant_history.get_category(description)
             if historical_category:
                 # If history returned a parent category, refine to subcategory via LLM
-                if historical_category in self.hierarchy and self.llm_available:
+                if historical_category in self.subcategories and self.llm_available:
                     refined = self._categorize_with_llm(description, amount)
-                    if refined and refined in self.hierarchy[historical_category]:
+                    if refined and refined in self.subcategories[historical_category]:
                         return refined
                 return historical_category
         

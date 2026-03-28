@@ -317,43 +317,33 @@ Track outstanding loans and credit balances and project payoff timelines based o
 ## Technical Debt
 
 ### High Priority
-- **Migrate transaction storage from CSV to a database**  
-  Currently all transaction data is stored in flat CSV files under `src/ui/data/statements/` and `src/ui/data/monthly_reports/`. This approach has several pain points:
-  - Concurrent read/write is fragile (no atomic transactions, race conditions during `classify_manual_review`)
-  - Category corrections and user flags (`user_corrected`) require re-reading and rewriting entire files
-  - Merchant history is rebuilt from scratch on every aggregate run by scanning all CSVs
-  - No indexing, so queries (e.g. "all transactions for merchant X") require full scans
+- **Migrate transaction storage from CSV to a database** *(Phase 1 complete — v1.1.0)*
 
-  **Recommended approach:** SQLite (via SQLAlchemy) — single-file, no separate server, zero-config, and accessible from both the FastAPI backend and the processing scripts. Schema would be roughly:
-  - `transactions` table: `id`, `month`, `type` (expense/income/transfer), `date`, `place`, `amount`, `category`, `label`, `statement`, `user_corrected`, `created_at`
-  - `merchant_metadata` table: `merchant_key`, `display_name`, `category`, `tags` (JSON array), `user_corrected`, `updated_at`
-  - Migration script to import existing CSVs on first run, seeding `merchant_metadata` from monthly report history
+  **Phase 1 (implemented):**
+  - `src/database/` package: `models.py` (SQLAlchemy Core tables), `session.py` (engine/session factory), `migrate.py` (`sync_from_csvs` / `sync_month`)
+  - `src/ui/data/budget.db` — SQLite DB, populated on startup and after every aggregate/process run
+  - DB is used for `/api/available-months`, `/api/all-expenses`, `/api/income-by-month`, `/api/income-entries` with CSV fallback if DB is unavailable
+  - All write endpoints (`/api/expense/edit`, `/api/expense/label`, `/api/income/label`, category and reclassify endpoints) call `sync_month()` after writing to CSV to keep DB in sync
+  - `scripts/aggregate_monthly.py` syncs the DB at the end of every run
+  - CSV files remain the authoritative write target for backward compatibility
 
-  The CSV files could be kept as export artifacts for compatibility, generated on demand rather than used as the primary store.
-
-  **How this directly resolves the `_INVESTMENT_PLATFORM_KEYWORDS` hardcoding problem:**
-
-  The keyword list exists to bootstrap investment detection: income from platforms like Cash App or Robinhood has no category when it first arrives, so we can't detect it by category alone. We use name matching as a stand-in. The DB removes the need for that stand-in entirely:
-
-  - The hardcoded keyword list becomes the **one-time seed** for `merchant_metadata` — on migration, any merchant matching a keyword gets `tags = ["investment_platform"]` written to the DB.
-  - From that point, the detection logic changes from `if any(kw in place for kw in HARDCODED_LIST)` to `if merchant_metadata.get(place).has_tag("investment_platform")`.
-  - When the user sets a new income source as "Investment Return" via the UI, `/api/income/categorize` writes `tags = ["investment_platform"]` to `merchant_metadata` for that merchant key — **permanently and automatically**. No list to maintain.
-  - The chicken-and-egg problem (category doesn't exist yet → can't detect by category) is solved because the DB tag is set once at classification time and persists. The next time that merchant appears in any future statement, it is immediately routed to transfers without any keyword matching or manual step.
-  - The duplicate constant in `main.py` and `aggregate_monthly.py` both disappear — both query `merchant_metadata` from the same DB instead.
+  **Phase 2 (remaining):**
+  - Migrate complex read endpoints (`/api/expenses-by-month`, `/api/expense-categories`, `/api/income-breakdown`) to DB — these involve reimbursement cross-table logic and subcategory roll-up that need careful porting
+  - Have write endpoints write to DB as primary, generate CSVs as exports
+  - Replace the keyword-based investment platform detection with `merchant_metadata.is_investment_platform` DB lookups (config/investment_platforms.json is the bridge — already done)
+  - Have `process_monthly.py` write new transactions directly to DB (currently only `aggregate_monthly.py` syncs)
+  - Have `chatbot_assistant.py` load expense data from DB instead of scanning CSVs
 
 - Unit tests for `StatementParser` (`src/statement_parser/parser.py`)
 - Unit tests for `TransactionCategorizer` (`src/ai_classification/categorizer.py`)
 - Integration tests for full PDF → dashboard workflow
 
 ### Medium Priority
-- **Move `_INVESTMENT_PLATFORM_KEYWORDS` to `config/investment_platforms.json`**  
-  The list of investment platform name keywords (`robinhood`, `cash app`, `vanguard`, etc.) is currently hardcoded in two places: `src/ui/backend/main.py` and `scripts/aggregate_monthly.py`. The list is used to auto-detect income rows that should appear as Direction=In in the Investments tab without manual tagging.
-
-  **Proposed change:**
-  - Create `config/investment_platforms.json`: `{ "keywords": ["robinhood", "cash app", ...] }`
-  - Both `main.py` and `aggregate_monthly.py` load the list at startup from `_CONFIG_ROOT`
-  - Remove the duplicate constant from both files
-  - Longer term: replace keyword matching entirely with a category-driven approach once `Investment Return` is reliably auto-assigned (see database migration item above)
+- ~~**Move `_INVESTMENT_PLATFORM_KEYWORDS` to `config/investment_platforms.json`**~~ *(Done — v1.1.0)*
+  `config/investment_platforms.json` now exists; both `main.py` and `aggregate_monthly.py`
+  load keywords from it at startup.  The duplicate hardcoded constant has been removed from
+  both files.  Longer term, replace keyword matching entirely with `merchant_metadata` DB
+  tags once `Investment Return` is reliably auto-assigned (see database migration item above).
 
 - Type hints throughout `process_monthly.py` (currently partially typed)
 - Centralize Ollama host configuration (currently spread across multiple files)

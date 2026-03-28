@@ -37,9 +37,6 @@ MONTH_TO_NUM = {
     'september': '09', 'october': '10', 'november': '11', 'december': '12'
 }
 
-# Centralised data path: src/ai_analysis/ → src/ → src/ui/data/
-_MONTHLY_REPORTS_DIR = Path(__file__).parent.parent / 'ui' / 'data' / 'monthly_reports'
-
 
 # ---------------------------------------------------------------------------
 # Conversation State
@@ -252,112 +249,73 @@ class ChatbotAssistant:
         }
     
     def _load_expenses(self, month: str) -> Optional[pd.DataFrame]:
-        """Load expense data for a specific month"""
+        """Load expense data for a specific month from DB."""
         try:
-            expense_path = _MONTHLY_REPORTS_DIR / f"expenses_{month}.csv"
-            if not expense_path.exists():
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from src.database.session import get_engine
+            from sqlalchemy import text as _text
+            eng = get_engine()
+            with eng.connect() as conn:
+                rows = conn.execute(_text(
+                    "SELECT tx_date, place, amount, category "
+                    "FROM transactions WHERE tx_type='expense' AND report_month=:m "
+                    "ORDER BY tx_date"
+                ), {'m': month}).fetchall()
+            if not rows:
                 return None
-            
-            df = pd.read_csv(expense_path)
-            
-            # Filter out summary rows
-            df = df[
-                ~df['Place'].astype(str).str.contains(
-                    'EXPENSE BREAKDOWN|Total:|GRAND TOTAL',
-                    case=False, na=False, regex=True
-                )
-            ]
-            
-            # Add metadata columns if they don't exist
-            if 'one_time_purchase' not in df.columns:
-                df['one_time_purchase'] = False
-            if 'user_notes' not in df.columns:
-                df['user_notes'] = ''
-            
+            df = pd.DataFrame(rows, columns=['Transaction Date', 'Place', 'Amount', 'category'])
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
             return df
         except Exception as e:
             logger.error(f"Error loading expenses for {month}: {e}")
             return None
     
     def _load_all_expenses(self) -> Optional[pd.DataFrame]:
-        """Load expense data from all available months"""
+        """Load expense data from all available months from DB."""
         try:
-            reports_dir = _MONTHLY_REPORTS_DIR
-            if not reports_dir.exists():
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from src.database.session import get_engine
+            from sqlalchemy import text as _text
+            eng = get_engine()
+            with eng.connect() as conn:
+                rows = conn.execute(_text(
+                    "SELECT tx_date, place, amount, category, report_month "
+                    "FROM transactions WHERE tx_type='expense' ORDER BY report_month, tx_date"
+                )).fetchall()
+            if not rows:
                 return None
-            
-            expense_files = sorted(reports_dir.glob("expenses_*.csv"))
-            if not expense_files:
-                return None
-            
-            all_expenses = []
-            for file in expense_files:
-                df = pd.read_csv(file)
-                # Filter out summary rows
-                df = df[
-                    ~df['Place'].astype(str).str.contains(
-                        'EXPENSE BREAKDOWN|Total:|GRAND TOTAL',
-                        case=False, na=False, regex=True
-                    )
-                ]
-                # Extract month from filename (expenses_YYYY-MM.csv)
-                month_str = file.stem.replace('expenses_', '')
-                df['month'] = month_str
-                
-                # Add metadata columns if they don't exist
-                if 'one_time_purchase' not in df.columns:
-                    df['one_time_purchase'] = False
-                if 'user_notes' not in df.columns:
-                    df['user_notes'] = ''
-                
-                all_expenses.append(df)
-            
-            combined_df = pd.concat(all_expenses, ignore_index=True)
-            logger.info(f"📊 Loaded {len(combined_df)} expenses across {len(expense_files)} months")
-            return combined_df
-            
+            df = pd.DataFrame(rows, columns=['Transaction Date', 'Place', 'Amount', 'category', 'month'])
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+            logger.info(f"📊 Loaded {len(df)} expenses from DB")
+            return df
         except Exception as e:
             logger.error(f"Error loading all expenses: {e}")
             return None
     
     def _load_all_income(self) -> Optional[pd.DataFrame]:
-        """Load income data from all available months"""
+        """Load income data from all available months from DB."""
         try:
-            reports_dir = _MONTHLY_REPORTS_DIR
-            if not reports_dir.exists():
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from src.database.session import get_engine
+            from sqlalchemy import text as _text
+            eng = get_engine()
+            with eng.connect() as conn:
+                rows = conn.execute(_text(
+                    "SELECT tx_date, place, amount, category, report_month "
+                    "FROM transactions WHERE tx_type='income' ORDER BY report_month, tx_date"
+                )).fetchall()
+            if not rows:
                 return None
-            
-            income_files = sorted(reports_dir.glob("income_*.csv"))
-            if not income_files:
-                return None
-            
-            all_income = []
-            for file in income_files:
-                df = pd.read_csv(file)
-                # Extract month from filename (income_YYYY-MM.csv)
-                month_str = file.stem.replace('income_', '')
-                df['month'] = month_str
-                
-                all_income.append(df)
-            
-            combined_df = pd.concat(all_income, ignore_index=True)
-            logger.info(f"💰 Loaded {len(combined_df)} income transactions across {len(income_files)} months")
-            return combined_df
-            
+            df = pd.DataFrame(rows, columns=['Transaction Date', 'Place', 'Amount', 'category', 'month'])
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+            logger.info(f"💰 Loaded {len(df)} income transactions from DB")
+            return df
         except Exception as e:
             logger.error(f"Error loading all income: {e}")
             return None
-    
-    def _save_expenses(self, month: str, df: pd.DataFrame) -> bool:
-        """Save updated expense data"""
-        try:
-            expense_path = _MONTHLY_REPORTS_DIR / f"expenses_{month}.csv"
-            df.to_csv(expense_path, index=False)
-            logger.info(f"💾 Saved updated expenses for {month}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving expenses for {month}: {e}")
-            return False
     
     def _prepare_expense_context(self, df: pd.DataFrame) -> str:
         """Prepare a summary of expenses for the AI"""
@@ -794,12 +752,12 @@ Rules:
             try:
                 _cfg_path = Path(__file__).parent.parent.parent / 'config' / 'categories.json'
                 with open(_cfg_path) as _f:
-                    _hierarchy = json.load(_f).get('hierarchy', {})
+                    _subcategories = json.load(_f).get('subcategories', {})
             except Exception:
-                _hierarchy = {}
+                _subcategories = {}
 
             candidate_cats: set = {cat_lower}
-            for parent, subs in _hierarchy.items():
+            for parent, subs in _subcategories.items():
                 if parent.lower() == cat_lower:
                     candidate_cats.update(s.lower() for s in subs)
 
@@ -1126,8 +1084,8 @@ For all other requests, answer in plain conversational text."""
                     source = row[merchant_col]
                     amount = row[amount_col]
                     date = row[date_col]
-                    month = row.get('month', 'N/A')
-                    facts.append(f"  • {date} [{month}]: {source} - ${amount:.2f}")
+                    month_tag = f" [{row['month']}]" if 'month' in row.index else ''
+                    facts.append(f"  • {date}{month_tag}: {source} - ${amount:.2f}")
             
             # Calculate net (income - expenses)
             total_expenses = expenses_df[amount_col].sum()
@@ -1162,8 +1120,8 @@ For all other requests, answer in plain conversational text."""
                 amount = row[amount_col]
                 date = row[date_col]
                 category = row.get(category_col, 'Uncategorized')
-                month = row.get('month', 'N/A')
-                facts.append(f"  • {date} [{month}]: {merchant} - ${amount:.2f} ({category})")
+                month_tag = f" [{row['month']}]" if 'month' in row.index else ''
+                facts.append(f"  • {date}{month_tag}: {merchant} - ${amount:.2f} ({category})")
         else:
             # Too many transactions - but check if they're asking about a specific merchant
             facts.append(f"\n**Note:** {num_transactions} transactions total (too many to list all)")
@@ -1194,8 +1152,8 @@ For all other requests, answer in plain conversational text."""
                             date = row[date_col]
                             amount = row[amount_col]
                             category = row.get(category_col, 'Uncategorized')
-                            month = row.get('month', 'N/A')
-                            facts.append(f"    • {date} [{month}]: ${amount:.2f} ({category})")
+                            month_tag = f" [{row['month']}]" if 'month' in row.index else ''
+                            facts.append(f"    • {date}{month_tag}: ${amount:.2f} ({category})")
                         
                         merchant_found = True
                         break
@@ -1322,55 +1280,6 @@ For all other requests, answer in plain conversational text."""
         
         return expenses_df
     
-    def _load_csv_for_month(self, expenses_df: pd.DataFrame) -> str:
-        """Load the complete CSV data including summary rows, formatted as markdown table"""
-        if expenses_df.empty:
-            print("⚠️ WARNING: Empty expenses DataFrame")
-            return "No expense data available."
-        
-        # Determine which month(s) we're looking at
-        if 'month' in expenses_df.columns:
-            months = expenses_df['month'].unique()
-            print(f"🔍 Unique months in DataFrame: {months}")
-            if len(months) == 1:
-                # Single month - load the original CSV with summary rows
-                month_str = months[0]
-                csv_path = _MONTHLY_REPORTS_DIR / f"expenses_{month_str}.csv"
-                print(f"🔍 Looking for CSV at: {csv_path}, exists={csv_path.exists()}")
-                if csv_path.exists():
-                    # Load as DataFrame and convert to markdown table
-                    df = pd.read_csv(csv_path)
-                    # Keep summary rows - they're useful!
-                    markdown_table = df.to_markdown(index=False)
-                    print(f"📊 Loaded CSV for {month_str}: {len(df)} rows")
-                    print(f"📊 Max amount in data: {df['Amount'].max() if 'Amount' in df.columns else 'N/A'}")
-                    return f"\n{markdown_table}\n"
-                else:
-                    print(f"⚠️ WARNING: CSV file not found at {csv_path}")
-        else:
-            print(f"🔍 No 'month' column in DataFrame (columns: {list(expenses_df.columns)})")
-        
-        # Multiple months or no month column - convert DataFrame to markdown table
-        markdown_table = expenses_df.to_markdown(index=False)
-        print(f"📊 Using DataFrame: {len(expenses_df)} rows")
-        print(f"📊 Max amount: {expenses_df['Amount'].max() if 'Amount' in expenses_df.columns else 'N/A'}")
-        return f"\n{markdown_table}\n"
-    
-    def _format_expense_list(self, df: pd.DataFrame, date_col: str, merchant_col: str, amount_col: str, category_col: str) -> List[Dict]:
-        """Format expense dataframe as list of dicts"""
-        expense_list = []
-        for idx, row in df.iterrows():
-            expense_list.append({
-                "index": idx,
-                "date": row[date_col],
-                "merchant": row[merchant_col],
-                "amount": float(row[amount_col]),
-                "category": row.get(category_col, 'Uncategorized'),
-                "one_time_purchase": bool(row.get('one_time_purchase', False)),
-                "notes": row.get('user_notes', '')
-            })
-        return expense_list
-    
     def _execute_action(
         self, 
         action_data: Dict, 
@@ -1382,25 +1291,8 @@ For all other requests, answer in plain conversational text."""
         actions_taken = []
         
         if action == "update_expense":
-            # Update an expense
-            expense_index = action_data.get("expense_index")
-            updates = action_data.get("updates", {})
-            
-            if expense_index is not None and 0 <= expense_index < len(expenses_df):
-                for key, value in updates.items():
-                    if key in expenses_df.columns:
-                        expenses_df.at[expense_index, key] = value
-                
-                # Save updated expenses
-                if self._save_expenses(month, expenses_df):
-                    actions_taken.append({
-                        "type": "update_expense",
-                        "expense": expenses_df.iloc[expense_index].to_dict(),
-                        "updates": updates
-                    })
-            
             return {
-                "response": action_data.get("message", "Expense updated successfully."),
+                "response": action_data.get("message", "Noted."),
                 "actions_taken": actions_taken,
                 "ai_generated": True,
                 "model_name": self.model_name
@@ -1436,8 +1328,6 @@ For all other requests, answer in plain conversational text."""
                     "merchant": row[merchant_col],
                     "amount": float(row[amount_col]),
                     "category": row.get(category_col, 'Uncategorized'),
-                    "one_time_purchase": bool(row.get('one_time_purchase', False)),
-                    "notes": row.get('user_notes', '')
                 })
             
             return {
@@ -1483,8 +1373,6 @@ For all other requests, answer in plain conversational text."""
                     "merchant": row[merchant_col],
                     "amount": float(row[amount_col]),
                     "category": row.get(category_col, 'Uncategorized'),
-                    "one_time_purchase": bool(row.get('one_time_purchase', False)),
-                    "notes": row.get('user_notes', '')
                 })
             
             top_expense = expense_list[0]

@@ -5,10 +5,10 @@ Aggregate Monthly Transactions by Calendar Month
 
 Reads all expenses.csv and income.csv files from statements/*/ directories,
 groups transactions by their actual calendar month (from Transaction Date),
-and saves to monthly_reports/expenses_YYYY-MM.csv and income_YYYY-MM.csv.
+and writes directly to the SQLite DB (src/ui/data/budget.db).
 
-This allows viewing all expenses for YYYY-MM together, even if they appeared
-in different statement months (e.g., Oct statement, Nov statement, Dec statement).
+monthly_reports/ CSV files are no longer generated; the DB is the sole
+authoritative store for aggregated transaction data.
 
 Usage:
     python aggregate_monthly.py                  # Aggregate all transactions
@@ -17,17 +17,24 @@ Usage:
 
 import sys
 import argparse
+import json
 from pathlib import Path
 import pandas as pd
 
-# TODO: Move this list to config/investment_platforms.json and load it at startup
-# so platforms can be added/removed without a code change or container rebuild.
-# See docs/FUTURE_FEATURES.md — Technical Debt > High Priority (database-backed merchant metadata).
-_INVESTMENT_PLATFORM_KEYWORDS = [
-    'investment', 'brokerage', 'trading', 'portfolio', 'securities', 'fund',
-    'robinhood', 'edward jones', 'cash app', 'vanguard', 'fidelity', 'schwab',
-    'ameritrade', 'webull', 'acorns', 'stash', 'betterment', 'wealthfront', 'sofi',
-]
+_PROJECT_ROOT = Path(__file__).parent.parent
+
+
+
+def _load_investment_keywords_from_db(engine) -> list:
+    """Load investment-platform keywords from the DB."""
+    try:
+        from sqlalchemy import text as _text
+        with engine.connect() as conn:
+            rows = conn.execute(_text('SELECT keyword FROM investment_keywords ORDER BY keyword')).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        pass
+    return []
 
 def _build_merchant_category_map(expenses_df: pd.DataFrame) -> dict:
     """
@@ -140,226 +147,114 @@ def _auto_classify_expenses(df: pd.DataFrame, abs_floor: float = 500.0, cat_mult
     return df
 
 
-def _restore_user_labels(new_df: pd.DataFrame, existing_file: Path) -> pd.DataFrame:
-    """Overwrite auto-classified labels with any user-set labels saved in an existing CSV."""
-    if not existing_file.exists() or 'Label' not in new_df.columns:
-        return new_df
-    try:
-        existing = pd.read_csv(existing_file)
-        if 'Label' not in existing.columns:
-            return new_df
-        label_map = {}
-        for _, row in existing.iterrows():
-            try:
-                key = (
-                    str(row.get('Transaction Date', '')).strip(),
-                    str(row.get('Place', '')).strip().upper(),
-                    round(float(row.get('Amount', 0)), 2),
-                )
-                lbl = str(row.get('Label', '')).strip()
-                if lbl:
-                    label_map[key] = lbl
-            except Exception:
-                continue
-        if not label_map:
-            return new_df
-        def _restore(row):
-            try:
-                key = (
-                    str(row.get('Transaction Date', '')).strip(),
-                    str(row.get('Place', '')).strip().upper(),
-                    round(float(row.get('Amount', 0)), 2),
-                )
-                return label_map.get(key, row.get('Label', 'recurring'))
-            except Exception:
-                return row.get('Label', 'recurring')
-        new_df = new_df.copy()
-        new_df['Label'] = new_df.apply(_restore, axis=1)
-    except Exception:
-        pass
-    return new_df
-
-
-def _restore_user_categories(new_df: pd.DataFrame, existing_file: Path, debug: bool = False) -> pd.DataFrame:
+def aggregate_by_transaction_month(debug: bool = False):
     """
-    Overwrite AI-assigned categories with any user-edited categories saved in an
-    existing monthly_reports CSV.  Keyed on (Transaction Date, Place, Amount) so
-    it survives re-aggregation when new statement months are added.
-    Only restores rows where the existing category is non-empty and not
-    'Uncategorized', so genuinely new transactions still get AI-classified.
-    """
-    if not existing_file.exists() or 'category' not in new_df.columns:
-        return new_df
-    try:
-        existing = pd.read_csv(existing_file)
-        if 'category' not in existing.columns:
-            return new_df
-        # Build map: (date, place_upper, amount) -> category
-        # Only include rows explicitly corrected by the user (user_corrected=True).
-        # AI-assigned categories from prior runs are NOT restored so that improved
-        # merchant history can override them on the next re-aggregate.
-        cat_map = {}
-        for _, row in existing.iterrows():
-            try:
-                # Skip rows not explicitly corrected by the user
-                user_corrected = row.get('user_corrected', False)
-                if str(user_corrected).strip().lower() not in ('true', '1', 'yes'):
-                    continue
-                cat = str(row.get('category', '')).strip()
-                # Skip blank / Uncategorized / summary rows
-                if not cat or cat.lower() in ('uncategorized', 'nan', ''):
-                    continue
-                place = str(row.get('Place', '')).strip()
-                if place.startswith('---') or place.startswith('Total:') or place == 'GRAND TOTAL':
-                    continue
-                key = (
-                    str(row.get('Transaction Date', '')).strip(),
-                    place.upper(),
-                    round(float(row.get('Amount', 0)), 2),
-                )
-                cat_map[key] = cat
-            except Exception:
-                continue
-        if not cat_map:
-            return new_df
-        restored = 0
-        def _restore_cat(row):
-            nonlocal restored
-            try:
-                key = (
-                    str(row.get('Transaction Date', '')).strip(),
-                    str(row.get('Place', '')).strip().upper(),
-                    round(float(row.get('Amount', 0)), 2),
-                )
-                saved = cat_map.get(key)
-                if saved:
-                    restored += 1
-                    return saved
-            except Exception:
-                pass
-            return row.get('category', 'Uncategorized')
-        new_df = new_df.copy()
-        new_df['category'] = new_df.apply(_restore_cat, axis=1)
-        if debug and restored:
-            print(f"     Restored {restored} user-edited category(ies) from {existing_file.name}")
-    except Exception:
-        pass
-    return new_df
+    Aggregate all expenses and income by their actual transaction month
+    and write the results directly to the SQLite DB.
 
-
-def aggregate_by_transaction_month(statements_dir: Path, debug: bool = False):
-    """
-    Aggregate all expenses and income by their actual transaction month.
-    
-    Args:
-        statements_dir: Path to statements directory
-        debug: Print debug information
+    Reads all transaction rows from the DB, re-groups them by the actual
+    calendar month derived from tx_date, applies auto-classification, and
+    writes back to the DB with corrected report_month values.
     """
     if debug:
         print("\n" + "="*70)
         print("Aggregating transactions by calendar month...")
         print("="*70)
-    
-    # statements_dir is already src/ui/data/statements; monthly_reports is its sibling
-    reports_dir = statements_dir.parent / 'monthly_reports'
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Collect all expenses and income
+
+    # Initialise DB connection early so per-month writes can happen inline
+    _db_engine = None
+    try:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+        from src.database.session import init_db, get_engine
+        from src.database.db_utils import write_month_to_db, write_transfers_to_db
+        _db_engine = init_db()
+    except ImportError:
+        pass  # SQLAlchemy not installed — DB writes skipped
+    except Exception as exc:
+        print(f"⚠  DB init failed (non-fatal): {exc}")
+
+    if _db_engine is None:
+        print("⚠  DB unavailable — cannot aggregate (no data source)")
+        return
+
+    from sqlalchemy import text as _text
+
+    # Load investment keywords from DB (single source of truth)
+    _INVESTMENT_PLATFORM_KEYWORDS = _load_investment_keywords_from_db(_db_engine)
+
+    # ── Read ALL expenses and income from DB ──────────────────────────────────
     all_expenses = []
     all_income = []
-    
-    for month_dir in sorted(statements_dir.glob('*')):
-        if not month_dir.is_dir():
-            continue
-        
-        # Read expenses
-        expenses_file = month_dir / 'expenses.csv'
-        if expenses_file.exists():
-            try:
-                df = pd.read_csv(expenses_file)
-                if not df.empty:
-                    # Filter out summary rows (expense breakdown)
-                    if 'Place' in df.columns:
-                        df = df[~df['Place'].astype(str).str.contains(
-                            'EXPENSE BREAKDOWN|Total:|GRAND TOTAL',
-                            case=False, na=False, regex=True
-                        )]
-                    
-                    if not df.empty:
-                        all_expenses.append(df)
-                        if debug:
-                            print(f"  Read {len(df)} expenses from {month_dir.name}")
-            except Exception as e:
-                if debug:
-                    print(f"  Warning: Could not read {expenses_file}: {e}")
-        
-        # Read income
-        income_file = month_dir / 'income.csv'
-        if income_file.exists():
-            try:
-                df = pd.read_csv(income_file)
-                if not df.empty:
-                    all_income.append(df)
-                    if debug:
-                        print(f"  Read {len(df)} income from {month_dir.name}")
-            except Exception as e:
-                if debug:
-                    print(f"  Warning: Could not read {income_file}: {e}")
-    
-    # Process expenses
-    category_promoted_transfers = []  # rows reclassified as Investment Transfer
+
+    try:
+        with _db_engine.connect() as conn:
+            exp_rows = conn.execute(_text(
+                "SELECT tx_date, place, amount, category, label, statement "
+                "FROM transactions WHERE tx_type='expense' ORDER BY tx_date"
+            )).fetchall()
+        if exp_rows:
+            df = pd.DataFrame(exp_rows, columns=['Transaction Date', 'Place', 'Amount', 'category', 'Label', 'Statement'])
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
+            all_expenses = [df]
+            if debug:
+                print(f"  Read {len(df)} expenses from DB")
+        elif debug:
+            print("  No expense rows in DB")
+    except Exception as exc:
+        print(f"⚠  Failed to read expenses from DB: {exc}")
+        return
+
+    try:
+        with _db_engine.connect() as conn:
+            inc_rows = conn.execute(_text(
+                "SELECT tx_date, place, amount, category, label, statement "
+                "FROM transactions WHERE tx_type='income' ORDER BY tx_date"
+            )).fetchall()
+        if inc_rows:
+            df = pd.DataFrame(inc_rows, columns=['Transaction Date', 'Place', 'Amount', 'category', 'Label', 'Statement'])
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
+            all_income = [df]
+            if debug:
+                print(f"  Read {len(df)} income rows from DB")
+    except Exception as exc:
+        print(f"⚠  Failed to read income from DB: {exc}")
+
+    # ── Process expenses ──────────────────────────────────────────────────────
+    category_promoted_transfers = []
     if all_expenses:
         combined_expenses = pd.concat(all_expenses, ignore_index=True)
-        
-        # Remove duplicates (same transaction appearing in multiple statements)
-        # Use all columns except Source/Statement for duplicate detection
         dedup_cols = [col for col in combined_expenses.columns if col not in ['Source', 'Statement']]
         combined_expenses = combined_expenses.drop_duplicates(subset=dedup_cols, keep='first')
-        
+
         if debug:
             print(f"\n  Combined {len(combined_expenses)} unique expenses")
 
-        # Auto-classify expenses as 'recurring' or 'one-time'
         combined_expenses = _auto_classify_expenses(combined_expenses)
 
-        # Parse transaction dates and extract year-month
-        # Handle both 2-digit and 4-digit year formats (MM/DD/YY and MM/DD/YYYY)
         combined_expenses['_parsed_date'] = pd.to_datetime(
-            combined_expenses['Transaction Date'],
-            format='mixed',
-            errors='coerce'
+            combined_expenses['Transaction Date'], format='mixed', errors='coerce'
         )
         combined_expenses['_month'] = combined_expenses['_parsed_date'].dt.strftime('%Y-%m')
-        
-        # Collect rows promoted to transfers via the 'Investment Transfer' category
-        # (defined before this block so it's always accessible)
 
-        # Group by month and save
-        months_saved = 0
+        # Do not globally delete all expense transactions here; write_month_to_db()
+        # handles per-month replacement while preserving any user_corrected rows.
+        months_written = 0
         for month, group in combined_expenses.groupby('_month'):
             if pd.isna(month):
                 continue
-            
-            # Remove temporary columns and Place_Original
+
             cols_to_drop = ['_parsed_date', '_month']
             if 'Place_Original' in group.columns:
                 cols_to_drop.append('Place_Original')
-            output_df = group.drop(columns=cols_to_drop)
-            
-            # Sort by date within month
-            output_df = output_df.sort_values('Transaction Date')
+            output_df = group.drop(columns=cols_to_drop).sort_values('Transaction Date')
 
-            # Restore any user-set labels (overrides auto-classification)
-            output_file = reports_dir / f'expenses_{month}.csv'
-            output_df = _restore_user_labels(output_df, output_file)
-            # Restore any user-edited categories (overrides AI re-classification on re-aggregation)
-            output_df = _restore_user_categories(output_df, output_file, debug=debug)
-            # Mirror 'Investment Transfer' (or legacy 'Investment') rows → transfers pipeline
-            # Rows stay in expenses AND are copied to transfers; removing the category re-moves them
+            # Restore user-set labels/categories from DB (user_corrected rows survive re-agg)
+            # Note: write_month_to_db handles this automatically via its user_corrected logic.
+
+            # Mirror Investment Transfer rows to the transfers pipeline
             if 'category' in output_df.columns:
                 inv_mask = output_df['category'].astype(str).str.strip().isin(['Investment', 'Investment Transfer'])
                 inv_rows = output_df[inv_mask].copy()
-                # Do NOT remove from output_df — keep them in expenses too
                 if not inv_rows.empty:
                     t = pd.DataFrame({
                         'Transaction Date': inv_rows['Transaction Date'].values,
@@ -372,151 +267,63 @@ def aggregate_by_transaction_month(statements_dir: Path, debug: bool = False):
                     if debug:
                         print(f"  Promoted {len(inv_rows)} Investment Transfer expense(s) to transfers for {month}")
 
-            # Add expense breakdown summary at the end
-            if 'category' in output_df.columns:
-                # Calculate totals BEFORE adding summary rows
-                grand_total = round(output_df['Amount'].sum(), 2)
-                category_totals = output_df.groupby('category')['Amount'].sum().sort_values(ascending=False)
-                
-                # Get all columns except 'category' for summary rows
-                base_columns = [col for col in output_df.columns if col != 'category']
-                
-                # Create summary rows WITHOUT the category column
-                summary_rows = []
-                
-                # Header row
-                header_dict = {col: '' for col in base_columns}
-                header_dict['Place'] = '--- EXPENSE BREAKDOWN ---'
-                summary_rows.append(header_dict)
-                
-                # Category total rows
-                for cat, total in category_totals.items():
-                    row_dict = {col: '' for col in base_columns}
-                    row_dict['Place'] = f'Total: {cat}'
-                    row_dict['Amount'] = round(total, 2)
-                    summary_rows.append(row_dict)
-                
-                # Grand total row
-                grand_dict = {col: '' for col in base_columns}
-                grand_dict['Place'] = 'GRAND TOTAL'
-                grand_dict['Amount'] = grand_total
-                summary_rows.append(grand_dict)
-                
-                # Append summary to expenses
-                summary_df = pd.DataFrame(summary_rows)
-                output_with_summary = pd.concat([output_df, summary_df], ignore_index=True)
-                
-                # Save to monthly_reports
-                output_file = reports_dir / f'expenses_{month}.csv'
-                output_with_summary.to_csv(output_file, index=False)
-                months_saved += 1
-                
-                if debug:
-                    print(f"  Saved {len(output_df)} expenses + breakdown to {output_file.name} (${grand_total:.2f})")
+            # Write to DB
+            if _db_engine is not None:
+                try:
+                    n = write_month_to_db(_db_engine, month, expenses_df=output_df)
+                    months_written += 1
+                    if debug:
+                        print(f"  Wrote {n} expense rows for {month} to DB")
+                except Exception as exc:
+                    print(f"  ⚠  DB write for {month} expenses failed: {exc}")
             else:
-                # No category column, save without summary
-                output_file = reports_dir / f'expenses_{month}.csv'
-                output_df.to_csv(output_file, index=False)
-                months_saved += 1
-                
-                if debug:
-                    total_amount = output_df['Amount'].sum() if 'Amount' in output_df.columns else 0
-                    print(f"  Saved {len(output_df)} expenses to {output_file.name} (${total_amount:.2f})")
-        
-        print(f"\n✓ Saved expenses for {months_saved} month(s)")
+                months_written += 1
+
+        print(f"\n✓ Processed expenses for {months_written} month(s)")
     else:
         print("\n⚠ No expense data found")
-    
-    # Process income
-    income_return_transfers = []  # income rows marked as Investment Return → Direction=In
-    # Build merchant→category map from all expenses so reimbursements can be auto-categorized
+
+    # ── Process income ────────────────────────────────────────────────────────
+    income_return_transfers = []
     merchant_cat_map = _build_merchant_category_map(
         pd.concat(all_expenses, ignore_index=True) if all_expenses else pd.DataFrame()
     )
     if all_income:
         combined_income = pd.concat(all_income, ignore_index=True)
-        
-        # Remove duplicates
         dedup_cols = [col for col in combined_income.columns if col not in ['Source', 'Statement']]
         combined_income = combined_income.drop_duplicates(subset=dedup_cols, keep='first')
-        
+
         if debug:
             print(f"\n  Combined {len(combined_income)} unique income transactions")
 
-        # Auto-classify income as 'recurring' or 'bonus'
         combined_income = _auto_classify_income(combined_income)
 
-        # Parse transaction dates and extract year-month
-        # Handle both 2-digit and 4-digit year formats (MM/DD/YY and MM/DD/YYYY)
         combined_income['_parsed_date'] = pd.to_datetime(
-            combined_income['Transaction Date'],
-            format='mixed',
-            errors='coerce'
+            combined_income['Transaction Date'], format='mixed', errors='coerce'
         )
         combined_income['_month'] = combined_income['_parsed_date'].dt.strftime('%Y-%m')
-        
-        # Group by month and save
-        months_saved = 0
+
+        # Do not globally delete all income transactions here; write_month_to_db()
+        # handles per-month replacement while preserving any user_corrected rows.
+        months_written = 0
         for month, group in combined_income.groupby('_month'):
             if pd.isna(month):
                 continue
-            
-            # Remove temporary columns and Place_Original
+
             cols_to_drop = ['_parsed_date', '_month']
             if 'Place_Original' in group.columns:
                 cols_to_drop.append('Place_Original')
-            output_df = group.drop(columns=cols_to_drop)
-            
-            # Sort by date within month
-            output_df = output_df.sort_values('Transaction Date')
+            output_df = group.drop(columns=cols_to_drop).sort_values('Transaction Date')
 
-            # Restore any user-set labels (overrides auto-classification)
-            output_file = reports_dir / f'income_{month}.csv'
-            output_df = _restore_user_labels(output_df, output_file)
-            # Auto-categorize reimbursements using expense merchant history
             if 'category' not in output_df.columns:
                 output_df['category'] = ''
             elif output_df['category'].dtype != object:
-                # Can happen when statements/income.csv has a category column with all-NaN
-                # values (e.g. written by classify_manual_review), causing pandas to infer float64
                 output_df['category'] = output_df['category'].astype(object).fillna('')
             output_df = _categorize_reimbursements(output_df, merchant_cat_map)
-            # Restore any user-edited categories (wins over auto-categorization)
-            output_df = _restore_user_categories(output_df, output_file, debug=debug)
 
-            # Restore any Investment Return category from existing monthly report
-            if output_file.exists():
-                try:
-                    existing = pd.read_csv(output_file)
-                    if 'category' in existing.columns:
-                        cat_map = {}
-                        for _, row in existing.iterrows():
-                            try:
-                                key = (str(row.get('Transaction Date','')).strip(),
-                                       str(row.get('Place','')).strip().upper(),
-                                       round(float(row.get('Amount',0)),2))
-                                if str(row.get('category','')).strip():
-                                    cat_map[key] = str(row['category']).strip()
-                            except Exception:
-                                continue
-                        if cat_map:
-                            if 'category' not in output_df.columns:
-                                output_df['category'] = ''
-                            for idx, row in output_df.iterrows():
-                                try:
-                                    key = (str(row.get('Transaction Date','')).strip(),
-                                           str(row.get('Place','')).strip().upper(),
-                                           round(float(row.get('Amount',0)),2))
-                                    if key in cat_map:
-                                        output_df.at[idx, 'category'] = cat_map[key]
-                                except Exception:
-                                    continue
-                except Exception:
-                    pass
-
-            # Mirror Investment Return rows and investment platform income → transfers (Direction=In)
-            is_tagged    = output_df['category'].astype(str).str.strip() == 'Investment Return' if 'category' in output_df.columns else pd.Series(False, index=output_df.index)
-            is_platform  = output_df['Place'].astype(str).str.lower().apply(
+            # Mirror Investment Return + platform rows to transfers (Direction=In)
+            is_tagged   = output_df['category'].astype(str).str.strip() == 'Investment Return' if 'category' in output_df.columns else pd.Series(False, index=output_df.index)
+            is_platform = output_df['Place'].astype(str).str.lower().apply(
                 lambda p: any(kw in p for kw in _INVESTMENT_PLATFORM_KEYWORDS)
             )
             ret_rows = output_df[is_tagged | is_platform].copy()
@@ -532,53 +339,58 @@ def aggregate_by_transaction_month(statements_dir: Path, debug: bool = False):
                 if debug:
                     print(f"  Mirrored {len(ret_rows)} investment income row(s) to transfers for {month}")
 
-            # Save to monthly_reports
-            output_df.to_csv(output_file, index=False)
-            months_saved += 1
-            
-            if debug:
-                total_amount = output_df['Amount'].sum() if 'Amount' in output_df.columns else 0
-                print(f"  Saved {len(output_df)} income to {output_file.name} (${total_amount:.2f})")
-        
-        print(f"✓ Saved income for {months_saved} month(s)")
+            # Write to DB
+            if _db_engine is not None:
+                try:
+                    n = write_month_to_db(_db_engine, month, income_df=output_df)
+                    months_written += 1
+                    if debug:
+                        print(f"  Wrote {n} income rows for {month} to DB")
+                except Exception as exc:
+                    print(f"  ⚠  DB write for {month} income failed: {exc}")
+            else:
+                months_written += 1
+
+        print(f"✓ Processed income for {months_written} month(s)")
     else:
         print("\n⚠ No income data found")
 
-    # Process investment transfers
+    # ── Process investment transfers ──────────────────────────────────────────
     all_transfers = []
-    # Include rows promoted from the 'Investment Transfer' category during expense processing
     if category_promoted_transfers:
         all_transfers.extend(category_promoted_transfers)
-    # Include income rows marked as Investment Return (Direction=In)
     if income_return_transfers:
         all_transfers.extend(income_return_transfers)
-    for month_dir in sorted(statements_dir.glob('*')):
-        if not month_dir.is_dir():
-            continue
-        transfers_file = month_dir / 'transfers.csv'
-        if transfers_file.exists():
-            try:
-                df = pd.read_csv(transfers_file)
-                if not df.empty:
-                    all_transfers.append(df)
-                    if debug:
-                        print(f"  Read {len(df)} transfers from {month_dir.name}")
-            except Exception as e:
-                if debug:
-                    print(f"  Warning: Could not read {transfers_file}: {e}")
 
-    if all_transfers:
+    # Also pull existing transfers from DB (statements/YYYY-MM/transfers.csv rows
+    # previously stored there, now read from the transfers table)
+    try:
+        with _db_engine.connect() as conn:
+            tr_rows = conn.execute(_text(
+                "SELECT tx_date, place, amount, direction, statement "
+                "FROM transfers ORDER BY tx_date"
+            )).fetchall()
+        if tr_rows:
+            df = pd.DataFrame(tr_rows, columns=['Transaction Date', 'Place', 'Amount', 'Direction', 'Statement'])
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
+            all_transfers.append(df)
+            if debug:
+                print(f"  Read {len(df)} existing transfers from DB")
+    except Exception as exc:
+        if debug:
+            print(f"  Warning: Could not read transfers from DB: {exc}")
+
+    if all_transfers and _db_engine is not None:
         combined_transfers = pd.concat(all_transfers, ignore_index=True)
         dedup_cols = [col for col in combined_transfers.columns if col not in ['Source', 'Statement']]
         combined_transfers = combined_transfers.drop_duplicates(subset=dedup_cols, keep='first')
-
         combined_transfers['_parsed_date'] = pd.to_datetime(
-            combined_transfers['Transaction Date'],
-            format='mixed',
-            errors='coerce'
+            combined_transfers['Transaction Date'], format='mixed', errors='coerce'
         )
         combined_transfers['_month'] = combined_transfers['_parsed_date'].dt.strftime('%Y-%m')
-
+        with _db_engine.connect() as conn:
+            conn.execute(_text("DELETE FROM transfers"))
+            conn.commit()
         months_saved = 0
         for month, group in combined_transfers.groupby('_month'):
             if pd.isna(month):
@@ -586,21 +398,31 @@ def aggregate_by_transaction_month(statements_dir: Path, debug: bool = False):
             cols_to_drop = ['_parsed_date', '_month']
             if 'Place_Original' in group.columns:
                 cols_to_drop.append('Place_Original')
-            output_df = group.drop(columns=cols_to_drop)
-            output_df = output_df.sort_values('Transaction Date')
-            output_file = reports_dir / f'transfers_{month}.csv'
-            output_df.to_csv(output_file, index=False)
-            months_saved += 1
-            if debug:
-                total = output_df['Amount'].sum() if 'Amount' in output_df.columns else 0
-                print(f"  Saved {len(output_df)} transfers to {output_file.name} (${total:.2f})")
-
-        print(f"✓ Saved investment transfers for {months_saved} month(s)")
-    else:
+            output_df = group.drop(columns=cols_to_drop).sort_values('Transaction Date')
+            try:
+                rows_list = [
+                    {
+                        'tx_date':   str(r.get('Transaction Date', '')),
+                        'place':     str(r.get('Place', '')),
+                        'amount':    float(r.get('Amount', 0) or 0),
+                        'direction': str(r.get('Direction', 'Out')),
+                        'statement': str(r.get('Statement', '')),
+                    }
+                    for _, r in output_df.iterrows()
+                ]
+                write_transfers_to_db(_db_engine, month, rows_list)
+                months_saved += 1
+                if debug:
+                    total = output_df['Amount'].sum() if 'Amount' in output_df.columns else 0
+                    print(f"  Wrote {len(rows_list)} transfers for {month} to DB (${total:.2f})")
+            except Exception as exc:
+                print(f"  ⚠  DB write for {month} transfers failed: {exc}")
+        print(f"✓ Processed investment transfers for {months_saved} month(s)")
+    elif all_transfers:
         if debug:
-            print("\n  (No investment transfer data found — re-process statements to capture them)")
+            print("\n  (DB unavailable — transfer rows not persisted)")
 
-    print(f"\n✓ Monthly reports saved to: {reports_dir}")
+    print(f"\n✓ Aggregation complete — data written to DB")
     print("="*70)
 
 
@@ -629,12 +451,8 @@ def main():
     else:
         statements_dir = Path(__file__).parent.parent / args.statements_dir
     
-    if not statements_dir.exists():
-        print(f"Error: Statements directory not found: {statements_dir}")
-        sys.exit(1)
-    
     # Run aggregation
-    aggregate_by_transaction_month(statements_dir, debug=args.debug)
+    aggregate_by_transaction_month(debug=args.debug)
 
 
 if __name__ == '__main__':

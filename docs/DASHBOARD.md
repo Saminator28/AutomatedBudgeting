@@ -128,26 +128,17 @@ for the full Swagger UI with all endpoints, parameters, and response schemas.
 
 ---
 
-## Data Files
+## Data Store
 
-The dashboard reads and writes to `src/ui/data/`:
+All data is persisted in a SQLite database at `src/ui/data/budget.db`. The API reads and writes exclusively through the database — there are no CSV data files read back by the backend at runtime.
 
 ```
 src/ui/data/
 ├── statements/
 │   └── YYYY-MM/
 │       ├── *.pdf          ← uploaded PDFs
-│       └── *.csv          ← parsed transaction CSVs
-└── monthly_reports/
-    └── expenses_YYYY-MM.csv   ← aggregated month summary
-```
-
-The CSV format for transactions:
-
-```
-date,type,merchant,category,amount,label
-2025-06-15,DEBIT,Whole Foods,Groceries,87.42,expense
-2025-06-15,CREDIT,Employer Inc,Income,3200.00,income
+│       └── *.csv          ← parsed statement CSVs (retained as source records)
+└── budget.db              ← sole authoritative data store (transactions, merchant metadata, transfers)
 ```
 
 ---
@@ -183,7 +174,7 @@ Statement processing is slow (seconds to minutes depending on PDF size and LLM s
 2. The dashboard polls `GET /api/jobs/{job_id}` every few seconds
 3. When status changes to `"completed"`, the dashboard refreshes the transaction list
 
-Job state is held in memory; restarting the server clears all job history (completed jobs are not persisted, but the output CSVs remain).
+Job state is held in memory; restarting the server clears all job history (completed jobs are not persisted to the DB, but the output transactions remain in `budget.db`).
 
 ---
 

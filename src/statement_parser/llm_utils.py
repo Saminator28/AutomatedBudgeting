@@ -492,6 +492,59 @@ Reply with only 'A' or 'B'."""
     return result1 if conf1 >= conf2 else result2
 
 
+def detect_institution_with_llm(
+    header_text: str,
+    model: str,
+    debug: bool = False,
+) -> Optional[str]:
+    """
+    Ask the LLM to identify the bank/issuer name from the first ~80 lines of a
+    statement.  Returns a short institution name string, or None on failure.
+
+    The header_text passed in is already the joined first-80-lines string, so the
+    LLM only sees the most signal-dense part of the document.
+    """
+    # Trim to ~2 000 chars so prompt stays short and fast
+    snippet = header_text[:2000].strip()
+    if not snippet:
+        return None
+
+    prompt = (
+        "You are reading the top of a bank or credit-card statement PDF.\n"
+        "Identify the financial institution (bank or card issuer) that issued this statement.\n"
+        "Use the short, common name only — for example:\n"
+        "  'Citibank' not 'Citibank N.A.'\n"
+        "  'Wells Fargo' not 'Wells Fargo Bank, N.A.'\n"
+        "Reply with ONLY the institution name — no explanation, no punctuation, no extra words.\n"
+        "If you cannot determine the institution, reply with exactly: Unknown\n\n"
+        f"Statement header:\n{snippet}"
+    )
+    messages = [{'role': 'user', 'content': prompt}]
+    try:
+        response = _ollama_chat(
+            model=model,
+            messages=messages,
+            options={'temperature': 0, 'num_predict': 32},
+            think=False,
+            timeout=30,
+        )
+        content, _ = _extract_content(response)
+        name = content.strip().strip('"\'.').strip()
+        if debug:
+            print(f'  [LLM institution] raw response: {repr(name)}')
+        # Reject non-answers
+        if not name or name.lower() in {'unknown', 'unknown institution', 'n/a', 'none', ''}:
+            return None
+        # Reject if the model hallucinated a long sentence
+        if len(name) > 80 or '\n' in name:
+            return None
+        return name
+    except Exception as exc:
+        if debug:
+            print(f'  [LLM institution] error: {exc}')
+        return None
+
+
 def clean_merchant_with_ensemble(
     merchant:        str,
     primary_model:   str,

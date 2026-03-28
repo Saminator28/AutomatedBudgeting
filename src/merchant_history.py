@@ -53,49 +53,42 @@ class MerchantHistory:
         return s
     
     def _load_history(self):
-        """Load all historical expenses from monthly_reports/ — the single source of truth.
+        """Load all historical expenses from the SQLite DB to build merchant→category history.
 
-        monthly_reports/expenses_YYYY-MM.csv is always the authoritative record because it
-        reflects any UI corrections the user made after parsing. The raw
+        The DB reflects any UI corrections the user made after parsing. The raw
         statements/YYYY-MM/expenses.csv files are kept only as parser artifacts and are
         deliberately NOT read here, so corrected categories are never overridden by stale
         parser output.
         """
-        reports_dir = self.statements_dir.parent / 'monthly_reports'
-        if not reports_dir.exists():
-            return
-
         total_transactions = 0
 
-        for report_file in sorted(reports_dir.glob('expenses_????-??.csv')):
-            report_month = report_file.stem.replace('expenses_', '')
-            if self.exclude_month and report_month >= self.exclude_month:
-                continue
-            try:
-                df = pd.read_csv(report_file)
-                if 'category' not in df.columns or 'Place' not in df.columns:
+        try:
+            import sys
+            sys.path.insert(0, str(self.statements_dir.parent.parent))
+            from src.database.session import get_engine
+            from sqlalchemy import text as _text
+            eng = get_engine()
+            with eng.connect() as conn:
+                rows = conn.execute(_text(
+                    "SELECT place, category, report_month FROM transactions "
+                    "WHERE tx_type='expense' AND category IS NOT NULL AND category != '' "
+                    "ORDER BY report_month"
+                )).fetchall()
+            for place, category, report_month in rows:
+                if not place or not category:
                     continue
-                if not df.empty:
-                    df = df[
-                        ~df['Place'].astype(str).str.contains(
-                            '--- EXPENSE BREAKDOWN ---|Total:|GRAND TOTAL',
-                            case=False, na=False, regex=True
-                        )
-                    ]
-                for _, row in df.iterrows():
-                    place = str(row.get('Place', '')).strip()
-                    category = str(row.get('category', '')).strip()
-                    if not place or not category:
-                        continue
-                    if category.lower() in ['uncategorized', 'nan']:
-                        continue
-                    place_normalized = self._normalize_key(place)
-                    self.merchant_history[place_normalized][category] += 1
-                    self.merchant_name_spellings[place_normalized][place] += 1
-                    self.merchant_report_spellings[place_normalized][place] += 1
-                    total_transactions += 1
-            except Exception:
-                continue
+                if self.exclude_month and report_month and report_month >= self.exclude_month:
+                    continue
+                if str(category).lower() in ['uncategorized', 'nan']:
+                    continue
+                place_normalized = self._normalize_key(str(place).strip())
+                self.merchant_history[place_normalized][category] += 1
+                self.merchant_name_spellings[place_normalized][str(place).strip()] += 1
+                self.merchant_report_spellings[place_normalized][str(place).strip()] += 1
+                total_transactions += 1
+        except Exception as exc:
+            import logging as _log
+            _log.getLogger(__name__).warning(f"merchant_history: DB read failed — {exc}")
 
         for merchant, category_counts in self.merchant_history.items():
             if not category_counts:
