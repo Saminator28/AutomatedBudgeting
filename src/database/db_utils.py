@@ -128,21 +128,43 @@ def _sync_merchant_metadata(engine, keywords: list[str], all_places: list[str]) 
 
 # ── institution cache bootstrap ──────────────────────────────────────────────
 
+_DEFAULT_INVESTMENT_KEYWORDS = [
+    'fidelity', 'vanguard', 'schwab', 'robinhood', 'wealthsimple', 'betterment',
+    'acorns', 'stash', 'etrade', 'td ameritrade', 'merrill', 'wealthfront',
+]
+_DEFAULT_INCOME_KEYWORDS = [
+    'payroll', 'direct deposit', 'salary', 'wages', 'dividend', 'interest',
+    'refund', 'rebate', 'cashback', 'tax refund', 'irs', 'cra',
+]
+_DEFAULT_IGNORE_KEYWORDS = [
+    'balance adjustment', 'returned item', 'adjustment', 'reversal', 'credit adjustment',
+]
+_DEFAULT_PAYMENT_APP_KEYWORDS = [
+    'venmo', 'zelle', 'paypal', 'cash app', 'cashapp', 'apple pay', 'google pay',
+    'interac', 'e-transfer',
+]
+_DEFAULT_TRANSFER_KEYWORDS = [
+    'transfer', 'xfer', 'wire', 'ach', 'online transfer', 'bank transfer',
+]
+
+
 def seed_investment_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
     """
     One-time import of keywords from config/investment_platforms.json into the
-    investment_keywords DB table.  Safe to call repeatedly (INSERT OR IGNORE).
+    investment_keywords DB table.  Falls back to built-in defaults when the JSON
+    file is absent.  Safe to call repeatedly (INSERT OR IGNORE).
     Returns the number of rows inserted.
     """
     json_path = config_root / 'investment_platforms.json'
-    if not json_path.exists():
-        return 0
-    try:
-        with open(json_path) as f:
-            keywords = json.load(f).get('keywords', [])
-    except Exception as exc:
-        logger.warning(f'seed_investment_keywords: could not read JSON: {exc}')
-        return 0
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                keywords = json.load(f).get('keywords', [])
+        except Exception as exc:
+            logger.warning(f'seed_investment_keywords: could not read JSON: {exc}')
+            keywords = _DEFAULT_INVESTMENT_KEYWORDS
+    else:
+        keywords = _DEFAULT_INVESTMENT_KEYWORDS
 
     inserted = 0
     with engine.connect() as conn:
@@ -160,18 +182,20 @@ def seed_investment_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
 def seed_income_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
     """
     One-time import of keywords from config/income_keywords.json into the
-    income_keywords DB table.  Safe to call repeatedly (INSERT OR IGNORE).
+    income_keywords DB table.  Falls back to built-in defaults when the JSON
+    file is absent.  Safe to call repeatedly (INSERT OR IGNORE).
     Returns the number of rows inserted.
     """
     json_path = config_root / 'income_keywords.json'
-    if not json_path.exists():
-        return 0
-    try:
-        with open(json_path) as f:
-            keywords = json.load(f).get('income_keywords', [])
-    except Exception as exc:
-        logger.warning(f'seed_income_keywords: could not read JSON: {exc}')
-        return 0
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                keywords = json.load(f).get('income_keywords', [])
+        except Exception as exc:
+            logger.warning(f'seed_income_keywords: could not read JSON: {exc}')
+            keywords = _DEFAULT_INCOME_KEYWORDS
+    else:
+        keywords = _DEFAULT_INCOME_KEYWORDS
 
     inserted = 0
     with engine.connect() as conn:
@@ -189,18 +213,20 @@ def seed_income_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
 def seed_ignore_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
     """
     One-time import of keywords from config/ignore_transactions.json into the
-    ignore_keywords DB table.  Safe to call repeatedly (INSERT OR IGNORE).
+    ignore_keywords DB table.  Falls back to built-in defaults when the JSON
+    file is absent.  Safe to call repeatedly (INSERT OR IGNORE).
     Returns the number of rows inserted.
     """
     json_path = config_root / 'ignore_transactions.json'
-    if not json_path.exists():
-        return 0
-    try:
-        with open(json_path) as f:
-            keywords = json.load(f).get('ignore_keywords', [])
-    except Exception as exc:
-        logger.warning(f'seed_ignore_keywords: could not read JSON: {exc}')
-        return 0
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                keywords = json.load(f).get('ignore_keywords', [])
+        except Exception as exc:
+            logger.warning(f'seed_ignore_keywords: could not read JSON: {exc}')
+            keywords = _DEFAULT_IGNORE_KEYWORDS
+    else:
+        keywords = _DEFAULT_IGNORE_KEYWORDS
 
     inserted = 0
     with engine.connect() as conn:
@@ -218,18 +244,20 @@ def seed_ignore_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
 def seed_payment_app_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
     """
     One-time import of keywords from config/payment_apps.json into the
-    payment_app_keywords DB table.  Safe to call repeatedly (INSERT OR IGNORE).
+    payment_app_keywords DB table.  Falls back to built-in defaults when the
+    JSON file is absent.  Safe to call repeatedly (INSERT OR IGNORE).
     Returns the number of rows inserted.
     """
     json_path = config_root / 'payment_apps.json'
-    if not json_path.exists():
-        return 0
-    try:
-        with open(json_path) as f:
-            keywords = json.load(f).get('payment_app_keywords', [])
-    except Exception as exc:
-        logger.warning(f'seed_payment_app_keywords: could not read JSON: {exc}')
-        return 0
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                keywords = json.load(f).get('payment_app_keywords', [])
+        except Exception as exc:
+            logger.warning(f'seed_payment_app_keywords: could not read JSON: {exc}')
+            keywords = _DEFAULT_PAYMENT_APP_KEYWORDS
+    else:
+        keywords = _DEFAULT_PAYMENT_APP_KEYWORDS
 
     inserted = 0
     with engine.connect() as conn:
@@ -247,18 +275,20 @@ def seed_payment_app_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
 def seed_transfer_keywords(engine, config_root: Path = _CONFIG_ROOT) -> int:
     """
     One-time import of keywords from config/transfer_keywords.json into the
-    transfer_keywords DB table.  Safe to call repeatedly (INSERT OR IGNORE).
+    transfer_keywords DB table.  Falls back to built-in defaults when the JSON
+    file is absent.  Safe to call repeatedly (INSERT OR IGNORE).
     Returns the number of rows inserted.
     """
     json_path = config_root / 'transfer_keywords.json'
-    if not json_path.exists():
-        return 0
-    try:
-        with open(json_path) as f:
-            keywords = json.load(f).get('keywords', [])
-    except Exception as exc:
-        logger.warning(f'seed_transfer_keywords: could not read JSON: {exc}')
-        return 0
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                keywords = json.load(f).get('keywords', [])
+        except Exception as exc:
+            logger.warning(f'seed_transfer_keywords: could not read JSON: {exc}')
+            keywords = _DEFAULT_TRANSFER_KEYWORDS
+    else:
+        keywords = _DEFAULT_TRANSFER_KEYWORDS
 
     inserted = 0
     with engine.connect() as conn:
@@ -375,10 +405,18 @@ def write_month_to_db(engine,
     type_placeholders = ','.join(f"'{t}'" for t in types_to_replace)
     with engine.connect() as conn:
         uc_rows = conn.execute(text(
-            f"SELECT tx_hash, category, label, place FROM transactions "
+            f"SELECT tx_hash, category, label, place, amount FROM transactions "
             f"WHERE report_month=:m AND user_corrected=1 AND tx_type IN ({type_placeholders})"
-        ), {'m': month}).fetchall()
-        uc_map = {r[0]: {'category': r[1], 'label': r[2], 'place': r[3]} for r in uc_rows}
+        ), {'m': month}).mappings().fetchall()
+        uc_map = {
+            r['tx_hash']: {
+                'category': r['category'],
+                'label':    r['label'],
+                'place':    r['place'],
+                'amount':   r['amount'],
+            }
+            for r in uc_rows
+        }
 
         for tx_type in types_to_replace:
             conn.execute(text(
@@ -397,10 +435,12 @@ def write_month_to_db(engine,
                     "  category=COALESCE(:cat, category), "
                     "  label=COALESCE(:lbl, label), "
                     "  place=COALESCE(:pl, place), "
+                    "  amount=COALESCE(:amt, amount), "
                     "  user_corrected=1 "
                     "WHERE tx_hash=:h"
                 ), {'cat': corr['category'], 'lbl': corr['label'],
-                    'pl': corr['place'],     'h': tx_hash})
+                    'pl': corr['place'],     'amt': corr['amount'],
+                    'h': tx_hash})
             conn.commit()
 
     keywords = _load_investment_keywords_from_db(engine)

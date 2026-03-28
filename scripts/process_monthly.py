@@ -1762,6 +1762,24 @@ def main():
         print("⚠ Ollama LLM not available - using pattern matching only")
         print("  (Install Ollama and run 'ollama pull dolphin-mistral' for better categorization)")
     
+    # Initialize DB and seed keywords before constructing StatementParser so
+    # keyword tables exist when the parser queries them on __init__.
+    try:
+        _script_root = Path(__file__).parent.parent
+        sys.path.insert(0, str(_script_root))
+        from src.database.session import init_db as _init_db
+        from src.database.db_utils import (
+            seed_income_keywords, seed_ignore_keywords,
+            seed_payment_app_keywords, seed_transfer_keywords,
+        )
+        _eng = _init_db()
+        seed_income_keywords(_eng)
+        seed_ignore_keywords(_eng)
+        seed_payment_app_keywords(_eng)
+        seed_transfer_keywords(_eng)
+    except Exception as _dbe:
+        print(f"⚠  DB pre-init failed (non-fatal): {_dbe}")
+
     # Initialize parser once
     print("Initializing statement parser...")
     statement_parser = StatementParser()

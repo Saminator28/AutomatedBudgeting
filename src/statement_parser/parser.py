@@ -62,6 +62,15 @@ class StatementParser:
         from pathlib import Path as _KWPath
         _kw_db = _KWPath(__file__).parent.parent / 'ui' / 'data' / 'budget.db'
         try:
+            # Ensure the DB and its tables exist before querying
+            _db_root = _KWPath(__file__).parent.parent.parent
+            import sys as _sys
+            _sys.path.insert(0, str(_db_root))
+            try:
+                from src.database.session import init_db as _init_db
+                _init_db()
+            except Exception:
+                pass  # init_db unavailable; DB may already exist or will fall through below
             _con = _sqlite3.connect(_kw_db)
             self.income_keywords   = [r[0].upper() for r in _con.execute('SELECT keyword FROM income_keywords').fetchall()]
             self.transfer_keywords = [r[0].upper() for r in _con.execute('SELECT keyword FROM transfer_keywords').fetchall()]
