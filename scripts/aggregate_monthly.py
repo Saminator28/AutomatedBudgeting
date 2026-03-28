@@ -189,11 +189,11 @@ def aggregate_by_transaction_month(debug: bool = False):
     try:
         with _db_engine.connect() as conn:
             exp_rows = conn.execute(_text(
-                "SELECT tx_date, place, amount, category, label, statement "
+                "SELECT tx_date, place, amount, category, label, statement, source_statement "
                 "FROM transactions WHERE tx_type='expense' ORDER BY tx_date"
             )).fetchall()
         if exp_rows:
-            df = pd.DataFrame(exp_rows, columns=['Transaction Date', 'Place', 'Amount', 'category', 'Label', 'Statement'])
+            df = pd.DataFrame(exp_rows, columns=['Transaction Date', 'Place', 'Amount', 'category', 'Label', 'Statement', 'source_statement'])
             df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
             all_expenses = [df]
             if debug:
@@ -223,8 +223,33 @@ def aggregate_by_transaction_month(debug: bool = False):
     category_promoted_transfers = []
     if all_expenses:
         combined_expenses = pd.concat(all_expenses, ignore_index=True)
-        dedup_cols = [col for col in combined_expenses.columns if col not in ['Source', 'Statement']]
-        combined_expenses = combined_expenses.drop_duplicates(subset=dedup_cols, keep='first')
+        # Dedup: rows that share (date, place, amount, statement) but came from
+        # DIFFERENT source_statements are cross-statement duplicates introduced by
+        # a prior parsing bug — keep only the one from the LATEST source_statement.
+        # Rows that share all those columns AND the same source_statement are genuine
+        # separate transactions (e.g. two ATM withdrawals from the same PDF parse) and
+        # must be preserved.
+        _grp_cols = [c for c in ['Transaction Date', 'Place', 'Amount', 'Statement']
+                     if c in combined_expenses.columns]
+        if 'source_statement' in combined_expenses.columns and _grp_cols:
+            _src_nunique = combined_expenses.groupby(_grp_cols, sort=False)['source_statement'].transform(
+                lambda x: x.fillna('').nunique()
+            )
+            if (_src_nunique > 1).any():
+                # Sort so the latest source_statement wins (keep='first' after sort)
+                combined_expenses = combined_expenses.sort_values(
+                    'source_statement', ascending=False, na_position='last', kind='stable'
+                )
+                _cross_src = _src_nunique > 1
+                _to_drop   = _cross_src & combined_expenses.duplicated(subset=_grp_cols, keep='first')
+                _removed   = _to_drop.sum()
+                combined_expenses = combined_expenses[~_to_drop].reset_index(drop=True)
+                if _removed and debug:
+                    print(f"  Removed {_removed} cross-statement expense duplicate(s) via source_statement dedup")
+        # Note: No further dedup here — the source_statement-aware cross-source dedup
+        # above is the correct guard.  A blanket drop_duplicates on visible fields would
+        # silently collapse genuine same-day same-amount transactions (e.g. two $200
+        # ATM withdrawals from the same bank on the same day).
 
         if debug:
             print(f"\n  Combined {len(combined_expenses)} unique expenses")
@@ -236,8 +261,17 @@ def aggregate_by_transaction_month(debug: bool = False):
         )
         combined_expenses['_month'] = combined_expenses['_parsed_date'].dt.strftime('%Y-%m')
 
-        # Do not globally delete all expense transactions here; write_month_to_db()
-        # handles per-month replacement while preserving any user_corrected rows.
+        if _db_engine is not None:
+            # Snapshot all user-corrected expense rows BEFORE the global wipe so
+            # write_month_to_db can reapply them after per-month replacement.
+            with _db_engine.connect() as conn:
+                _uc_exp = conn.execute(_text(
+                    "SELECT tx_hash, category, label, place, amount, report_month, tx_date "
+                    "FROM transactions WHERE tx_type='expense' AND user_corrected=1"
+                )).fetchall()
+                conn.execute(_text("DELETE FROM transactions WHERE tx_type='expense'"))
+                conn.commit()
+
         months_written = 0
         for month, group in combined_expenses.groupby('_month'):
             if pd.isna(month):
@@ -280,6 +314,51 @@ def aggregate_by_transaction_month(debug: bool = False):
                 months_written += 1
 
         print(f"\n✓ Processed expenses for {months_written} month(s)")
+
+        # Reapply user corrections that existed before the global wipe.
+        # Try by tx_hash first; fall back to (tx_date, place, amount) because
+        # the hash changes when report_month changes (cross-month transaction
+        # moved by aggregate re-grouping).
+        if _db_engine is not None and _uc_exp:
+            applied = 0
+            with _db_engine.connect() as conn:
+                for uc in _uc_exp:
+                    tx_hash, cat, lbl, place, amt, rmonth, tx_date = uc
+                    res = conn.execute(_text(
+                        "UPDATE transactions SET "
+                        "  category=COALESCE(:cat, category), "
+                        "  label=COALESCE(:lbl, label), "
+                        "  place=COALESCE(:pl, place), "
+                        "  amount=COALESCE(:amt, amount), "
+                        "  user_corrected=1 "
+                        "WHERE tx_hash=:h"
+                    ), {'cat': cat, 'lbl': lbl, 'pl': place, 'amt': amt, 'h': tx_hash})
+                    if res.rowcount == 0:
+                        # Hash mismatch — tx changed report_month; restore by tx_date+place+amount
+                        if tx_date:
+                            conn.execute(_text(
+                                "UPDATE transactions SET "
+                                "  category=COALESCE(:cat, category), "
+                                "  label=COALESCE(:lbl, label), "
+                                "  user_corrected=1 "
+                                "WHERE tx_date=:d "
+                                "  AND UPPER(place)=UPPER(:pl) "
+                                "  AND ROUND(amount,2)=ROUND(:amt,2)"
+                            ), {'cat': cat, 'lbl': lbl, 'pl': place, 'amt': amt, 'd': tx_date})
+                        else:
+                            conn.execute(_text(
+                                "UPDATE transactions SET "
+                                "  category=COALESCE(:cat, category), "
+                                "  label=COALESCE(:lbl, label), "
+                                "  user_corrected=1 "
+                                "WHERE report_month=:m "
+                                "  AND UPPER(place)=UPPER(:pl) "
+                                "  AND ROUND(amount,2)=ROUND(:amt,2)"
+                            ), {'cat': cat, 'lbl': lbl, 'pl': place, 'amt': amt, 'm': rmonth})
+                    applied += 1
+                conn.commit()
+            if debug:
+                print(f"  Re-applied {applied} user-corrected expense row(s)")
     else:
         print("\n⚠ No expense data found")
 
@@ -290,8 +369,20 @@ def aggregate_by_transaction_month(debug: bool = False):
     )
     if all_income:
         combined_income = pd.concat(all_income, ignore_index=True)
-        dedup_cols = [col for col in combined_income.columns if col not in ['Source', 'Statement']]
-        combined_income = combined_income.drop_duplicates(subset=dedup_cols, keep='first')
+        _grp_cols_inc = [c for c in ['Transaction Date', 'Place', 'Amount', 'Statement']
+                         if c in combined_income.columns]
+        if 'source_statement' in combined_income.columns and _grp_cols_inc:
+            _src_nunique_inc = combined_income.groupby(_grp_cols_inc, sort=False)['source_statement'].transform(
+                lambda x: x.fillna('').nunique()
+            )
+            if (_src_nunique_inc > 1).any():
+                combined_income = combined_income.sort_values(
+                    'source_statement', ascending=False, na_position='last', kind='stable'
+                )
+                _cross_src_inc = _src_nunique_inc > 1
+                _to_drop_inc   = _cross_src_inc & combined_income.duplicated(subset=_grp_cols_inc, keep='first')
+                combined_income = combined_income[~_to_drop_inc].reset_index(drop=True)
+        # No further dedup — same reasoning as expenses above.
 
         if debug:
             print(f"\n  Combined {len(combined_income)} unique income transactions")
@@ -303,8 +394,16 @@ def aggregate_by_transaction_month(debug: bool = False):
         )
         combined_income['_month'] = combined_income['_parsed_date'].dt.strftime('%Y-%m')
 
-        # Do not globally delete all income transactions here; write_month_to_db()
-        # handles per-month replacement while preserving any user_corrected rows.
+        if _db_engine is not None:
+            # Snapshot all user-corrected income rows BEFORE the global wipe.
+            with _db_engine.connect() as conn:
+                _uc_inc = conn.execute(_text(
+                    "SELECT tx_hash, category, label, place, amount, report_month, tx_date "
+                    "FROM transactions WHERE tx_type='income' AND user_corrected=1"
+                )).fetchall()
+                conn.execute(_text("DELETE FROM transactions WHERE tx_type='income'"))
+                conn.commit()
+
         months_written = 0
         for month, group in combined_income.groupby('_month'):
             if pd.isna(month):
@@ -352,6 +451,49 @@ def aggregate_by_transaction_month(debug: bool = False):
                 months_written += 1
 
         print(f"✓ Processed income for {months_written} month(s)")
+
+        # Reapply user corrections that existed before the global wipe.
+        # Try by tx_hash first; fall back to (tx_date, place, amount) because
+        # the hash changes when tx_type changes (e.g. expense→income).
+        if _db_engine is not None and _uc_inc:
+            applied = 0
+            with _db_engine.connect() as conn:
+                for uc in _uc_inc:
+                    tx_hash, cat, lbl, place, amt, rmonth, tx_date = uc
+                    res = conn.execute(_text(
+                        "UPDATE transactions SET "
+                        "  category=COALESCE(:cat, category), "
+                        "  label=COALESCE(:lbl, label), "
+                        "  place=COALESCE(:pl, place), "
+                        "  amount=COALESCE(:amt, amount), "
+                        "  user_corrected=1 "
+                        "WHERE tx_hash=:h"
+                    ), {'cat': cat, 'lbl': lbl, 'pl': place, 'amt': amt, 'h': tx_hash})
+                    if res.rowcount == 0:
+                        if tx_date:
+                            conn.execute(_text(
+                                "UPDATE transactions SET "
+                                "  category=COALESCE(:cat, category), "
+                                "  label=COALESCE(:lbl, label), "
+                                "  user_corrected=1 "
+                                "WHERE tx_date=:d "
+                                "  AND UPPER(place)=UPPER(:pl) "
+                                "  AND ROUND(amount,2)=ROUND(:amt,2)"
+                            ), {'cat': cat, 'lbl': lbl, 'pl': place, 'amt': amt, 'd': tx_date})
+                        else:
+                            conn.execute(_text(
+                                "UPDATE transactions SET "
+                                "  category=COALESCE(:cat, category), "
+                                "  label=COALESCE(:lbl, label), "
+                                "  user_corrected=1 "
+                                "WHERE report_month=:m "
+                                "  AND UPPER(place)=UPPER(:pl) "
+                                "  AND ROUND(amount,2)=ROUND(:amt,2)"
+                            ), {'cat': cat, 'lbl': lbl, 'pl': place, 'amt': amt, 'm': rmonth})
+                    applied += 1
+                conn.commit()
+            if debug:
+                print(f"  Re-applied {applied} user-corrected income row(s)")
     else:
         print("\n⚠ No income data found")
 
@@ -362,28 +504,17 @@ def aggregate_by_transaction_month(debug: bool = False):
     if income_return_transfers:
         all_transfers.extend(income_return_transfers)
 
-    # Also pull existing transfers from DB (statements/YYYY-MM/transfers.csv rows
-    # previously stored there, now read from the transfers table)
-    try:
-        with _db_engine.connect() as conn:
-            tr_rows = conn.execute(_text(
-                "SELECT tx_date, place, amount, direction, statement "
-                "FROM transfers ORDER BY tx_date"
-            )).fetchall()
-        if tr_rows:
-            df = pd.DataFrame(tr_rows, columns=['Transaction Date', 'Place', 'Amount', 'Direction', 'Statement'])
-            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
-            all_transfers.append(df)
-            if debug:
-                print(f"  Read {len(df)} existing transfers from DB")
-    except Exception as exc:
-        if debug:
-            print(f"  Warning: Could not read transfers from DB: {exc}")
+    # NOTE: Do NOT read existing transfers from DB here.
+    # category_promoted_transfers (from Investment-categorised expenses) and
+    # income_return_transfers (from investment income) are freshly derived each
+    # run and are the complete source of truth for the transfers table.
+    # Reading old DB rows back and merging them would double-count on every run.
 
     if all_transfers and _db_engine is not None:
         combined_transfers = pd.concat(all_transfers, ignore_index=True)
-        dedup_cols = [col for col in combined_transfers.columns if col not in ['Source', 'Statement']]
-        combined_transfers = combined_transfers.drop_duplicates(subset=dedup_cols, keep='first')
+        _tr_dedup_cols = ['Transaction Date', 'Place', 'Amount', 'Direction', 'Statement']
+        _tr_dedup_cols = [c for c in _tr_dedup_cols if c in combined_transfers.columns]
+        combined_transfers = combined_transfers.drop_duplicates(subset=_tr_dedup_cols, keep='first')
         combined_transfers['_parsed_date'] = pd.to_datetime(
             combined_transfers['Transaction Date'], format='mixed', errors='coerce'
         )

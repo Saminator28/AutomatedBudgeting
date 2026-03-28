@@ -57,20 +57,26 @@ class StatementParser:
                 # If running from project root
                 self.config_dir = Path('config')
         
-        # Load keyword lists from DB (inline sqlite3, same pattern as detect_bank_name)
+        # Ensure the DB exists and keyword tables are seeded before querying them.
+        # This is safe to call on every startup (all inserts are INSERT OR IGNORE).
         import sqlite3 as _sqlite3
         from pathlib import Path as _KWPath
         _kw_db = _KWPath(__file__).parent.parent / 'ui' / 'data' / 'budget.db'
         try:
-            # Ensure the DB and its tables exist before querying
-            _db_root = _KWPath(__file__).parent.parent.parent
-            import sys as _sys
-            _sys.path.insert(0, str(_db_root))
-            try:
-                from src.database.session import init_db as _init_db
-                _init_db()
-            except Exception:
-                pass  # init_db unavailable; DB may already exist or will fall through below
+            _kw_db.parent.mkdir(parents=True, exist_ok=True)
+            # Use SQLAlchemy init_db so tables are created before we query them
+            _kw_db_url = f"sqlite:///{_kw_db}"
+            from sqlalchemy import create_engine as _ce
+            from src.database.session import init_db as _init_db
+            from src.database.db_utils import (
+                seed_income_keywords, seed_transfer_keywords,
+                seed_payment_app_keywords, seed_ignore_keywords,
+            )
+            _eng = _ce(_kw_db_url)
+            _init_db(_kw_db)
+            for _seed_fn in (seed_income_keywords, seed_transfer_keywords,
+                             seed_payment_app_keywords, seed_ignore_keywords):
+                _seed_fn(_eng)
             _con = _sqlite3.connect(_kw_db)
             self.income_keywords   = [r[0].upper() for r in _con.execute('SELECT keyword FROM income_keywords').fetchall()]
             self.transfer_keywords = [r[0].upper() for r in _con.execute('SELECT keyword FROM transfer_keywords').fetchall()]
@@ -78,11 +84,11 @@ class StatementParser:
             self.ignore_keywords   = [r[0].upper() for r in _con.execute('SELECT keyword FROM ignore_keywords').fetchall()]
             _con.close()
         except Exception as _kw_exc:
-            print(f"⚠ Could not load keywords from DB ({_kw_exc}). Keyword matching will be limited.")
-            self.income_keywords   = []
-            self.transfer_keywords = []
-            self.payment_apps      = []
-            self.ignore_keywords   = []
+            raise RuntimeError(
+                f"❌ Could not load classification keywords from DB: {_kw_exc}\n"
+                f"   DB path: {_kw_db}\n"
+                f"   Ensure the database is accessible and try again."
+            ) from _kw_exc
         
         # Load LLM model configuration - STRICT VALIDATION (no defaults)
         llm_config_file = self.config_dir / 'llm_models.json'
@@ -598,8 +604,18 @@ class StatementParser:
         
         # If LLM failed to clean (Place == Place_Original), set Place to empty
         # This indicates the name needs manual review/cleaning
-        # Skip this check if we manually cleaned the description
-        if not manually_cleaned and trans['Place'].strip().upper() == trans['Place_Original'].strip().upper():
+        # Skip this check if:
+        #   - we manually cleaned the description, OR
+        #   - the original description was ALREADY a short/clean name (≤4 words,
+        #     no reference numbers) — e.g. "INTEREST", "DIAMOND CASH REWARDS".
+        #     For these the LLM just title-cases; treat that as a valid clean.
+        _orig_already_clean = (
+            not re.search(r'\d{3,}', original_description)  # no ref numbers
+            and len(original_description.split()) <= 4        # not a long raw description
+        )
+        if (not manually_cleaned
+                and trans['Place'].strip().upper() == trans['Place_Original'].strip().upper()
+                and not _orig_already_clean):
             trans['Place'] = ''
         
         # Assign amounts
@@ -1110,14 +1126,37 @@ class StatementParser:
         
         return text, transactions, validation
     
-    def filter_transfers(self, transactions: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Separate transfers from real transactions using config keywords."""
+    def filter_transfers(self, transactions: List[Dict], whitelisted_places: set = None) -> Tuple[List[Dict], List[Dict]]:
+        """Separate transfers from real transactions using config keywords.
+
+        *whitelisted_places* is an optional set of normalized merchant keys
+        (from auto_deleted_transactions where whitelisted=1 and reason='transfer_keyword').
+        Transactions whose normalized place is whitelisted are kept as real transactions
+        even if they match a transfer keyword.
+
+        Keyword-filtered transactions are also appended to
+        ``self._keyword_filtered_transfers`` so *process_monthly.py* can log them
+        to auto_deleted_transactions after the call returns.
+        """
+        from src.database.db_utils import _normalize_merchant_key as _nmk  # lazy import to avoid circular dep
+        _wl = whitelisted_places or set()
+
         real_transactions = []
         transfers = []
-        
+
+        if not hasattr(self, '_keyword_filtered_transfers'):
+            self._keyword_filtered_transfers = []
+
         for trans in transactions:
             place = trans.get('Place_Original', trans.get('Place', '')).upper()
             is_transfer = any(keyword in place for keyword in self.transfer_keywords)
+
+            # Honour whitelist — if the normalized place is whitelisted, never treat
+            # it as a transfer regardless of keyword match.
+            if is_transfer and _wl:
+                norm = _nmk(trans.get('Place_Original', trans.get('Place', '')))
+                if norm in _wl:
+                    is_transfer = False
             
             # Debug logging for transfers
             if hasattr(self, 'debug') and self.debug and is_transfer:
@@ -1125,6 +1164,7 @@ class StatementParser:
             
             if is_transfer:
                 transfers.append(trans)
+                self._keyword_filtered_transfers.append(trans)
             else:
                 real_transactions.append(trans)
         
@@ -1188,88 +1228,22 @@ class StatementParser:
                 continue
 
             if is_payment_app:
-                # Payment apps always go to manual review (user must classify)
-                # Try to hint the type based on Credits/Debits, keywords, or transaction description
-                trans['_needs_manual_review'] = True
-                
-                # Hint: Determine likely type (Income or Expense) for the Type column
-                has_credits = 'Credits' in trans and trans['Credits'] and trans['Credits'] > 0
-                has_debits = 'Debits' in trans and trans['Debits'] and trans['Debits'] > 0
-                is_income_keyword = any(keyword in place_original for keyword in self.income_keywords)
-                
-                # Check description for specific transaction type indicators
-                desc_upper = place_original.upper()
-                expense_indicators = ['PAYMENT', 'PURCHASE', 'POS PURCHASE', 'WITHDRAWAL', 'PAYMENT APP*']
-                income_indicators = ['CASHOUT', 'CASH OUT', 'DEPOSIT', 'CREDIT', 'REFUND', 'TRANSFER FROM']
-                
-                is_likely_expense = any(indicator in desc_upper for indicator in expense_indicators)
-                is_likely_income = any(indicator in desc_upper for indicator in income_indicators)
-                
-                # Special handling for payment-app transactions without purchase keywords
-                # "PAYMENT APP [NAME]" without "PURCHASE"/"POS" = likely cashout (income)
-                # "PAYMENT APP*" or "POS PURCHASE AT PAYMENT APP" = likely wallet load (expense)
-                if any(app in desc_upper for app in self.payment_apps) and not is_likely_expense and not is_likely_income:
-                    # Plain "PAYMENT APP [NAME]" pattern suggests cashout
-                    is_likely_income = True
-                
-                # Prioritize description indicators over column-based hints
-                if is_likely_income:
-                    trans['Type'] = 'Income'
-                elif is_likely_expense:
-                    trans['Type'] = 'Expense'
-                elif has_credits or is_income_keyword:
-                    trans['Type'] = 'Income'
-                elif has_debits:
-                    trans['Type'] = 'Expense'
-                elif 'Amount' in trans:
-                    # For Amount column, check keywords
-                    trans['Type'] = 'Income' if is_income_keyword else 'Expense'
-                else:
-                    trans['Type'] = 'Expense'  # Default to expense if unsure
-                
-                print(f"  Payment app flagged for manual review: {trans.get('Place', '')} (Type: {trans['Type']})")
-                manual_review.append(trans)
+                # Payment apps (Cash App, Venmo, Zelle, etc.) are treated as
+                # expenses by default. The user can reclassify individual
+                # transactions via the Income tab if needed, which will create
+                # a merchant rule so future transactions auto-classify.
+                expenses.append(trans)
                 continue
-            
-            if is_bank_account:
-                has_credits = 'Credits' in trans and trans['Credits'] and trans['Credits'] > 0
-                has_debits = 'Debits' in trans and trans['Debits'] and trans['Debits'] > 0
-                
-                if has_credits:
-                    income.append(trans)
-                elif has_debits:
-                    expenses.append(trans)
-                elif 'Amount' in trans and trans['Amount'] > 0:
-                    # Use income_keywords to classify
-                    is_income_keyword = any(keyword in place_original for keyword in self.income_keywords)
-                    
-                    if hasattr(self, 'debug') and self.debug:
-                        classification = "INCOME" if (is_income_keyword or is_credit_return) else "EXPENSE"
-                        matched_keyword = next((kw for kw in self.income_keywords if kw in place_original), "CR return" if is_credit_return else "none")
-                        print(f"  [KEYWORD] {trans.get('Transaction Date')} {trans.get('Place', '')[:25]:25s}: matched='{matched_keyword}' → {classification}")
-                    
-                    if is_credit_return:
-                        trans['category'] = 'Return/Reimbursement'
-                        print(f"  Credit return detected (CR): {trans.get('Place', '')} ${trans.get('Amount', '')}")
-                        income.append(trans)
-                    elif is_income_keyword:
-                        income.append(trans)
-                    else:
-                        expenses.append(trans)
-            else:
-                has_credits = 'Credits' in trans and trans['Credits'] and trans['Credits'] > 0
-                has_debits = 'Debits' in trans and trans['Debits'] and trans['Debits'] > 0
-                
-                if has_credits:
-                    income.append(trans)
-                elif is_credit_return:
-                    trans['category'] = 'Return/Reimbursement'
-                    print(f"  Credit return detected (CR): {trans.get('Place', '')} ${trans.get('Amount', '')}")
-                    income.append(trans)
-                elif has_debits or 'Amount' in trans:
-                    expenses.append(trans)
-                else:
-                    expenses.append(trans)
+
+            # Default everything to expenses.
+            # _apply_merchant_rules (called after write_month_to_db) is the ONLY
+            # thing that promotes a transaction to income — and it only fires for
+            # merchants the user has explicitly confirmed as income sources.
+            # Credit card returns (explicit "CR" suffix) are kept as
+            # Return/Reimbursement so they offset the original expense category.
+            if is_credit_return:
+                trans['category'] = 'Return/Reimbursement'
+            expenses.append(trans)
         
         return income, expenses, manual_review, investment_transfers
     
@@ -1313,7 +1287,10 @@ class StatementParser:
             print(f"  Found {len(transactions)} transaction(s)")
         
         # Filter out transfers
-        transactions, transfers = self.filter_transfers(transactions)
+        transactions, transfers = self.filter_transfers(
+            transactions,
+            whitelisted_places=getattr(self, 'whitelisted_transfer_places', None),
+        )
         if debug and transfers:
             print(f"  Skipped {len(transfers)} transfer(s)")
         

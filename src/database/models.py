@@ -37,8 +37,9 @@ transactions = Table(
     Column('category',       String(128), index=True),
     Column('label',          String(32)),   # recurring | one-time | bonus | reimbursement
     Column('tx_type',        String(16), nullable=False, index=True),
-    Column('statement',      String(256)),
-    Column('user_corrected', Boolean, default=False),
+    Column('statement',        String(256)),
+    Column('user_corrected',   Boolean, default=False),
+    Column('source_statement', String(7)),   # YYYY-MM folder month that produced this row
 )
 
 # ── merchant_metadata ────────────────────────────────────────────────────────
@@ -80,6 +81,7 @@ investment_keywords = Table(
     'investment_keywords', metadata,
     Column('id',      Integer, primary_key=True, autoincrement=True),
     Column('keyword', String(128), unique=True, nullable=False, index=True),
+    Column('source',  String(16),  nullable=False, server_default='default'),
 )
 
 # ── income_keywords ───────────────────────────────────────────────────────────
@@ -89,6 +91,7 @@ income_keywords = Table(
     'income_keywords', metadata,
     Column('id',      Integer, primary_key=True, autoincrement=True),
     Column('keyword', String(128), unique=True, nullable=False, index=True),
+    Column('source',  String(16),  nullable=False, server_default='default'),
 )
 
 # ── ignore_keywords ───────────────────────────────────────────────────────────
@@ -99,6 +102,7 @@ ignore_keywords = Table(
     'ignore_keywords', metadata,
     Column('id',      Integer, primary_key=True, autoincrement=True),
     Column('keyword', String(128), unique=True, nullable=False, index=True),
+    Column('source',  String(16),  nullable=False, server_default='default'),
 )
 
 # ── payment_app_keywords ──────────────────────────────────────────────────────
@@ -109,6 +113,7 @@ payment_app_keywords = Table(
     'payment_app_keywords', metadata,
     Column('id',      Integer, primary_key=True, autoincrement=True),
     Column('keyword', String(128), unique=True, nullable=False, index=True),
+    Column('source',  String(16),  nullable=False, server_default='default'),
 )
 
 # ── transfer_keywords ─────────────────────────────────────────────────────────
@@ -119,6 +124,7 @@ transfer_keywords = Table(
     'transfer_keywords', metadata,
     Column('id',      Integer, primary_key=True, autoincrement=True),
     Column('keyword', String(128), unique=True, nullable=False, index=True),
+    Column('source',  String(16),  nullable=False, server_default='default'),
 )
 
 # ── institution_cache ─────────────────────────────────────────────────────────
@@ -130,4 +136,49 @@ institution_cache = Table(
     Column('id',               Integer, primary_key=True, autoincrement=True),
     Column('header_fp',        String(16), unique=True, nullable=False, index=True),
     Column('institution_name', String(256), nullable=False),
+)
+
+# ── auto_deleted_transactions ─────────────────────────────────────────────────
+# Records every transaction that was automatically removed during processing
+# (e.g. flagged as an inter-account transfer or matched a transfer keyword).
+# Rows with whitelisted=True are kept on the next reprocess instead of deleted.
+# `place_normalized` is the canonical lookup key; `place_display` is what the
+# user sees.  `occurrence_count` tracks how many times this pattern was auto-
+# removed across all processing runs.
+auto_deleted_transactions = Table(
+    'auto_deleted_transactions', metadata,
+    Column('id',               Integer, primary_key=True, autoincrement=True),
+    Column('place_normalized', String(256), nullable=False, index=True),
+    Column('place_display',    String(512)),
+    Column('amount',           Float),
+    Column('tx_date',          String(10)),
+    Column('report_month',     String(7), index=True),
+    Column('reason',           String(64)),   # 'transfer_keyword' | 'cross_account' | 'bank_transfer' | 'place_filter'
+    Column('first_seen',       String(20)),   # ISO timestamp
+    Column('last_seen',        String(20)),   # ISO timestamp
+    Column('occurrence_count', Integer, default=1),
+    Column('whitelisted',      Boolean, default=False),
+    Column('seen_months',      String(512), default='[]'),  # JSON list of report_months seen
+    Column('keyword_matched',  String(128)),
+    Column('tx_type',          String(16)),    # original tx_type at time of manual delete
+    Column('category',         String(128)),   # original category at time of manual delete
+    Column('original_statement', String(256)), # original statement name at time of manual delete
+)
+
+# ── merchant_rules ────────────────────────────────────────────────────────────
+# One rule per normalized merchant key.  After each import,
+# db_utils._apply_merchant_rules() overrides the parser's auto-classification
+# for any transaction whose normalized merchant name matches a stored rule.
+# Rules are created by the user from the Transactions tab ("Yes, always" prompt).
+#
+# action: 'income'  → force tx_type = 'income'
+#         'expense' → force tx_type = 'expense', optionally override category
+#         'ignore'  → delete the transaction (silently skip it)
+merchant_rules = Table(
+    'merchant_rules', metadata,
+    Column('id',           Integer, primary_key=True, autoincrement=True),
+    Column('merchant_key', String(256), unique=True, nullable=False, index=True),
+    Column('display_name', String(256)),       # original merchant name shown in UI
+    Column('action',       String(16),  nullable=False),  # 'income'|'expense'|'ignore'
+    Column('category',     String(128)),       # used when action='expense'
 )

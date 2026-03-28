@@ -62,8 +62,9 @@ def get_transfers():
             from sqlalchemy import text as _text
             with get_engine().connect() as conn:
                 db_rows = conn.execute(_text(
-                    "SELECT tx_date, place, amount, report_month, statement, direction, label "
-                    "FROM transfers ORDER BY report_month, tx_date"
+                    "SELECT tx_date, place, amount, report_month, statement, direction, label, "
+                    "SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2) AS tx_month "
+                    "FROM transfers ORDER BY tx_date"
                 )).fetchall()
             for r in db_rows:
                 date  = r[0] or ''
@@ -73,11 +74,13 @@ def get_transfers():
                 except Exception:
                     amount = 0.0
                 override = labels.get((date.strip(), place.strip().upper(), amount))
+                # Use computed tx_date month (r[7]) so filter always matches selectedMonth
+                tx_month = r[7] or r[3] or ''
                 rows.append({
                     'date':      date,
                     'place':     place,
                     'amount':    amount,
-                    'month':     r[3] or '',
+                    'month':     tx_month,
                     'statement': r[4] or '',
                     'direction': r[5] or 'Out',
                     'label':     override if override is not None else r[6],

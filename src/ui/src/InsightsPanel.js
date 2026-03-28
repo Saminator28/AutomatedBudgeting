@@ -642,11 +642,20 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, goals
                   {budgetComparison && (
                     <>
                       <div style={{ padding: '12px', backgroundColor: '#f8f9fa', borderRadius: '8px', flex: 1 }}>
-                        <div style={{ fontSize: '14px', color: '#666' }}>Actual Spending ({currentMonth})</div>
+                        <div style={{ fontSize: '14px', color: '#666' }}>Recurring Spend ({currentMonth})</div>
                         <div style={{ fontSize: '24px', fontWeight: 'bold', color: budgetComparison.on_track ? '#00C49F' : '#FF8042' }}>
                           ${budgetComparison.total_actual?.toFixed(2) || '0.00'}
                         </div>
                       </div>
+                      {budgetComparison.one_time_total > 0 && (
+                        <div style={{ padding: '12px', backgroundColor: '#fefce8', borderRadius: '8px', flex: 1, border: '1px solid #fde68a' }}>
+                          <div style={{ fontSize: '14px', color: '#92400e' }}>⚡ Unusual (One-Time)</div>
+                          <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#d97706' }}>
+                            ${budgetComparison.one_time_total?.toFixed(2)}
+                          </div>
+                          <div style={{ fontSize: '11px', color: '#92400e', marginTop: 2 }}>Not counted in budget</div>
+                        </div>
+                      )}
                       <div style={{ padding: '12px', backgroundColor: '#f8f9fa', borderRadius: '8px', flex: 1 }}>
                         <div style={{ fontSize: '14px', color: '#666' }}>Status</div>
                         <div style={{ fontSize: '24px', fontWeight: 'bold', color: budgetComparison.on_track ? '#00C49F' : '#FF8042' }}>
@@ -764,7 +773,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, goals
                         if (!seen.has(cat)) { seen.add(cat); extras.push({ category: cat, amount: 0, subcategories: [] }); }
                       });
                       const allCategories = [
-                        ...groupedData,
+                        ...groupedData.filter(g => !g.one_time),
                         ...extras.sort((a, b) => a.category.localeCompare(b.category)),
                       ];
                       const totalGoals = allCategories.reduce((s, g) => s + (goals[g.category] || 0), 0);

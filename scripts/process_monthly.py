@@ -35,10 +35,26 @@ from ai_classification.categorizer import TransactionCategorizer
 from merchant_history import MerchantHistory
 
 
+_CROSS_TRANSFER_KEYWORDS = {
+    'transfer', 'xfer', 'payment', 'deposit', 'direct dep', 'ach',
+    'online pmt', 'web pmt', 'autopay', 'auto pay', 'bill pay',
+}
+
+
+def _place_looks_like_transfer(place: str) -> bool:
+    """Return True if the place name suggests an inter-account transfer or payment."""
+    place_lower = place.lower()
+    return any(kw in place_lower for kw in _CROSS_TRANSFER_KEYWORDS)
+
+
 def find_cross_statement_transfers(all_transactions: pd.DataFrame, date_tolerance_days: int = 2) -> pd.DataFrame:
     """
     Find transactions that are likely transfers between accounts by matching amounts.
-    
+
+    A pair is only flagged when at least one of the two place names contains a
+    transfer/payment keyword.  This prevents coincidental same-amount purchases
+    at different merchants from being misidentified as cross-account transfers.
+
     Args:
         all_transactions: DataFrame with all transactions from all statements
         date_tolerance_days: Days +/- to search for matching amounts
@@ -91,20 +107,30 @@ def find_cross_statement_transfers(all_transactions: pd.DataFrame, date_toleranc
                 
                 # Check if dates are within tolerance
                 date_diff = abs((date1 - date2).days)
-                if date_diff <= date_tolerance_days:
-                    # Found a potential transfer!
-                    potential_transfers.append({
-                        'amount': amount,
-                        'date_diff_days': date_diff,
-                        'source1': row1['Source'],
-                        'source2': row2['Source'],
-                        'date1': row1['Transaction Date'],
-                        'date2': row2['Transaction Date'],
-                        'place1': row1['Place'],
-                        'place2': row2['Place'],
-                        'idx1': idx1,
-                        'idx2': idx2
-                    })
+                if date_diff > date_tolerance_days:
+                    continue
+
+                # Require at least one side to look like a real inter-account
+                # transfer or payment.  Two completely different merchants that
+                # happen to share an amount on the same day are NOT a transfer.
+                place1 = str(row1.get('Place', ''))
+                place2 = str(row2.get('Place', ''))
+                if not (_place_looks_like_transfer(place1) or _place_looks_like_transfer(place2)):
+                    continue
+
+                # Found a potential transfer!
+                potential_transfers.append({
+                    'amount': amount,
+                    'date_diff_days': date_diff,
+                    'source1': row1['Source'],
+                    'source2': row2['Source'],
+                    'date1': row1['Transaction Date'],
+                    'date2': row2['Transaction Date'],
+                    'place1': place1,
+                    'place2': place2,
+                    'idx1': idx1,
+                    'idx2': idx2
+                })
     
     return pd.DataFrame(potential_transfers)
 
@@ -308,8 +334,22 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
     try:
         sys.path.insert(0, str(Path(__file__).parent.parent))
         from src.database.session import init_db as _init_db
-        from src.database.db_utils import write_month_to_db as _write_month, write_transfers_to_db as _write_transfers
+        from src.database.db_utils import (
+            write_month_to_db as _write_month,
+            write_transfers_to_db as _write_transfers,
+            log_auto_deleted as _log_auto_deleted,
+            get_whitelisted_places as _get_whitelisted_places,
+        )
         _db_engine = _init_db()
+
+        # Give the parser the current set of whitelisted transfer-keyword places
+        # so filter_transfers() will skip them instead of dropping them.
+        try:
+            parser.whitelisted_transfer_places = _get_whitelisted_places(
+                _db_engine, reason='transfer_keyword'
+            )
+        except Exception:
+            parser.whitelisted_transfer_places = set()
     except ImportError:
         pass  # SQLAlchemy not installed
     except Exception as _dbe:
@@ -910,7 +950,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         if not expenses_df.empty:
             expenses_df = expenses_df.drop(['one_time_purchase', 'user_notes'], axis=1, errors='ignore')
             if _db_engine is not None:
-                _write_month(_db_engine, month_name, expenses_df=expenses_df)
+                _write_month(_db_engine, month_name, expenses_df=expenses_df, source_statement=month_name)
             if debug:
                 expenses_df.to_csv(output_file, index=False)
             print(f"✓ Updated {len(expenses_df)} expense(s)")
@@ -918,7 +958,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         if not income_df.empty:
             income_df = income_df.drop_duplicates(subset=['Transaction Date', 'Place', 'Amount'], keep='first')
             if _db_engine is not None:
-                _write_month(_db_engine, month_name, income_df=income_df)
+                _write_month(_db_engine, month_name, income_df=income_df, source_statement=month_name)
             if debug:
                 income_df.to_csv(income_file, index=False)
             print(f"✓ Updated {len(income_df)} income transaction(s)")
@@ -980,9 +1020,34 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         try:
             # Extract year from month directory for correct date parsing
             statement_year = int(month_dir.name.split('-')[0])
-            
+
+            # Reset per-file keyword-filtered transfer log on the parser
+            parser._keyword_filtered_transfers = []
+
             # Use hybrid parser - returns (income_df, expenses_df, manual_review_df, transfers_df, bank_name, is_bank_account)
             income_df, expenses_df, manual_review_df, transfers_df, bank_name, is_bank_account = parser.parse_pdf(pdf_file, debug=debug, statement_year=statement_year)
+
+            # Log any transfer-keyword-filtered rows to the DB
+            if _db_engine is not None and parser._keyword_filtered_transfers:
+                try:
+                    for _kft in parser._keyword_filtered_transfers:
+                        _kft_place = _kft.get('Place_Original', _kft.get('Place', '')) or ''
+                        _kft_kw = next(
+                            (kw for kw in getattr(parser, 'transfer_keywords', [])
+                             if kw in _kft_place.upper()),
+                            '',
+                        )
+                        _log_auto_deleted(
+                            _db_engine,
+                            place=_kft_place,
+                            amount=float(_kft.get('Amount', 0) or 0),
+                            tx_date=str(_kft.get('Transaction Date', '')),
+                            report_month=month_name,
+                            reason='transfer_keyword',
+                            keyword_matched=_kft_kw.lower(),
+                        )
+                except Exception:
+                    pass
             
             # Combine income and expenses into single df for compatibility with old code
             df_list = []
@@ -1003,6 +1068,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 df = pd.concat(df_list, ignore_index=True)
                 df['_is_bank_account'] = is_bank_account
                 df['Statement'] = bank_name
+                df['_source_pdf'] = pdf_file.name  # actual filename — used for cross-file dedup
                 all_month_transactions.append(df)
                 
                 account_type = "bank account" if is_bank_account else "credit card"
@@ -1185,11 +1251,13 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         combined_df = combined_df.drop('_sort_date', axis=1)
         
         # Filter to only show expenses (debits/money spent)
-        # Remove Beginning Balance, Ending Balance, Interest, transfers in, etc.
+        # Remove Beginning Balance, Ending Balance, transfers in, etc.
+        # Note: "Interest" is intentionally NOT filtered here — interest earned
+        # (bank income) and interest charged (CC expense) are both real transactions.
         if 'Place' in combined_df.columns:
             combined_df = combined_df[
                 ~combined_df['Place'].str.contains(
-                    'Beginning Balance|Ending Balance|Interest|ONE TRANSFER FROM|TRANSFER FROM|Payment Thank|Online Payment',
+                    'Beginning Balance|Ending Balance|ONE TRANSFER FROM|TRANSFER FROM|Payment Thank|Online Payment',
                     case=False, na=False, regex=True
                 )
             ]
@@ -1296,6 +1364,15 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         # Cross-reference amounts to find inter-account transfers
         print(f"\n{'='*70}")
         print("Cross-referencing transactions for inter-account transfers...")
+
+        # Load whitelisted places so we don't remove them even if detected
+        _cross_whitelist: set = set()
+        if _db_engine is not None:
+            try:
+                _cross_whitelist = _get_whitelisted_places(_db_engine, reason='cross_account')
+            except Exception:
+                pass
+
         potential_transfers = find_cross_statement_transfers(combined_df, date_tolerance_days=2)
         
         if not potential_transfers.empty:
@@ -1307,10 +1384,35 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 idx2 = transfer['idx2']
                 # Ensure both indices are valid and not already matched
                 if idx1 not in matched_pairs and idx2 not in matched_pairs:
+                    place1_norm = str(transfer['place1']).lower()
+                    place2_norm = str(transfer['place2']).lower()
+                    # Skip if either side is whitelisted
+                    from src.database.db_utils import _normalize_merchant_key as _nmk
+                    if _nmk(place1_norm) in _cross_whitelist or _nmk(place2_norm) in _cross_whitelist:
+                        print(f"    ↳ Skipped (whitelisted): {transfer['place1']} / {transfer['place2']}")
+                        continue
                     matched_pairs.add(idx1)
                     matched_pairs.add(idx2)
                     print(f"    - ${transfer['amount']:.2f}: {transfer['source1']} ({transfer['date1']}) ↔ {transfer['source2']} ({transfer['date2']}) [{transfer['date_diff_days']} day(s) apart]")
                     print(f"      • {transfer['place1']} ↔ {transfer['place2']}")
+                    # Log both sides to auto_deleted_transactions
+                    if _db_engine is not None:
+                        try:
+                            for side_place, side_date in (
+                                (transfer['place1'], transfer['date1']),
+                                (transfer['place2'], transfer['date2']),
+                            ):
+                                _log_auto_deleted(
+                                    _db_engine,
+                                    place=str(side_place),
+                                    amount=float(transfer['amount']),
+                                    tx_date=str(side_date),
+                                    report_month=month_name,
+                                    reason='cross_account',
+                                    keyword_matched='',
+                                )
+                        except Exception:
+                            pass
             # Remove only matched transfer pairs
             if matched_pairs:
                 original_count = len(combined_df)
@@ -1320,9 +1422,44 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         else:
             print(f"  ✓ No cross-account transfers detected")
         print(f"{'='*70}")
-        
+
+        # Deduplicate transactions that appear identically (same date + place + amount)
+        # across two different statements.  This handles the case where a CC payment
+        # shows up in both the bank-account statement AND the CC statement with the
+        # same cleaned merchant name.  We keep only the CREDIT-CARD side (the actual
+        # charge) by preferring the non-bank-account row when there is a mix, or
+        # simply the first occurrence otherwise.
+        #
+        # IMPORTANT: only deduplicate when the identical (date, place, amount) tuple
+        # spans more than one distinct Statement.  Same-statement duplicates are
+        # genuine separate transactions (e.g. two $200 ATM withdrawals on the same
+        # day from one bank statement) and must both be preserved.
+        _dedup_cols = ['Transaction Date', 'Place', 'Amount']
+        if all(c in combined_df.columns for c in _dedup_cols):
+            _before = len(combined_df)
+            # Sort so that credit-card rows (is_bank_account=False) come first —
+            # keep='first' will then prefer the CC side.
+            if '_is_bank_account' in combined_df.columns:
+                combined_df = combined_df.sort_values(
+                    '_is_bank_account', ascending=True, kind='stable'
+                )
+            # Use the actual PDF filename (_source_pdf) to detect cross-file duplicates.
+            # Two transactions with identical (date, place, amount) that came from
+            # DIFFERENT PDF files are cross-statement duplicates and should be merged.
+            # Two identical transactions from the SAME PDF are genuine separate charges
+            # (e.g. two $200 ATM withdrawals on the same day) and must be preserved.
+            _pdf_col = '_source_pdf' if '_source_pdf' in combined_df.columns else 'Statement'
+            _pdf_nunique = combined_df.groupby(_dedup_cols, sort=False)[_pdf_col].transform('nunique')
+            _cross_file  = _pdf_nunique > 1
+            _to_drop     = _cross_file & combined_df.duplicated(subset=_dedup_cols, keep='first')
+            combined_df  = combined_df[~_to_drop].reset_index(drop=True)
+            _removed = _before - len(combined_df)
+            if _removed:
+                print(f"  ✓ Removed {_removed} cross-statement exact duplicate(s) (same date/place/amount)")
+
         # Remove temporary columns
         combined_df = combined_df.drop('Source', axis=1, errors='ignore')
+        combined_df = combined_df.drop('_source_pdf', axis=1, errors='ignore')
         combined_df = combined_df.drop('_parsed_date', axis=1, errors='ignore')
         
         # Final column order: Date, Place, Amount, Statement
@@ -1463,7 +1600,17 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         # Separate manually categorized transactions to preserve their categories
         manual_expenses = combined_df[combined_df.get('_manual_category', False) == True].copy() if '_manual_category' in combined_df.columns else pd.DataFrame()
         auto_expenses = combined_df[combined_df.get('_manual_category', False) != True] if '_manual_category' in combined_df.columns else combined_df
-        
+
+        # Separate parser-tagged Return/Reimbursement rows — categorize_dataframe would
+        # overwrite the pre-set category with the merchant category (e.g. Transportation).
+        reimb_mask = auto_expenses.get('category', pd.Series(dtype=str)).astype(str).str.strip() == 'Return/Reimbursement'
+        reimb_expenses = auto_expenses[reimb_mask].copy()
+        auto_expenses  = auto_expenses[~reimb_mask]
+        # A CR refund should be a negative expense so it offsets the original charge.
+        if not reimb_expenses.empty and 'Amount' in reimb_expenses.columns:
+            reimb_expenses['Amount'] = reimb_expenses['Amount'].apply(lambda a: -abs(float(a)) if pd.notna(a) else a)
+            reimb_expenses['Label'] = 'reimbursement'
+
         # Filter out transactions with empty Place values before categorization
         empty_place_mask = auto_expenses['Place'].isna() | (auto_expenses['Place'] == '')
         empty_place_expenses = auto_expenses[empty_place_mask].copy()
@@ -1481,8 +1628,8 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 amount_column='Amount'
             )
         
-        # Merge back manually categorized and empty place transactions
-        dfs_to_concat = [df for df in [auto_expenses, manual_expenses, empty_place_expenses] if not df.empty]
+        # Merge back manually categorized, reimbursement, and empty place transactions
+        dfs_to_concat = [df for df in [auto_expenses, manual_expenses, reimb_expenses, empty_place_expenses] if not df.empty]
         if dfs_to_concat:
             combined_df = pd.concat(dfs_to_concat, ignore_index=True)
             # Drop the flag column
@@ -1577,7 +1724,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             grand_total = round(expenses_to_save['Amount'].sum(), 2)
             expenses_to_save = expenses_to_save.drop(['one_time_purchase', 'user_notes'], axis=1, errors='ignore')
             if _db_engine is not None:
-                _write_month(_db_engine, month_name, expenses_df=expenses_to_save)
+                _write_month(_db_engine, month_name, expenses_df=expenses_to_save, source_statement=month_name)
             if debug:
                 expenses_to_save.to_csv(output_file, index=False)
                 print(f"✓ Saved {len(expenses_to_save)} expense(s) to {output_file}")
@@ -1607,7 +1754,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             income_df = income_df.drop_duplicates(subset=['Transaction Date', 'Place', 'Amount'], keep='first')
             
             if _db_engine is not None:
-                _write_month(_db_engine, month_name, income_df=income_df)
+                _write_month(_db_engine, month_name, income_df=income_df, source_statement=month_name)
             if debug:
                 income_df.to_csv(income_file, index=False)
                 print(f"✓ Saved {len(income_df)} income transaction(s) to {income_file}")
@@ -1762,23 +1909,21 @@ def main():
         print("⚠ Ollama LLM not available - using pattern matching only")
         print("  (Install Ollama and run 'ollama pull dolphin-mistral' for better categorization)")
     
-    # Initialize DB and seed keywords before constructing StatementParser so
-    # keyword tables exist when the parser queries them on __init__.
+    # Initialize DB and seed keyword tables BEFORE constructing StatementParser,
+    # because StatementParser.__init__() reads keyword lists from the DB.
     try:
-        _script_root = Path(__file__).parent.parent
-        sys.path.insert(0, str(_script_root))
         from src.database.session import init_db as _init_db
         from src.database.db_utils import (
-            seed_income_keywords, seed_ignore_keywords,
-            seed_payment_app_keywords, seed_transfer_keywords,
+            seed_income_keywords, seed_transfer_keywords,
+            seed_payment_app_keywords, seed_ignore_keywords,
         )
-        _eng = _init_db()
-        seed_income_keywords(_eng)
-        seed_ignore_keywords(_eng)
-        seed_payment_app_keywords(_eng)
-        seed_transfer_keywords(_eng)
-    except Exception as _dbe:
-        print(f"⚠  DB pre-init failed (non-fatal): {_dbe}")
+        _db_eng_pre = _init_db()
+        for _seed_fn in (seed_income_keywords, seed_transfer_keywords,
+                         seed_payment_app_keywords, seed_ignore_keywords):
+            _seed_fn(_db_eng_pre)
+        print("✓ DB initialized and keyword tables seeded")
+    except Exception as _db_pre_exc:
+        print(f"⚠ DB pre-init failed ({_db_pre_exc}) — parser keywords may be empty")
 
     # Initialize parser once
     print("Initializing statement parser...")

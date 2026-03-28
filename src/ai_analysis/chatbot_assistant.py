@@ -259,7 +259,8 @@ class ChatbotAssistant:
             with eng.connect() as conn:
                 rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, category "
-                    "FROM transactions WHERE tx_type='expense' AND report_month=:m "
+                    "FROM transactions WHERE tx_type='expense' "
+                    "AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)=:m "
                     "ORDER BY tx_date"
                 ), {'m': month}).fetchall()
             if not rows:

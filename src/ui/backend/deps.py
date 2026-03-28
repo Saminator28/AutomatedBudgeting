@@ -155,7 +155,7 @@ def _safe_statement_path(month: str, filename: str) -> Path:
 
 # ── Data access ───────────────────────────────────────────────────────────────
 
-def _query_df(tx_type: str, months: list = None, recent_n: int = None) -> pd.DataFrame:
+def _query_df(tx_type: str, months: list = None, recent_n: int = None, date_months: list = None, exclude_one_time: bool = False) -> pd.DataFrame:
     """Load transactions from the DB as a CSV-compatible DataFrame.
 
     Column mapping: tx_date→'Transaction Date', place→'Place', amount→'Amount',
@@ -188,6 +188,14 @@ def _query_df(tx_type: str, months: list = None, recent_n: int = None) -> pd.Dat
         q += f' AND report_month IN ({phs})'
         for i, m in enumerate(_months):
             params[f'm{i}'] = m
+    if date_months:
+        # Filter by the calendar month of the actual transaction date (MM/DD/YYYY stored format)
+        phs = ','.join(f':dm{i}' for i in range(len(date_months)))
+        q += f" AND (SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)) IN ({phs})"
+        for i, m in enumerate(date_months):
+            params[f'dm{i}'] = m
+    if exclude_one_time:
+        q += " AND (label IS NULL OR label != 'one-time')"
     q += ' ORDER BY report_month, tx_date'
     with _eng.connect() as conn:
         rows = conn.execute(_text(q), params).fetchall()
@@ -271,7 +279,8 @@ def _rebuild_transfers_for_month(month: str) -> None:
             with _eng.connect() as conn:
                 exp_rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, statement, category FROM transactions "
-                    "WHERE tx_type='expense' AND report_month=:m"
+                    "WHERE tx_type='expense' "
+                    "AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)=:m"
                 ), {'m': month}).fetchall()
                 inv_expenses = [r for r in exp_rows if str(r[4] or '').strip() in _INVESTMENT_CATEGORIES]
                 non_inv = [r for r in exp_rows if str(r[4] or '').strip() not in _INVESTMENT_CATEGORIES]
@@ -288,13 +297,15 @@ def _rebuild_transfers_for_month(month: str) -> None:
                     } for r in inv_expenses]))
 
                 inc_rows = conn.execute(_text(
-                    "SELECT tx_date, place, amount, statement, category FROM transactions "
-                    "WHERE tx_type='income' AND report_month=:m"
+                    "SELECT tx_date, place, amount, statement, category, label FROM transactions "
+                    "WHERE tx_type='income' "
+                    "AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)=:m"
                 ), {'m': month}).fetchall()
                 for r in inc_rows:
-                    is_tagged   = str(r[4] or '').strip() == 'Investment Return'
-                    is_platform = any(kw in str(r[1] or '').lower() for kw in _INVESTMENT_PLATFORM_KEYWORDS)
-                    if is_tagged or is_platform:
+                    is_tagged            = str(r[4] or '').strip() == 'Investment Return'
+                    is_platform          = any(kw in str(r[1] or '').lower() for kw in _INVESTMENT_PLATFORM_KEYWORDS)
+                    is_investment_label  = str(r[5] or '').strip() == 'investment_transfer'
+                    if is_tagged or is_platform or is_investment_label:
                         raw_rows.append(pd.DataFrame([{
                             'Transaction Date': r[0], 'Place': r[1],
                             'Amount': float(r[2] or 0), 'Direction': 'In',
