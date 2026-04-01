@@ -22,8 +22,6 @@ class TransactionCategorizer:
     """Categorize transactions using pattern matching and AI."""
     
     def __init__(self, config_path: str = None, use_llm: bool = True, llm_host: str = None, merchant_history=None):
-        if llm_host is None:
-            llm_host = _OLLAMA_HOST
         """
         Initialize the categorizer.
         
@@ -33,6 +31,7 @@ class TransactionCategorizer:
             llm_host: Ollama server URL
             merchant_history: MerchantHistory instance for learning from past corrections (recommended)
         """
+        llm_host = llm_host or _OLLAMA_HOST
         # Load valid categories and subcategories from categories.json
         categories_config_path = Path(__file__).parent.parent.parent / 'config' / 'categories.json'
         self.subcategories = {}   # parent → [subcategories]

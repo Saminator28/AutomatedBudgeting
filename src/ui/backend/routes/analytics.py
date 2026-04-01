@@ -7,8 +7,6 @@ import os
 from pathlib import Path
 
 import requests
-
-_OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 from fastapi import APIRouter, Body
 from fastapi.responses import JSONResponse
 
@@ -16,6 +14,8 @@ from src.ui.backend.deps import (
     _PROJECT_ROOT,
     _query_df,
 )
+
+_OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
 router = APIRouter()
 
