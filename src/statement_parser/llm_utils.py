@@ -17,7 +17,8 @@ import time
 import requests
 from typing import Optional
 
-OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://localhost:11434')
+OLLAMA_BASE_URL = (os.environ.get('OLLAMA_BASE_URL')
+                   or os.environ.get('OLLAMA_HOST', 'http://localhost:11434'))
 
 # Track which models we've already pulled this session so we only attempt once
 _pulled_models: set = set()

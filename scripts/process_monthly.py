@@ -18,6 +18,7 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
+import os
 import argparse
 from pathlib import Path
 import requests
@@ -278,8 +279,9 @@ Respond with ONLY the exact category name from the list above. No explanation, n
 
 Best match:"""
 
+        _ollama_url = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
         resp = requests.post(
-            'http://localhost:11434/api/chat',
+            f'{_ollama_url}/api/chat',
             json={
                 'model': llm_model,
                 'messages': [{'role': 'user', 'content': prompt}],
@@ -383,22 +385,19 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             prev_manual_review = pd.read_csv(manual_review_file, sep=None, engine='python')
             print(f"[DEBUG] Read manual_review.csv with {len(prev_manual_review)} rows")
             if 'Classification' in prev_manual_review.columns:
-                # Show all Classification values
-                print(f"[DEBUG] Classification values found:")
-                for idx, row in prev_manual_review.iterrows():
-                    cls = row.get('Classification', 'NO_VALUE')
-                    print(f"  - {row.get('Place', 'NO_PLACE')}: '{cls}' (type: {type(cls).__name__})")
+                # Normalise to str so .str accessor never fails on an all-NaN float column
+                prev_manual_review['Classification'] = (
+                    prev_manual_review['Classification'].fillna('').astype(str)
+                )
                 
                 # Separate classified from unclassified (Classification must be filled in by user)
                 classified = prev_manual_review[
-                    prev_manual_review['Classification'].notna() & 
-                    (prev_manual_review['Classification'].str.strip() != '')
+                    prev_manual_review['Classification'].str.strip() != ''
                 ]
                 
                 # Keep unclassified transactions in manual_review
                 unclassified = prev_manual_review[
-                    prev_manual_review['Classification'].isna() | 
-                    (prev_manual_review['Classification'].str.strip() == '')
+                    prev_manual_review['Classification'].str.strip() == ''
                 ]
                 if not unclassified.empty:
                     transactions_to_keep_in_manual_review.extend(unclassified.to_dict('records'))
@@ -834,6 +833,11 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         if manual_review_file.exists():
             try:
                 manual_review_df = pd.read_csv(manual_review_file, sep=None, engine='python')
+                # Normalise string columns so .str accessor never fails on all-NaN float columns
+                if 'Classification' in manual_review_df.columns:
+                    manual_review_df['Classification'] = (
+                        manual_review_df['Classification'].fillna('').astype(str)
+                    )
                 
                 # Check if Classification column exists
                 if 'Classification' not in manual_review_df.columns:
@@ -846,8 +850,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                     # 3. Reimbursements without category
                     
                     unclassified = manual_review_df[
-                        (manual_review_df['Classification'].isna()) | 
-                        (manual_review_df['Classification'].str.strip() == '')
+                        manual_review_df['Classification'].str.strip() == ''
                     ]
                     
                     # Find expenses/reimbursements missing categories (check if category column exists)
@@ -1846,8 +1849,10 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         return False
 
 
-def check_llm_availability(host="http://localhost:11434"):
+def check_llm_availability(host=None):
     """Check if Ollama LLM is available."""
+    if host is None:
+        host = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
     try:
         response = requests.get(f"{host}/api/tags", timeout=2)
         return response.status_code == 200

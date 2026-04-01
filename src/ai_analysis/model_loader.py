@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Optional, Tuple
 import logging
 
+import os
 import requests
 
-OLLAMA_HOST = 'http://localhost:11434'
+OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,9 @@ logger = logging.getLogger(__name__)
 class FinGPTModelLoader:
     """Load and manage financial analysis models via Ollama."""
     
-    def __init__(self, llm_host: str = "http://localhost:11434"):
+    def __init__(self, llm_host: str = None):
+        if llm_host is None:
+            llm_host = OLLAMA_HOST
         """
         Initialize model loader.
         

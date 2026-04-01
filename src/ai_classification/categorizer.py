@@ -7,10 +7,13 @@ Category list loaded from config/categories.json for easy customization.
 
 import pandas as pd
 from typing import List, Dict, Optional
+import os
 import re
 import json
 from pathlib import Path
 import requests
+
+_OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
 # Ollama is accessed directly via REST API (no SDK dependency)
 
@@ -18,7 +21,9 @@ import requests
 class TransactionCategorizer:
     """Categorize transactions using pattern matching and AI."""
     
-    def __init__(self, config_path: str = None, use_llm: bool = True, llm_host: str = "http://localhost:11434", merchant_history=None):
+    def __init__(self, config_path: str = None, use_llm: bool = True, llm_host: str = None, merchant_history=None):
+        if llm_host is None:
+            llm_host = _OLLAMA_HOST
         """
         Initialize the categorizer.
         

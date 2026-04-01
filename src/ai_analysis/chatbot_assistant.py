@@ -19,6 +19,7 @@ Architecture: Two-Model Pipeline
      suggestions, savings plans, and goal adjustments.
 """
 
+import os
 import pandas as pd
 import json
 import logging
@@ -28,6 +29,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+
+_OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
 logger = logging.getLogger(__name__)
 
@@ -566,7 +569,7 @@ Rules:
 
         try:
             _resp = requests.post(
-                'http://localhost:11434/api/chat',
+                f'{_OLLAMA_HOST}/api/chat',
                 json={
                     'model': self.intent_model,
                     'messages': [{"role": "user", "content": prompt}],
@@ -1025,7 +1028,7 @@ For all other requests, answer in plain conversational text."""
 
         try:
             _resp = requests.post(
-                'http://localhost:11434/api/chat',
+                f'{_OLLAMA_HOST}/api/chat',
                 json={
                     'model': self.finance_model,
                     'messages': messages,

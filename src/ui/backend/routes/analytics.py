@@ -3,9 +3,12 @@
 import json
 import logging
 import math
+import os
 from pathlib import Path
 
 import requests
+
+_OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 from fastapi import APIRouter, Body
 from fastapi.responses import JSONResponse
 
@@ -299,7 +302,7 @@ async def check_chat_availability():
             return {"available": False, "model_name": None}
 
         try:
-            resp = requests.get('http://localhost:11434/api/tags', timeout=3)
+            resp = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
             model_names = [m['name'] for m in resp.json().get('models', [])]
             is_available = any(
                 model_name in name or name.startswith(model_name + ':')
@@ -339,7 +342,7 @@ async def chat_with_assistant(request: dict = Body(...)):
 
         if model_name:
             try:
-                resp = requests.get('http://localhost:11434/api/tags', timeout=3)
+                resp = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
                 model_names = [m['name'] for m in resp.json().get('models', [])]
                 is_available = any(
                     model_name in name or name.startswith(model_name + ':')
