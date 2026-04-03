@@ -61,7 +61,7 @@ def _learn_keyword_from_label(place: str, label: str) -> None:
             # investment platforms as income keywords — they are not payroll/salary.
             if any(existing.lower() in kw for existing in _PAYMENT_APP_KEYWORDS):
                 return
-            if any(existing in kw for existing in _INVESTMENT_PLATFORM_KEYWORDS):
+            if any(existing.lower() in kw for existing in _INVESTMENT_PLATFORM_KEYWORDS):
                 return
             with engine.connect() as conn:
                 conn.execute(_text(
