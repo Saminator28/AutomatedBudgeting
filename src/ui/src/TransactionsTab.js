@@ -201,18 +201,33 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
 
 
   // ── Derived: filtered + sorted transactions (expenses + income + unclassified) ────
+
+  // Helper: derive YYYY-MM calendar month from a transaction date string (M/D/YYYY or MM/DD/YYYY).
+  const calendarMonth = dateStr => {
+    if (!dateStr) return '';
+    try {
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return '';
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    } catch (_) { return ''; }
+  };
+
   const allRows = [
     ...expenses.map(e => ({ ...e, _type: e.tx_type || 'expense' })),
     ...income.map(i => ({ ...i, _type: 'income' })),
+    // Manual-review rows store the statement folder name in 'month', not the calendar month.
+    // Compute the calendar month from the transaction 'date' field so the filter matches
+    // the same YYYY-MM value used by expenses and income.
     ...reviewData
-      .filter(r => !filterMonth || r.month === filterMonth)
-      .map(r => ({ ...r, _type: 'review' })),
+      .filter(r => !filterMonth || calendarMonth(r.date) === filterMonth)
+      .map(r => ({ ...r, _type: 'review', month: calendarMonth(r.date) || r.month })),
   ];
 
-  // 'month' on each row is already the tx_date calendar month (set by the backend),
-  // so filtering by e.month === filterMonth correctly bins transactions by when they occurred.
+  // 'month' on each row is the tx_date calendar month (set by the backend for expenses/income,
+  // or derived above for review rows), so filtering by e.month === filterMonth correctly bins
+  // transactions by when they occurred.
   const filtered = allRows.filter(e => {
-    if (filterMonth && e.month !== filterMonth) return false; // statement month check
+    if (filterMonth && e.month !== filterMonth) return false;
     if (filterType === 'unclassified') { if (e._type !== 'review') return false; }
     else if (filterType === 'reimbursement') { if (!(e._type === 'expense' && e.amount < 0)) return false; }
     else if (filterType === 'expense') { if (!(e._type === 'expense' && e.amount >= 0)) return false; }
@@ -230,8 +245,8 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
     if (sortCol === 'amount') { av = a.amount; bv = b.amount; }
     const cmp = av < bv ? -1 : av > bv ? 1 : 0;
     if (cmp !== 0) return sortDir === 'asc' ? cmp : -cmp;
-    // Stable tiebreaker: tx_hash never changes when a row's type changes,
-    // so rows with identical sort-column values keep their visual position.
+    // Deterministic tiebreaker: use tx_hash to keep a consistent secondary order
+    // among rows with identical sort-column values (does not stay fixed across type changes).
     return (a.tx_hash || '').localeCompare(b.tx_hash || '');
   });
 

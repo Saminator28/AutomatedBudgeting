@@ -189,9 +189,17 @@ def _query_df(tx_type: str, months: list = None, recent_n: int = None, date_mont
         for i, m in enumerate(_months):
             params[f'm{i}'] = m
     if date_months:
-        # Filter by the calendar month of the actual transaction date (MM/DD/YYYY stored format)
+        # Filter by the calendar month of the actual transaction date.
+        # tx_date may be stored as zero-padded MM/DD/YYYY or non-padded M/D/YYYY,
+        # so derive YYYY-MM robustly: year = last 4 chars; month = chars before
+        # the first '/' cast to int then zero-padded via printf.
         phs = ','.join(f':dm{i}' for i in range(len(date_months)))
-        q += f" AND (SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)) IN ({phs})"
+        q += (
+            " AND ("
+            "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
+            "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER))"
+            f") IN ({phs})"
+        )
         for i, m in enumerate(date_months):
             params[f'dm{i}'] = m
     if exclude_one_time:

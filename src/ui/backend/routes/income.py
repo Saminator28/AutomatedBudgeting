@@ -55,11 +55,11 @@ def _learn_keyword_from_label(place: str, label: str) -> None:
             logging.info(f'Learned investment keyword from user action: "{kw}"')
         elif label == 'recurring':
             from src.ui.backend.deps import _INCOME_KEYWORDS
-            if any(existing in kw for existing in _INCOME_KEYWORDS):
+            if any(existing.lower() in kw for existing in _INCOME_KEYWORDS):
                 return
             # Never learn payment-app merchants (Cash App, Venmo, Zelle, etc.) or
             # investment platforms as income keywords — they are not payroll/salary.
-            if any(existing in kw for existing in _PAYMENT_APP_KEYWORDS):
+            if any(existing.lower() in kw for existing in _PAYMENT_APP_KEYWORDS):
                 return
             if any(existing in kw for existing in _INVESTMENT_PLATFORM_KEYWORDS):
                 return

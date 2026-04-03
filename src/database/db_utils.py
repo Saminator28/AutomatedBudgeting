@@ -513,6 +513,9 @@ def _apply_income_keywords(engine, month: str) -> int:
     so 'payroll' matches 'John Deere World Payroll', 'direct dep' matches
     'Direct Deposit - ACME Corp', etc.
 
+    Invalid regex patterns are skipped with a warning rather than aborting the
+    entire pass — one bad user-entered keyword cannot block all promotions.
+
     Investment platform transactions are EXCLUDED: if the normalized place also
     matches any investment_keyword, the row stays an expense (investment deposits
     are handled separately by _auto_label_investment_income).
@@ -521,14 +524,34 @@ def _apply_income_keywords(engine, month: str) -> int:
     """
     try:
         with engine.connect() as conn:
-            inc_kws = [r[0] for r in conn.execute(text(
+            inc_kws_raw = [r[0] for r in conn.execute(text(
                 'SELECT keyword FROM income_keywords'
             )).fetchall()]
-            inv_kws = [r[0] for r in conn.execute(text(
+            inv_kws_raw = [r[0] for r in conn.execute(text(
                 'SELECT keyword FROM investment_keywords'
             )).fetchall()]
-        if not inc_kws:
+        if not inc_kws_raw:
             return 0
+
+        # Pre-compile patterns; skip any that are invalid regex.
+        def _compile_safe(kws: list, label: str) -> list:
+            compiled = []
+            for kw in kws:
+                try:
+                    compiled.append(re.compile(kw, re.IGNORECASE))
+                except re.error as _re_exc:
+                    logger.warning(
+                        f'_apply_income_keywords: skipping invalid {label} pattern '
+                        f'"{kw}": {_re_exc}'
+                    )
+            return compiled
+
+        inc_patterns = _compile_safe(inc_kws_raw, 'income')
+        inv_patterns = _compile_safe(inv_kws_raw, 'investment')
+
+        if not inc_patterns:
+            return 0
+
         with engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT tx_hash, place FROM transactions "
@@ -538,9 +561,9 @@ def _apply_income_keywords(engine, month: str) -> int:
             for tx_hash, place in rows:
                 mk = _normalize_merchant_key(place)
                 # Investment platform keywords take priority — never promote to income
-                if inv_kws and any(re.search(kw, mk, re.IGNORECASE) for kw in inv_kws):
+                if inv_patterns and any(p.search(mk) for p in inv_patterns):
                     continue
-                if any(re.search(kw, mk, re.IGNORECASE) for kw in inc_kws):
+                if any(p.search(mk) for p in inc_patterns):
                     conn.execute(text(
                         "UPDATE transactions SET tx_type='income', label='recurring' "
                         "WHERE tx_hash=:h"

@@ -1,7 +1,7 @@
 """routes/settings.py — Auto-filter tracker endpoints for the Settings tab."""
 
 import logging
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 from fastapi.responses import JSONResponse
 
 from src.ui.backend.deps import _DB_AVAILABLE, get_engine
@@ -25,7 +25,7 @@ def list_auto_filters():
 
 
 @router.patch("/api/auto-filters/{record_id}/whitelist")
-def set_whitelist(record_id: int, body: dict = None):
+def set_whitelist(record_id: int, body: dict = Body(None)):
     """Toggle the whitelisted flag for a given record.
     Body should contain ``{"whitelisted": true|false}``.
     Defaults to True if body is omitted.

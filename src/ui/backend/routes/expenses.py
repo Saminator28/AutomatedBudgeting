@@ -104,7 +104,10 @@ def get_available_months():
             from sqlalchemy import text as _text
             with get_engine().connect() as conn:
                 rows = conn.execute(_text(
-                    "SELECT DISTINCT SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2) AS tx_month "
+                    "SELECT DISTINCT "
+                    "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER)) "
+                    "AS tx_month "
                     "FROM transactions WHERE tx_type='expense' "
                     "AND tx_date IS NOT NULL AND tx_date != '' "
                     "ORDER BY tx_month DESC"
@@ -130,12 +133,19 @@ def get_all_expenses(month: str = None, category: str = None, search: str = None
             query = (
                 "SELECT tx_hash, tx_date, place, amount, category, label, statement, "
                 "report_month, rowid AS row_idx, tx_type, "
-                "SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2) AS tx_month "
+                "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
+                "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER)) "
+                "AS tx_month "
                 "FROM transactions WHERE tx_type IN ('expense', 'transfer')"
             )
             params: dict = {}
             if month:
-                query += " AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2) = :month"
+                query += (
+                    " AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER))"
+                    ") = :month"
+                )
                 params['month'] = month
             if category:
                 query += " AND lower(category) = lower(:category)"
@@ -206,14 +216,21 @@ def delete_transaction(tx_hash: str):
             )
         except Exception as _log_exc:
             logging.warning(f"auto-filter log failed: {_log_exc}")
-        # If the deleted row was investment-related, rebuild transfers for that month
+        # If the deleted row was investment-related, rebuild transfers for that month.
+        # Use the calendar month derived from tx_date (YYYY-MM) rather than report_month
+        # to match what _rebuild_transfers_for_month uses internally.
         is_investment = (
             str(category or '').strip() in _INVESTMENT_CATEGORIES
             or tx_type == 'income' and any(kw in str(place or '').lower() for kw in ['fidelity', 'vanguard', 'schwab', 'etrade', 'robinhood', 'coinbase'])
         )
-        if is_investment and report_month:
+        if is_investment and tx_date:
             try:
-                _rebuild_transfers_for_month(report_month)
+                calendar_month = pd.to_datetime(str(tx_date)).strftime('%Y-%m')
+            except Exception as _parse_exc:
+                logging.warning(f"Failed to derive calendar month from tx_date '{tx_date}': {_parse_exc}")
+                calendar_month = report_month  # fall back to report_month
+            try:
+                _rebuild_transfers_for_month(calendar_month)
             except Exception as exc:
                 logging.warning(f"Transfer rebuild after delete failed: {exc}")
         return {'success': True}
