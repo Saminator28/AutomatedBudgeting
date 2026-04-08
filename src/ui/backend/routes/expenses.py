@@ -105,9 +105,10 @@ def get_available_months():
             with get_engine().connect() as conn:
                 rows = conn.execute(_text(
                     "SELECT DISTINCT "
+                    "CASE WHEN INSTR(tx_date, '/') > 0 THEN "
                     "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER)) "
-                    "AS tx_month "
+                    "ELSE '' END AS tx_month "
                     "FROM transactions WHERE tx_type='expense' "
                     "AND tx_date IS NOT NULL AND tx_date != '' "
                     "ORDER BY tx_month DESC"
@@ -133,14 +134,16 @@ def get_all_expenses(month: str = None, category: str = None, search: str = None
             query = (
                 "SELECT tx_hash, tx_date, place, amount, category, label, statement, "
                 "report_month, rowid AS row_idx, tx_type, "
+                "CASE WHEN INSTR(tx_date, '/') > 0 THEN "
                 "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
                 "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER)) "
-                "AS tx_month "
+                "ELSE '' END AS tx_month "
                 "FROM transactions WHERE tx_type IN ('expense', 'transfer')"
             )
             params: dict = {}
             if month:
                 query += (
+                    " AND INSTR(tx_date, '/') > 0"
                     " AND ("
                     "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER))"
@@ -268,6 +271,7 @@ def edit_expense(payload: dict = Body(...)):
                 old_row = conn.execute(_text(
                     "SELECT category FROM transactions "
                     "WHERE tx_type='expense' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND ("
                     "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
@@ -293,6 +297,7 @@ def edit_expense(payload: dict = Body(...)):
                 sql = (
                     f"UPDATE transactions SET {', '.join(set_clauses)} "
                     "WHERE tx_type='expense' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND ("
                     "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"

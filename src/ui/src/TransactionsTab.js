@@ -208,9 +208,9 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
     if (!dateStr || typeof dateStr !== 'string') return '';
     const parts = dateStr.split('/');
     if (parts.length < 3) return '';
-    const monthNum = Number(parts[0].trim());
+    const monthNum = parseInt(parts[0].trim(), 10);
     const year = parts[2].trim().slice(-4);
-    if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12) return '';
+    if (isNaN(monthNum) || monthNum < 1 || monthNum > 12) return '';
     if (!/^\d{4}$/.test(year)) return '';
     return `${year}-${String(monthNum).padStart(2, '0')}`;
   };

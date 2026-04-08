@@ -65,7 +65,7 @@ def export_transactions(month: str = ''):
             "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
         )
         month_filter = (
-            f" AND {tx_month_expr} = :month"
+            f" AND INSTR(tx_date, '/') > 0 AND {tx_month_expr} = :month"
             if month else ""
         )
         if month:

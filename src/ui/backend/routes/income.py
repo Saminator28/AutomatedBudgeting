@@ -153,14 +153,16 @@ def get_income_entries(month: str = ''):
             from sqlalchemy import text as _text
             query = (
                 "SELECT tx_hash, tx_date, place, amount, report_month, statement, label, category, "
+                "CASE WHEN INSTR(tx_date, '/') > 0 THEN "
                 "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
                 "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER)) "
-                "AS tx_month "
+                "ELSE '' END AS tx_month "
                 "FROM transactions WHERE tx_type='income'"
             )
             params: dict = {}
             if month:
                 query += (
+                    " AND INSTR(tx_date, '/') > 0"
                     " AND ("
                     "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
@@ -233,6 +235,7 @@ def categorize_income(payload: dict = Body(...)):
                 result = conn.execute(_text(
                     "UPDATE transactions SET category=:cat, user_corrected=1 "
                     "WHERE tx_type='income' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND (SUBSTR(tx_date, LENGTH(tx_date)-3, 4)||'-'||"
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER)))=:month "
                     "AND tx_date=:date AND UPPER(place)=UPPER(:place) "
@@ -284,6 +287,7 @@ def set_income_label(payload: dict = Body(...)):
                 result = conn.execute(_text(
                     "UPDATE transactions SET label=:label, user_corrected=1 "
                     "WHERE tx_type='income' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND (SUBSTR(tx_date, LENGTH(tx_date)-3, 4)||'-'||"
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER)))=:month "
                     "AND tx_date=:date AND UPPER(place)=UPPER(:place) "
@@ -363,6 +367,7 @@ def reclassify_income_as_reimbursement(payload: dict = Body(...)):
                 result = conn.execute(_text(
                     "UPDATE transactions SET tx_type='expense', amount=-ABS(amount), label='reimbursement' "
                     "WHERE tx_type='income' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND (SUBSTR(tx_date, LENGTH(tx_date)-3, 4)||'-'||"
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER)))=:month "
                     "AND tx_date=:date AND UPPER(place)=UPPER(:place) "
@@ -395,6 +400,7 @@ def reclassify_income_as_reimbursement(payload: dict = Body(...)):
                     conn3.execute(_text(
                         "UPDATE transactions SET category=:cat "
                         "WHERE tx_type='expense' AND label='reimbursement' "
+                        "AND INSTR(tx_date, '/') > 0 "
                         "AND (SUBSTR(tx_date, LENGTH(tx_date)-3, 4)||'-'||"
                         "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER)))=:month "
                         "AND tx_date=:date AND UPPER(place)=UPPER(:place) "
@@ -479,6 +485,7 @@ def reclassify_expense_as_income(payload: dict = Body(...)):
                 result = conn.execute(_text(
                     "UPDATE transactions SET tx_type='income', amount=ABS(amount), label=:label, user_corrected=1 "
                     "WHERE tx_type='expense' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND (SUBSTR(tx_date, LENGTH(tx_date)-3, 4)||'-'||"
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER)))=:month "
                     "AND tx_date=:date AND UPPER(place)=UPPER(:place) "

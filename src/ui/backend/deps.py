@@ -195,6 +195,7 @@ def _query_df(tx_type: str, months: list = None, recent_n: int = None, date_mont
         # the first '/' cast to int then zero-padded via printf.
         phs = ','.join(f':dm{i}' for i in range(len(date_months)))
         q += (
+            " AND INSTR(tx_date, '/') > 0"
             " AND ("
             "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
             "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER))"
@@ -288,6 +289,7 @@ def _rebuild_transfers_for_month(month: str) -> None:
                 exp_rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, statement, category FROM transactions "
                     "WHERE tx_type='expense' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND ("
                     "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
@@ -310,6 +312,7 @@ def _rebuild_transfers_for_month(month: str) -> None:
                 inc_rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, statement, category, label FROM transactions "
                     "WHERE tx_type='income' "
+                    "AND INSTR(tx_date, '/') > 0 "
                     "AND ("
                     "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
