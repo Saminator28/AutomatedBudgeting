@@ -5,7 +5,8 @@ services:
   app:
     build: .
     container_name: automated-budgeting
-    network_mode: "host"  # Use host network to access Ollama directly
+    ports:
+      - "8000:8000"
     volumes:
       # Mount data directories for persistence
       - ./src/ui/data:/app/src/ui/data
@@ -13,7 +14,11 @@ services:
       - ./logs:/app/logs
     environment:
       - PYTHONUNBUFFERED=1
-      - OLLAMA_HOST=http://localhost:11434  # Direct access via host network
+      # host.docker.internal resolves to the host on Docker Desktop (Windows/Mac).
+      # On Linux, extra_hosts below maps it via host-gateway (Docker 20.10+).
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   # Note: Ollama service disabled - using host Ollama instance instead
