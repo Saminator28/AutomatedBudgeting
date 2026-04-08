@@ -63,7 +63,9 @@ def get_transfers():
             with get_engine().connect() as conn:
                 db_rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, report_month, statement, direction, label, "
-                    "SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2) AS tx_month "
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER)) "
+                    "AS tx_month "
                     "FROM transfers ORDER BY tx_date"
                 )).fetchall()
             for r in db_rows:

@@ -60,8 +60,12 @@ def export_transactions(month: str = ''):
 
         eng = get_engine()
         params: dict = {}
+        tx_month_expr = (
+            "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+            "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+        )
         month_filter = (
-            " AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2) = :month"
+            f" AND {tx_month_expr} = :month"
             if month else ""
         )
         if month:

@@ -203,13 +203,16 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
   // ── Derived: filtered + sorted transactions (expenses + income + unclassified) ────
 
   // Helper: derive YYYY-MM calendar month from a transaction date string (M/D/YYYY or MM/DD/YYYY).
+  // Parses explicitly to avoid implementation-dependent behaviour of new Date() on non-ISO strings.
   const calendarMonth = dateStr => {
-    if (!dateStr) return '';
-    try {
-      const d = new Date(dateStr);
-      if (isNaN(d.getTime())) return '';
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    } catch (_) { return ''; }
+    if (!dateStr || typeof dateStr !== 'string') return '';
+    const parts = dateStr.split('/');
+    if (parts.length < 3) return '';
+    const monthNum = Number(parts[0].trim());
+    const year = parts[2].trim().slice(-4);
+    if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12) return '';
+    if (!/^\d{4}$/.test(year)) return '';
+    return `${year}-${String(monthNum).padStart(2, '0')}`;
   };
 
   const allRows = [
@@ -388,11 +391,13 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
       // expense → income
       // Investment expenses become Investment income (label='investment_transfer') —
       // never show a dialog or create a merchant rule for those.
-      // Only Regular income (label='recurring') can create a merchant rule.
+      // Only Regular income (label='recurring') can optionally save a merchant rule.
       const investmentCategories = ['Investment', 'Investment Transfer'];
       const isInvestmentTx = investmentCategories.includes(row.category);
       const incomeLabel = isInvestmentTx ? 'investment_transfer' : 'recurring';
-      const saveRule = false;
+      const saveRule = !isInvestmentTx && window.confirm(
+        `Save "${row.place}" as a recurring income rule?\n\nChoose OK to always classify this merchant as income, or Cancel to reclassify this transaction only.`
+      );
       try {
         const res = await fetch(`${API}/api/expense/reclassify-as-income`, {
           method: 'POST',

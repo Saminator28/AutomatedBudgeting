@@ -288,7 +288,10 @@ def _rebuild_transfers_for_month(month: str) -> None:
                 exp_rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, statement, category FROM transactions "
                     "WHERE tx_type='expense' "
-                    "AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)=:m"
+                    "AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+                    ")=:m"
                 ), {'m': month}).fetchall()
                 inv_expenses = [r for r in exp_rows if str(r[4] or '').strip() in _INVESTMENT_CATEGORIES]
                 non_inv = [r for r in exp_rows if str(r[4] or '').strip() not in _INVESTMENT_CATEGORIES]
@@ -307,7 +310,10 @@ def _rebuild_transfers_for_month(month: str) -> None:
                 inc_rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, statement, category, label FROM transactions "
                     "WHERE tx_type='income' "
-                    "AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)=:m"
+                    "AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+                    ")=:m"
                 ), {'m': month}).fetchall()
                 for r in inc_rows:
                     is_tagged            = str(r[4] or '').strip() == 'Investment Return'

@@ -268,7 +268,10 @@ def edit_expense(payload: dict = Body(...)):
                 old_row = conn.execute(_text(
                     "SELECT category FROM transactions "
                     "WHERE tx_type='expense' "
-                    "AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)=:m "
+                    "AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+                    ")=:m "
                     "AND tx_date=:d AND UPPER(place)=UPPER(:p) "
                     "AND ROUND(amount,2)=ROUND(:a,2) LIMIT 1"
                 ), {'m': month, 'd': date, 'p': original_place, 'a': amount}).fetchone()
@@ -290,7 +293,10 @@ def edit_expense(payload: dict = Body(...)):
                 sql = (
                     f"UPDATE transactions SET {', '.join(set_clauses)} "
                     "WHERE tx_type='expense' "
-                    "AND SUBSTR(tx_date,7,4)||'-'||SUBSTR(tx_date,1,2)=:m "
+                    "AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+                    ")=:m "
                     "AND tx_date=:d AND UPPER(place)=UPPER(:p) "
                     "AND ROUND(amount,2)=ROUND(:a,2)"
                 )

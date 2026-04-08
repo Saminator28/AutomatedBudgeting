@@ -448,7 +448,7 @@ function MerchantRulesPanel() {
         <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: '#1e293b' }}>Merchant Rules</h2>
         <p style={{ margin: '6px 0 0', color: '#64748b', fontSize: 14 }}>
           Rules are applied every time a month is processed. They override the parser&apos;s auto-classification.
-          Rules are only created when you confirm &quot;save as recurring rule&quot; while reclassifying a transaction.
+          Rules are created when you confirm &quot;save as recurring rule&quot; while reclassifying an expense as income in the Transactions tab.
         </p>
       </div>
 
