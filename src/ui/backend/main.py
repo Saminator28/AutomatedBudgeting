@@ -7,6 +7,7 @@ All routes live in dedicated modules:
   src/ui/backend/routes/statements.py  — statement management / processing jobs
   src/ui/backend/routes/keywords.py    — keyword CRUD (5 types)
   src/ui/backend/routes/analytics.py   — AI insights / forecast / budget / chat
+  src/ui/backend/routes/settings.py    — auto-filter tracker / Settings tab
   src/ui/backend/export_excel.py       — Excel export
 
 Shared state (DB, paths, helpers) lives in src/ui/backend/deps.py.
@@ -34,6 +35,7 @@ from src.ui.backend.routes.transfers import router as _transfers_router   # noqa
 from src.ui.backend.routes.statements import router as _statements_router # noqa: E402
 from src.ui.backend.routes.keywords import router as _keywords_router     # noqa: E402
 from src.ui.backend.routes.analytics import router as _analytics_router   # noqa: E402
+from src.ui.backend.routes.settings import router as _settings_router    # noqa: E402
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 from src.ui.backend import deps                                            # noqa: E402
@@ -114,6 +116,7 @@ app.include_router(_transfers_router)
 app.include_router(_statements_router)
 app.include_router(_keywords_router)
 app.include_router(_analytics_router)
+app.include_router(_settings_router)
 
 # ── Static files & dashboard ──────────────────────────────────────────────────
 _react_build = Path(__file__).parent.parent / "build"

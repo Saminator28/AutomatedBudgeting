@@ -360,7 +360,7 @@ def classify_manual_review(payload: dict = Body(...)):
                         conn.execute(_text(
                             "INSERT OR IGNORE INTO transactions "
                             "(tx_hash, report_month, tx_date, place, amount, category, label, tx_type, statement, user_corrected) "
-                            "VALUES (:h, :m, :d, :p, :a, :c, :l, 'expense', :s, 0)"
+                            "VALUES (:h, :m, :d, :p, :a, :c, :l, 'expense', :s, 1)"
                         ), {'h': tx_hash, 'm': month, 'd': row_date, 'p': final_place,
                             'a': amount_to_write, 'c': final_category, 'l': 'recurring', 's': row_statement})
                         conn.commit()
@@ -380,7 +380,7 @@ def classify_manual_review(payload: dict = Body(...)):
                         conn.execute(_text(
                             "INSERT OR IGNORE INTO transactions "
                             "(tx_hash, report_month, tx_date, place, amount, category, label, tx_type, statement, user_corrected) "
-                            "VALUES (:h, :m, :d, :p, :a, :c, :l, 'income', :s, 0)"
+                            "VALUES (:h, :m, :d, :p, :a, :c, :l, 'income', :s, 1)"
                         ), {'h': tx_hash, 'm': month, 'd': row_date, 'p': final_place,
                             'a': row_amount, 'c': final_category, 'l': 'recurring', 's': row_statement})
                         conn.commit()

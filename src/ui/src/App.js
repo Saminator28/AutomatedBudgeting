@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, BarChart, Bar, ComposedChart } from "recharts";
 import InsightsPanel from "./InsightsPanel";
 import TransactionsTab from "./TransactionsTab";
+import SettingsTab from "./SettingsTab";
 
 const COLORS = [
   "#0088FE", "#00C49F", "#FFBB28", "#FF8042", "#A28CFF", "#FF6699", "#33CC99", "#FF4444", "#FFB347", "#B6D7A8",
@@ -189,8 +190,9 @@ function App() {
     const groups = new Map();
     for (const item of data) {
       const parent = parentMap[item.category] || item.category;
-      if (!groups.has(parent)) groups.set(parent, { category: parent, amount: 0, subcategories: [] });
+      if (!groups.has(parent)) groups.set(parent, { category: parent, amount: 0, subcategories: [], one_time: !!item.one_time });
       const g = groups.get(parent);
+      if (item.one_time) g.one_time = true;
       g.amount += item.amount;
       if (parentMap[item.category]) g.subcategories.push(item);
     }
@@ -204,8 +206,9 @@ function App() {
       })
     : data;
 
-  // Calculate totals
-  const totalExpenses = data.reduce((sum, d) => sum + d.amount, 0);
+  // Calculate totals — one-time expenses are tracked separately so they don't skew budget baselines
+  const oneTimeTotal = data.reduce((sum, d) => sum + (d.one_time ? d.amount : 0), 0);
+  const totalExpenses = data.reduce((sum, d) => sum + (d.one_time ? 0 : d.amount), 0);
   // Use only recurring income for the budget baseline average
   const totalRecurringIncome = incomeData.reduce((sum, d) => sum + (d.income || 0), 0);
   const totalBonusIncome = incomeData.reduce((sum, d) => sum + (d.bonus || 0), 0);
@@ -289,9 +292,10 @@ function App() {
           </div>
           <div style={{ display: 'flex', gap: 10 }}>
             {[
-              { label: `${formatMonth(selectedMonth)} Spend`, value: formatCurrency(totalExpenses), color: '#fbbf24' },
+              { label: 'Recurring Spend', value: formatCurrency(totalExpenses), color: '#fbbf24' },
+              ...(oneTimeTotal > 0 ? [{ label: '⚡ Unusual', value: formatCurrency(oneTimeTotal), color: '#94a3b8' }] : []),
               { label: 'Avg Monthly Income', value: formatCurrency(avgMonthlyIncome), color: '#34d399' },
-              { label: 'Categories', value: categories.length, color: '#a5b4fc' },
+              { label: 'Categories', value: categories.filter(c => c !== '⚡ Unusual Spending').length, color: '#a5b4fc' },
             ].map((s, i) => (
               <div key={i} style={{ background: 'rgba(255,255,255,.12)', backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,.2)', borderRadius: 10, padding: '10px 18px', textAlign: 'center' }}>
                 <div style={{ fontSize: 11, color: 'rgba(255,255,255,.7)', fontWeight: 700, letterSpacing: '.05em', textTransform: 'uppercase', marginBottom: 4 }}>{s.label}</div>
@@ -311,6 +315,7 @@ function App() {
             { key: 'investments', label: '💼 Investments' },
             { key: 'transactions', label: '✏️ Transactions' },
             { key: 'statements', label: '⬆️ Statements' },
+            { key: 'settings', label: '⚙️ Settings' },
           ].map(tab => (
             <button
               key={tab.key}
@@ -427,14 +432,28 @@ function App() {
                 <YAxis />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                {categories.slice(0, 8).map((cat, idx) => (
-                  <Line key={cat} type="monotone" dataKey={cat} stroke={COLORS[idx % COLORS.length]} strokeWidth={2} dot={false} />
-                ))}
+                {(() => {
+                  const UNUSUAL = '⚡ Unusual Spending';
+                  const regCats = categories.filter(c => c !== UNUSUAL).slice(0, categories.includes(UNUSUAL) ? 7 : 8);
+                  const visible = [...regCats, ...(categories.includes(UNUSUAL) ? [UNUSUAL] : [])];
+                  return visible.map((cat, idx) => (
+                    <Line
+                      key={cat}
+                      type="monotone"
+                      dataKey={cat}
+                      stroke={cat === UNUSUAL ? '#94a3b8' : COLORS[idx % COLORS.length]}
+                      strokeWidth={2}
+                      strokeDasharray={cat === UNUSUAL ? '6 4' : undefined}
+                      dot={false}
+                    />
+                  ));
+                })()
+                }
               </LineChart>
             </ResponsiveContainer>
-            {categories.length > 8 && (
+            {categories.filter(c => c !== '⚡ Unusual Spending').length > 8 && (
               <p style={{ fontSize: 12, color: '#666', marginTop: 8 }}>
-                * Showing top 8 categories. Total: {categories.length}
+                * Showing top 8 categories. Total: {categories.filter(c => c !== '⚡ Unusual Spending').length}
               </p>
             )}
           </div>
@@ -459,9 +478,10 @@ function App() {
                   {groupedData.map((entry, index) => (
                     <Cell
                       key={`cell-${index}`}
-                      fill={COLORS[index % COLORS.length]}
+                      fill={entry.one_time ? '#94a3b8' : COLORS[index % COLORS.length]}
                       stroke={selectedCategory === entry.category || (parentMap[selectedCategory] === undefined && entry.subcategories?.some(s => s.category === selectedCategory)) ? "#222" : "#fff"}
                       strokeWidth={selectedCategory === entry.category ? 3 : 1}
+                      opacity={entry.one_time ? 0.65 : 1}
                       cursor="pointer"
                     />
                   ))}
@@ -594,7 +614,11 @@ function App() {
       {/* ── Investments Tab ── */}
       {activeTab === 'investments' && (() => {
         const availableInvMonths = Array.from(new Set(transfers.map(t => t.month))).sort().reverse();
-        const monthRows = transfers.filter(t => t.month === invFilterMonth);
+        // Snap invFilterMonth to nearest available if it's not present (e.g. no investments that month)
+        const effectiveInvMonth = availableInvMonths.includes(invFilterMonth)
+          ? invFilterMonth
+          : (availableInvMonths[0] || invFilterMonth);
+        const monthRows = transfers.filter(t => t.month === effectiveInvMonth);
         const netOut = rows => rows.filter(t => t.direction === 'Out').reduce((s, t) => s + t.amount, 0)
                              - rows.filter(t => t.direction === 'In').reduce((s, t) => s + t.amount, 0);
         const totalInvested  = rows => rows.filter(t => t.direction === 'Out').reduce((s, t) => s + t.amount, 0);
@@ -634,7 +658,7 @@ function App() {
               <div>
                 <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.04em' }}>Month</div>
                 <select
-                  value={invFilterMonth}
+                  value={effectiveInvMonth}
                   onChange={e => setInvFilterMonth(e.target.value)}
                   style={{ padding: '7px 12px', border: '1px solid #cbd5e1', borderRadius: 8, fontSize: 13, background: '#fff', fontWeight: 600, color: '#0f172a', minWidth: 130 }}
                 >
@@ -648,27 +672,61 @@ function App() {
             {!transfersLoading && (
               <>
                 {/* Summary cards */}
-                <div style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>
-                  <SummaryCard label={`${invFilterMonth} — month total`} rows={monthRows} accent='#4f46e5' />
+                <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
+                  <SummaryCard label={`${effectiveInvMonth} — month total`} rows={monthRows} accent='#4f46e5' />
                   <SummaryCard label='All time — grand total' rows={transfers} accent='#0891b2' />
                 </div>
 
+                {/* Retirement vs Personal breakdown */}
+                {(() => {
+                  const retRows = transfers.filter(t => t.label === 'Retirement');
+                  const perRows = transfers.filter(t => t.label === 'Personal');
+                  if (retRows.length === 0 && perRows.length === 0) return null;
+                  const breakdown = [
+                    { label: '🏦 Retirement (401k / IRA)', rows: retRows, color: '#4f46e5', bg: '#eef2ff' },
+                    { label: '📈 Personal (Taxable)',       rows: perRows, color: '#0891b2', bg: '#ecfeff' },
+                  ].filter(b => b.rows.length > 0);
+                  return (
+                    <div style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>
+                      {breakdown.map(b => {
+                        const out = b.rows.filter(t => t.direction === 'Out').reduce((s, t) => s + t.amount, 0);
+                        const inp = b.rows.filter(t => t.direction === 'In').reduce((s, t) => s + t.amount, 0);
+                        const ytd = b.rows.filter(t => t.month && t.month.startsWith(new Date().getFullYear().toString()));
+                        const ytdOut = ytd.filter(t => t.direction === 'Out').reduce((s, t) => s + t.amount, 0);
+                        return (
+                          <div key={b.label} style={{ background: b.bg, border: `1px solid ${b.color}22`, borderRadius: 12, padding: '16px 20px', flex: 1, minWidth: 220 }}>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: b.color, textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 10 }}>{b.label}</div>
+                            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+                              <div><div style={{ fontSize: 10, color: '#ef4444', fontWeight: 700, marginBottom: 2 }}>ALL TIME IN</div><div style={{ fontWeight: 700, fontSize: 17, color: '#0f172a' }}>{formatCurrency(out)}</div></div>
+                              <div><div style={{ fontSize: 10, color: '#64748b', fontWeight: 700, marginBottom: 2 }}>YTD {new Date().getFullYear()}</div><div style={{ fontWeight: 700, fontSize: 17, color: b.color }}>{formatCurrency(ytdOut)}</div></div>
+                              {inp > 0 && <div><div style={{ fontSize: 10, color: '#22c55e', fontWeight: 700, marginBottom: 2 }}>RETURNED</div><div style={{ fontWeight: 700, fontSize: 17, color: '#0f172a' }}>{formatCurrency(inp)}</div></div>}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+
                 {/* Tag Investment Returns section */}
                 {(() => {
-                  // Find income entries for invFilterMonth that are from investment-likely sources
-                  // and not yet tagged as Investment Return
-                  const potential = incomeEntries.filter(e =>
-                    e.month === invFilterMonth &&
-                    e.category !== 'Investment Return' &&
-                    investmentKeywords.some(p => e.place.toLowerCase().includes(p.toLowerCase()))
-                  );
+                  // Find income entries for invFilterMonth that are investment-related:
+                  // 1. explicitly labeled investment_transfer, OR
+                  // 2. matching investment platform keywords (auto-detected)
+                  // already tagged = category is Investment Return
                   const alreadyTagged = incomeEntries.filter(e =>
-                    e.month === invFilterMonth && e.category === 'Investment Return'
+                    e.month === effectiveInvMonth && e.category === 'Investment Return'
+                  );
+                  const potential = incomeEntries.filter(e =>
+                    e.month === effectiveInvMonth &&
+                    e.category !== 'Investment Return' &&
+                    (e.label === 'investment_transfer' ||
+                      investmentKeywords.some(p => e.place.toLowerCase().includes(p.toLowerCase())))
                   );
                   if (potential.length === 0 && alreadyTagged.length === 0) return null;
                   return (
                     <div style={{ ...cardStyle, marginBottom: 24 }}>
-                      <h3 style={{ margin: '0 0 4px 0', color: '#0f172a', fontSize: 15 }}>💰 Investment Income — {invFilterMonth}</h3>
+                      <h3 style={{ margin: '0 0 4px 0', color: '#0f172a', fontSize: 15 }}>💰 Investment Income — {effectiveInvMonth}</h3>
                       <p style={{ margin: '0 0 14px 0', fontSize: 12, color: '#64748b' }}>Money received from investment accounts. These are automatically counted in the ↓ In totals above.</p>
                       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                         <thead>
@@ -686,7 +744,11 @@ function App() {
                               <td style={{ padding: '9px 12px', fontWeight: 600 }}>{e.place}</td>
                               <td style={{ padding: '9px 12px', textAlign: 'right', fontWeight: 700, color: '#16a34a' }}>+{formatCurrency(e.amount)}</td>
                               <td style={{ padding: '9px 12px', textAlign: 'center' }}>
-                                <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 10, fontWeight: 700, background: '#f0fdf4', color: '#16a34a' }}>✓ Auto-detected</span>
+                                <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 10, fontWeight: 700,
+                                  background: e.category === 'Investment Return' ? '#f0fdf4' : '#eff6ff',
+                                  color:      e.category === 'Investment Return' ? '#16a34a' : '#1d4ed8' }}>
+                                  {e.category === 'Investment Return' ? '✓ Auto-detected' : '📈 Investment Transfer'}
+                                </span>
                               </td>
                             </tr>
                           ))}
@@ -705,11 +767,11 @@ function App() {
                 ) : monthRows.length === 0 ? (
                   <div style={{ ...cardStyle, textAlign: 'center', padding: 48, color: '#94a3b8' }}>
                     <div style={{ fontSize: 32, marginBottom: 12 }}>📭</div>
-                    <p style={{ margin: 0, fontWeight: 600 }}>No investment transfers for {invFilterMonth}</p>
+                    <p style={{ margin: 0, fontWeight: 600 }}>No investment transfers for {effectiveInvMonth}</p>
                   </div>
                 ) : (
                   <div style={{ ...cardStyle }}>
-                    <h3 style={{ margin: '0 0 16px 0', color: '#0f172a', fontSize: 15 }}>Transfers — {invFilterMonth}</h3>
+                    <h3 style={{ margin: '0 0 16px 0', color: '#0f172a', fontSize: 15 }}>Transfers — {effectiveInvMonth}</h3>
                     <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                       <thead>
                         <tr style={{ background: '#f8fafc', borderBottom: '2px solid #e2e8f0' }}>
@@ -777,6 +839,7 @@ function App() {
             }
           }
           const updated = await fetch('http://localhost:8000/api/statements').then(r => r.json());
+          stmtUploadMonthInitialised.current = true; // prevent init effect from advancing month
           setStatementsData(Array.isArray(updated) ? updated : []);
           setStmtUploading(false);
         };
@@ -800,6 +863,7 @@ function App() {
               if (poll.status === 'done') {
                 setStmtLog(poll.output || '✅ Done');
                 const updated = await fetch('http://localhost:8000/api/statements').then(r => r.json());
+                stmtUploadMonthInitialised.current = true; // prevent init effect from advancing month
                 setStatementsData(Array.isArray(updated) ? updated : []);
                 break;
               } else if (poll.status === 'error') {
@@ -972,6 +1036,9 @@ function App() {
           </div>
         );
       })()}
+
+      {/* ── Settings Tab ── */}
+      {activeTab === 'settings' && <SettingsTab />}
 
     </div>
   );

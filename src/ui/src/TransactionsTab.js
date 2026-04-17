@@ -201,19 +201,41 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
 
 
   // ── Derived: filtered + sorted transactions (expenses + income + unclassified) ────
+
+  // Helper: derive YYYY-MM calendar month from a transaction date string (M/D/YYYY or MM/DD/YYYY).
+  // Parses explicitly to avoid implementation-dependent behaviour of new Date() on non-ISO strings.
+  const calendarMonth = dateStr => {
+    if (!dateStr || typeof dateStr !== 'string') return '';
+    const parts = dateStr.split('/');
+    if (parts.length < 3) return '';
+    const monthNum = parseInt(parts[0].trim(), 10);
+    const year = parts[2].trim().slice(-4);
+    if (isNaN(monthNum) || monthNum < 1 || monthNum > 12) return '';
+    if (!/^\d{4}$/.test(year)) return '';
+    return `${year}-${String(monthNum).padStart(2, '0')}`;
+  };
+
   const allRows = [
-    ...expenses.map(e => ({ ...e, _type: 'expense' })),
+    ...expenses.map(e => ({ ...e, _type: e.tx_type || 'expense' })),
     ...income.map(i => ({ ...i, _type: 'income' })),
+    // Manual-review rows store the statement folder name in 'month', not the calendar month.
+    // Compute the calendar month from the transaction 'date' field so the filter matches
+    // the same YYYY-MM value used by expenses and income.
     ...reviewData
-      .filter(r => !filterMonth || r.month === filterMonth)
-      .map(r => ({ ...r, _type: 'review' })),
+      .filter(r => !filterMonth || calendarMonth(r.date) === filterMonth)
+      .map(r => ({ ...r, _type: 'review', month: calendarMonth(r.date) || r.month })),
   ];
 
+  // 'month' on each row is the tx_date calendar month (set by the backend for expenses/income,
+  // or derived above for review rows), so filtering by e.month === filterMonth correctly bins
+  // transactions by when they occurred.
   const filtered = allRows.filter(e => {
+    if (filterMonth && e.month !== filterMonth) return false;
     if (filterType === 'unclassified') { if (e._type !== 'review') return false; }
     else if (filterType === 'reimbursement') { if (!(e._type === 'expense' && e.amount < 0)) return false; }
     else if (filterType === 'expense') { if (!(e._type === 'expense' && e.amount >= 0)) return false; }
     else if (filterType === 'income') { if (e._type !== 'income') return false; }
+    // 'all' shows everything including transfers
     if (filterCategory && e.category !== filterCategory) return false;
     if (search && !e.place.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
@@ -225,7 +247,10 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
     let av = a[sortCol] ?? '', bv = b[sortCol] ?? '';
     if (sortCol === 'amount') { av = a.amount; bv = b.amount; }
     const cmp = av < bv ? -1 : av > bv ? 1 : 0;
-    return sortDir === 'asc' ? cmp : -cmp;
+    if (cmp !== 0) return sortDir === 'asc' ? cmp : -cmp;
+    // Deterministic tiebreaker: use tx_hash to keep a consistent secondary order
+    // among rows with identical sort-column values (does not stay fixed across type changes).
+    return (a.tx_hash || '').localeCompare(b.tx_hash || '');
   });
 
   const toggleSort = col => {
@@ -291,7 +316,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Failed');
         setIncome(prev => prev.filter(r => !(r.date === row.date && r.place === row.place && r.amount === row.amount && r.month === row.month)));
-        setExpenses(prev => [...prev, { ...row, _type: 'expense', amount: -Math.abs(row.amount), label: 'reimbursement', category: '' }]);
+        setExpenses(prev => [...prev, { ...row, _type: 'expense', amount: -Math.abs(row.amount), label: 'reimbursement', category: data.category || '' }]);
       } catch (err) {
         alert('Reclassify failed: ' + err.message);
       }
@@ -363,19 +388,28 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
         await editExpense(row, { new_label: 'recurring', new_amount: Math.abs(row.amount) });
       }
     } else {
-      // expense → income (moves row to income CSV)
+      // expense → income
+      // Investment expenses become Investment income (label='investment_transfer') —
+      // never show a dialog or create a merchant rule for those.
+      // Only Regular income (label='recurring') can optionally save a merchant rule.
+      const investmentCategories = ['Investment', 'Investment Transfer'];
+      const isInvestmentTx = investmentCategories.includes(row.category);
+      const incomeLabel = isInvestmentTx ? 'investment_transfer' : 'recurring';
+      const saveRule = !isInvestmentTx && window.confirm(
+        `Save "${row.place}" as a recurring income rule?\n\nChoose OK to always classify this merchant as income, or Cancel to reclassify this transaction only.`
+      );
       try {
         const res = await fetch(`${API}/api/expense/reclassify-as-income`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ date: row.date, place: row.place, amount: row.amount, month: row.month }),
+          body: JSON.stringify({ date: row.date, place: row.place, amount: row.amount, month: row.month, label: incomeLabel, save_rule: saveRule }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Failed');
         setExpenses(prev => prev.filter(e =>
           !(e.date === row.date && e.place === row.place && e.amount === row.amount && e.month === row.month)
         ));
-        setIncome(prev => [...prev, { ...row, _type: 'income', amount: Math.abs(row.amount), label: 'recurring', category: '' }]);
+        setIncome(prev => [...prev, { ...row, _type: 'income', amount: Math.abs(row.amount), label: incomeLabel, category: '' }]);
       } catch (err) {
         alert('Reclassify failed: ' + err.message);
       }
@@ -384,8 +418,6 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
 
   // ── Permanently delete a transaction ─────────────────────────────────────
   const deleteTx = useCallback(async (row) => {
-    const label = `${row.place} ${row.amount < 0 ? '-' : ''}$${Math.abs(row.amount).toFixed(2)}`;
-    if (!window.confirm(`Permanently delete "${label}"?\n\nThis cannot be undone.`)) return;
     try {
       const res = await fetch(`${API}/api/transactions/${row.tx_hash}`, { method: 'DELETE' });
       const data = await res.json();
@@ -650,6 +682,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                   </thead>
                   <tbody>
                     {sorted.map((row, i) => {
+                      const isTransfer = row._type === 'transfer';
                       const isIncome = row._type === 'income' && row.label !== 'reimbursement';
                       const isReimb  = (row._type === 'expense' && row.amount < 0) || (row._type === 'income' && row.label === 'reimbursement');
                       const isReview = row._type === 'review';
@@ -661,7 +694,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
 
                       if (isReview) {
                         return (
-                          <tr key={i} style={{ opacity: rvSaving ? 0.5 : 1, background: '#fef2f2' }}>
+                          <tr key={reviewKey} style={{ opacity: rvSaving ? 0.5 : 1, background: '#fef2f2' }}>
                             <td style={{ ...td, whiteSpace: 'nowrap', color: '#64748b' }}>{row.date}</td>
                             <td style={td}>
                               <select
@@ -712,8 +745,27 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                         );
                       }
 
+                      if (isTransfer) {
+                        return (
+                          <tr key={row.tx_hash || key} style={{ opacity: 0.6, background: '#f8fafc' }}>
+                            <td style={{ ...td, whiteSpace: 'nowrap', color: '#94a3b8' }}>{row.date}</td>
+                            <td style={td}>
+                              <span style={{ background: '#e2e8f0', color: '#64748b', borderRadius: 4, padding: '2px 7px', fontSize: 11, fontWeight: 700 }}>↔ Transfer</span>
+                            </td>
+                            <td style={{ ...td, minWidth: 160, color: '#64748b' }}>{row.place}</td>
+                            <td style={{ ...td, textAlign: 'right', fontWeight: 600, whiteSpace: 'nowrap', color: '#94a3b8' }}>{formatCurrency(row.amount)}</td>
+                            <td style={{ ...td, color: '#94a3b8', fontSize: 12 }}>—</td>
+                            <td style={{ ...td, color: '#94a3b8', fontSize: 12 }}>—</td>
+                            <td style={{ ...td, color: '#94a3b8', fontSize: 11 }}>{row.statement}</td>
+                            <td style={{ ...td, padding: '4px 6px' }}>
+                              <button onClick={() => deleteTx(row)} title="Delete transfer" style={{ background: 'none', color: '#cbd5e1', border: 'none', borderRadius: 4, padding: '2px 5px', fontSize: 14, cursor: 'pointer', lineHeight: 1 }} onMouseEnter={e => e.currentTarget.style.color = '#dc2626'} onMouseLeave={e => e.currentTarget.style.color = '#cbd5e1'}>🗑️</button>
+                            </td>
+                          </tr>
+                        );
+                      }
+
                       return (
-                        <tr key={i} style={{ opacity: saving ? 0.5 : 1, background: isIncome ? '#f0fdf4' : isReimb ? '#f5f3ff' : undefined }}>
+                        <tr key={row.tx_hash || key} style={{ opacity: saving ? 0.5 : 1, background: isIncome ? '#f0fdf4' : isReimb ? '#f5f3ff' : undefined }}>
                           <td style={{ ...td, whiteSpace: 'nowrap', color: '#64748b' }}>{row.date}</td>
                           <td style={td}>
                             <span
@@ -755,6 +807,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                               >
                                 <option value="recurring">✅ Regular</option>
                                 <option value="bonus">⭐ Bonus</option>
+                                <option value="investment_transfer">📈 Investment</option>
                               </select>
                             ) : (
                               <select

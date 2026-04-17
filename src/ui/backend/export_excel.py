@@ -1,110 +1,445 @@
 """
-export_excel.py — Excel export router for the Automated Budgeting API.
+export_excel.py — Excel export for the Automated Budgeting API.
 
-Provides GET /api/transactions/export?month=YYYY-MM
-Generates a three-sheet .xlsx workbook:
-  1. Transaction Ledger   — date-sorted ledger with type, description, category,
-                            amount, frequency, and a blank Notes column.
-  2. Category Breakdown   — total / count / avg per category, % of expenses,
-                            % of income; sorted by spend descending.
-  3. Budget Overview      — income vs. expenses summary + 50/30/20 rule analysis
-                            showing target vs. actual for Needs/Wants/Savings.
+GET /api/transactions/export?month=YYYY-MM
+
+Three-sheet workbook:
+  1. Monthly Budget   — template-style layout; categories come from categories.json
+                        so it automatically reflects any additions/removals.
+                        Budget column is blank for the user to fill in;
+                        Actual is populated from the DB;
+                        Remaining = Budget − Actual (live formula).
+  2. Transactions     — date-sorted ledger: Date, Type, Description, Category,
+                        Amount, Notes  (no Frequency column).
+  3. Category Detail  — total / count / avg per category, % of expenses, % of income.
 """
 
 import io
 import json as _json
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# ── Shared state from deps ───────────────────────────────────────────────────
-from src.ui.backend.deps import (  # noqa: E402
-    _DB_AVAILABLE, get_engine,
-)
+from src.ui.backend.deps import _DB_AVAILABLE, get_engine
 
-
-# ── Router ────────────────────────────────────────────────────────────────────
 router = APIRouter()
+
+# categories.json lives at <project_root>/config/categories.json
+# This file: src/ui/backend/export_excel.py → parents[3] = project root
+_CONF_ROOT = Path(__file__).parents[3] / 'config'
+
+
+def _load_categories() -> tuple[list[str], dict[str, list[str]]]:
+    """Return (categories_list, subcategory_map) from categories.json."""
+    try:
+        with open(_CONF_ROOT / 'categories.json') as fh:
+            data = _json.load(fh)
+        return data.get('categories', []), data.get('subcategories', {})
+    except Exception:
+        return [], {}
 
 
 @router.get("/api/transactions/export")
 def export_transactions(month: str = ''):
-    """
-    Export transactions for the given month (or all months) as a formatted Excel workbook.
-
-    Sheet layout (based on personal-finance spreadsheet best practices):
-      1. Transaction Ledger  — date-sorted ledger with type, description, category,
-                               amount, frequency, and a blank Notes column.
-      2. Category Breakdown  — total / count / avg per category, % of expenses,
-                               % of income; sorted by spend descending.
-      3. Budget Overview     — income vs. expenses summary + 50/30/20 rule analysis
-                               showing target vs. actual for Needs/Wants/Savings.
-    """
+    """Export a formatted Excel workbook for the given month (or all months)."""
     if not _DB_AVAILABLE:
         return JSONResponse(status_code=503, content={'error': 'Database unavailable'})
 
     try:
         import openpyxl
-        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.styles import PatternFill, Font, Alignment
         from openpyxl.utils import get_column_letter
         from sqlalchemy import text as _text
 
-        _eng = get_engine()
+        # ── Load categories (dynamic, from categories.json) ──────────────────
+        all_cats, subcats = _load_categories()
+        child_set = {c for children in subcats.values() for c in children}
+        top_level = [c for c in all_cats if c not in child_set]
+
+        eng = get_engine()
         params: dict = {}
-        month_filter = " AND report_month = :month" if month else ""
+        tx_month_expr = (
+            "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+            "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+        )
+        month_filter = (
+            f" AND INSTR(tx_date, '/') > 0 AND {tx_month_expr} = :month"
+            if month else ""
+        )
         if month:
             params['month'] = month
 
-        with _eng.connect() as conn:
+        with eng.connect() as conn:
             tx_rows = conn.execute(_text(
-                "SELECT tx_hash, tx_date, place, amount, category, label, tx_type, report_month "
-                "FROM transactions WHERE 1=1" + month_filter +
-                " ORDER BY report_month ASC, tx_date ASC, place ASC"
+                "SELECT tx_hash, tx_date, place, amount, category, label, tx_type "
+                "FROM transactions WHERE tx_type != 'transfer'" + month_filter +
+                " ORDER BY tx_date ASC, place ASC"
             ), params).fetchall()
 
         label_month = month if month else 'All Months'
 
-        # ── Shared style helpers ──────────────────────────────────────────────
-        HDR_FILL     = PatternFill('solid', fgColor='1E3A5F')   # deep navy
-        HDR_FONT     = Font(bold=True, color='FFFFFF', size=11)
-        SUB_FILL     = PatternFill('solid', fgColor='2D6A9F')   # medium blue sub-header
-        SUB_FONT     = Font(bold=True, color='FFFFFF', size=10)
-        EXPENSE_FILL = PatternFill('solid', fgColor='FEF2F2')   # pale red
-        INCOME_FILL  = PatternFill('solid', fgColor='F0FDF4')   # pale green
-        REIMB_FILL   = PatternFill('solid', fgColor='F5F3FF')   # pale purple
-        ALT_FILL     = PatternFill('solid', fgColor='F8FAFC')   # very light gray alt row
-        TOTAL_FILL   = PatternFill('solid', fgColor='1E3A5F')
-        TOTAL_FONT   = Font(bold=True, color='FFFFFF', size=11)
-        OK_FILL      = PatternFill('solid', fgColor='DCFCE7')
-        WARN_FILL    = PatternFill('solid', fgColor='FEF3C7')
-        OVER_FILL    = PatternFill('solid', fgColor='FEE2E2')
-        MONEY_FMT    = '#,##0.00'
-        PCT_FMT      = '0.0%'
+        # ── Style helpers ─────────────────────────────────────────────────────
+        def _fill(hex6: str) -> PatternFill:
+            return PatternFill('solid', fgColor=hex6)
 
-        def _hdr(ws, headers, col_widths):
-            ws.append(headers)
-            for i, _ in enumerate(headers, 1):
-                c = ws.cell(1, i)
-                c.fill = HDR_FILL; c.font = HDR_FONT
-                c.alignment = Alignment(horizontal='center', vertical='center')
-            ws.row_dimensions[1].height = 22
-            ws.freeze_panes = 'A2'
-            ws.auto_filter.ref = ws.dimensions
-            for i, w in enumerate(col_widths, 1):
-                ws.column_dimensions[get_column_letter(i)].width = w
+        def _fnt(bold=False, color='000000', size=11, italic=False) -> Font:
+            return Font(bold=bold, color=color, size=size, italic=italic)
+
+        def _aln(h='left', v='center', wrap=False) -> Alignment:
+            return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+        C_NAVY  = '1E3A5F'
+        C_BLUE  = '2D6A9F'
+        C_LBLUE = 'D0E4F7'
+        C_GREY  = 'F8FAFC'
+        C_WHITE = 'FFFFFF'
+        C_GREEN = 'F0FDF4'
+        C_RED   = 'FEF2F2'
+        C_PURP  = 'F5F3FF'
+        C_TBLUE = 'EBF3FB'
+        MONEY   = '#,##0.00'
+        PCT     = '0.0%'
+
+        # ── Pre-compute totals ────────────────────────────────────────────────
+        total_income = sum(
+            float(r[3] or 0) for r in tx_rows
+            if r[6] == 'income' and str(r[5] or '').lower() != 'investment_transfer'
+        )
+        total_expenses = sum(
+            float(r[3] or 0) for r in tx_rows
+            if r[6] == 'expense' and float(r[3] or 0) >= 0
+        )
+        total_reimb = sum(
+            abs(float(r[3] or 0)) for r in tx_rows
+            if r[6] == 'expense' and float(r[3] or 0) < 0
+        )
+        net = total_income - total_expenses + total_reimb
+
+        cat_actuals: dict[str, float] = {}
+        for r in tx_rows:
+            if r[6] != 'expense' or float(r[3] or 0) < 0:
+                continue
+            cat = str(r[4] or 'Uncategorized').strip()
+            cat_actuals[cat] = cat_actuals.get(cat, 0.0) + float(r[3] or 0)
+
+        income_salary = sum(
+            float(r[3] or 0) for r in tx_rows
+            if r[6] == 'income'
+            and str(r[5] or '').lower() not in ('bonus', 'reimbursement', 'investment_transfer')
+        )
+        income_bonus = sum(
+            float(r[3] or 0) for r in tx_rows
+            if r[6] == 'income' and str(r[5] or '').lower() == 'bonus'
+        )
 
         wb = openpyxl.Workbook()
 
-        # ── Pre-compute totals ────────────────────────────────────────────────
-        total_income   = sum(float(r[3] or 0) for r in tx_rows if r[6] == 'income')
-        total_expenses = sum(float(r[3] or 0) for r in tx_rows if r[6] == 'expense' and float(r[3] or 0) >= 0)
-        total_reimb    = sum(abs(float(r[3] or 0)) for r in tx_rows if r[6] == 'expense' and float(r[3] or 0) < 0)
-        net_savings    = total_income - total_expenses + total_reimb
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET 1 — Monthly Budget  (A=Item | B=Budget | C=Actual | D=Remaining)
+        # ════════════════════════════════════════════════════════════════════
+        ws1 = wb.active
+        ws1.title = 'Monthly Budget'
 
-        # ── Sheet 1: Transaction Ledger ───────────────────────────────────────
-        ws_tx = wb.active
-        ws_tx.title = 'Transaction Ledger'
+        for col, w in zip('ABCD', [34, 16, 16, 16]):
+            ws1.column_dimensions[col].width = w
+
+        brow = 1  # running row cursor for this sheet
+
+        # Title banner
+        ws1.cell(brow, 1, f'Personal Monthly Budget — {label_month}')
+        ws1.cell(brow, 1).fill      = _fill(C_NAVY)
+        ws1.cell(brow, 1).font      = _fnt(bold=True, color=C_WHITE, size=14)
+        ws1.cell(brow, 1).alignment = _aln('center')
+        ws1.merge_cells(f'A{brow}:D{brow}')
+        ws1.row_dimensions[brow].height = 30
+        brow += 1
+
+        # Hint line
+        ws1.cell(brow, 1,
+                 '← Enter your targets in the "Budget" column. '
+                 'Remaining = Budget − Actual (updates automatically).')
+        ws1.cell(brow, 1).font      = _fnt(italic=True, size=9, color='555555')
+        ws1.cell(brow, 1).alignment = _aln()
+        ws1.merge_cells(f'A{brow}:D{brow}')
+        ws1.row_dimensions[brow].height = 14
+        brow += 1
+
+        ws1.freeze_panes = f'A{brow + 2}'
+
+        def _sec(label: str):
+            nonlocal brow
+            ws1.cell(brow, 1, label)
+            ws1.cell(brow, 1).fill      = _fill(C_BLUE)
+            ws1.cell(brow, 1).font      = _fnt(bold=True, color=C_WHITE, size=11)
+            ws1.cell(brow, 1).alignment = _aln()
+            ws1.merge_cells(f'A{brow}:D{brow}')
+            ws1.row_dimensions[brow].height = 20
+            brow += 1
+
+        def _col_hdrs():
+            nonlocal brow
+            for ci, hdr in enumerate(['Item', 'Budget', 'Actual', 'Remaining'], 1):
+                c = ws1.cell(brow, ci, hdr)
+                c.fill      = _fill(C_LBLUE)
+                c.font      = _fnt(bold=True, size=10)
+                c.alignment = _aln('center' if ci > 1 else 'left')
+            ws1.row_dimensions[brow].height = 18
+            brow += 1
+
+        def _brow_data(label: str, actual: float,
+                       indent=False, is_total=False, bg: str | None = None):
+            nonlocal brow
+            txt = ('    ' if indent else '') + label
+            if is_total:
+                bg_c = C_GREEN if 'INCOME' in label else C_RED
+            else:
+                bg_c = bg or (C_GREY if brow % 2 == 0 else C_WHITE)
+            ws1.cell(brow, 1, txt)
+            ws1.cell(brow, 2, '')
+            ws1.cell(brow, 3, round(actual, 2))
+            ws1.cell(brow, 4, f'=B{brow}-C{brow}')
+            for ci in range(1, 5):
+                c = ws1.cell(brow, ci)
+                c.fill      = _fill(bg_c)
+                c.alignment = _aln('right' if ci > 1 else 'left')
+            for ci in (2, 3, 4):
+                ws1.cell(brow, ci).number_format = MONEY
+            if is_total:
+                for ci in range(1, 5):
+                    ws1.cell(brow, ci).font = _fnt(bold=True, size=11)
+            elif indent:
+                ws1.cell(brow, 1).font = _fnt(italic=True, size=10)
+            ws1.row_dimensions[brow].height = 17
+            brow += 1
+
+        # Income section
+        _sec('INCOME')
+        _col_hdrs()
+        _brow_data('Salary / Paycheck', income_salary, bg=C_GREEN)
+        if income_bonus > 0:
+            _brow_data('Bonus / Extra', income_bonus, bg=C_GREEN)
+        _brow_data('TOTAL INCOME', total_income, is_total=True)
+        total_income_brow = brow - 1
+        brow += 1
+
+        # Expenses section — categories come from categories.json
+        _sec('EXPENSES')
+        _col_hdrs()
+
+        for cat in top_level:
+            children = subcats.get(cat, [])
+            if children:
+                parent_actual = (
+                    cat_actuals.get(cat, 0.0)
+                    + sum(cat_actuals.get(c, 0.0) for c in children)
+                )
+                _brow_data(cat, parent_actual, bg=C_TBLUE)
+                ws1.cell(brow - 1, 1).font = _fnt(bold=True, size=10)
+                for child in children:
+                    _brow_data(child, cat_actuals.get(child, 0.0), indent=True)
+            else:
+                _brow_data(cat, cat_actuals.get(cat, 0.0))
+
+        # Any spend not in categories.json
+        known_cats = set(all_cats)
+        uncategorized = (
+            cat_actuals.get('Uncategorized', 0.0)
+            + sum(v for k, v in cat_actuals.items()
+                  if k not in known_cats and k != 'Uncategorized')
+        )
+        if uncategorized > 0:
+            _brow_data('Uncategorized', uncategorized)
+
+        _brow_data('TOTAL EXPENSES', total_expenses, is_total=True)
+        total_expense_brow = brow - 1
+        brow += 1
+
+        # Summary
+        _sec('SUMMARY')
+        net_bg = C_GREEN if net >= 0 else C_RED
+        ws1.cell(brow, 1, 'Net Savings  (Income − Expenses)')
+        ws1.cell(brow, 2, '')
+        ws1.cell(brow, 3, round(net, 2))
+        ws1.cell(brow, 4, f'=C{total_income_brow}-C{total_expense_brow}')
+        for ci in range(1, 5):
+            c = ws1.cell(brow, ci)
+            c.fill      = _fill(net_bg)
+            c.font      = _fnt(bold=True, size=11)
+            c.alignment = _aln('right' if ci > 1 else 'left')
+        ws1.cell(brow, 3).number_format = MONEY
+        ws1.cell(brow, 4).number_format = MONEY
+        ws1.row_dimensions[brow].height = 22
+        brow += 1
+
+        savings_rate = net / total_income if total_income > 0 else 0
+        ws1.cell(brow, 1, 'Savings Rate')
+        ws1.cell(brow, 3, savings_rate)
+        ws1.cell(brow, 1).font = _fnt(italic=True, size=10)
+        ws1.cell(brow, 3).number_format = PCT
+
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET 2 — Transactions  (no Frequency column)
+        # Date | Type | Description | Category | Amount | Notes
+        # ════════════════════════════════════════════════════════════════════
+        ws2 = wb.create_sheet('Transactions')
+
+        ws2.append([f'Transactions — {label_month}'])
+        ws2.merge_cells('A1:F1')
+        t = ws2.cell(1, 1)
+        t.fill      = _fill(C_NAVY)
+        t.font      = _fnt(bold=True, color=C_WHITE, size=13)
+        t.alignment = _aln('center')
+        ws2.row_dimensions[1].height = 26
+
+        tx_headers = ['Date', 'Type', 'Description', 'Category', 'Amount', 'Notes']
+        tx_widths  = [13,     14,     36,             22,         14,       32     ]
+        ws2.append(tx_headers)
+        for i, _ in enumerate(tx_headers, 1):
+            c = ws2.cell(2, i)
+            c.fill      = _fill(C_BLUE)
+            c.font      = _fnt(bold=True, color=C_WHITE, size=10)
+            c.alignment = _aln('center')
+        ws2.row_dimensions[2].height = 19
+        ws2.freeze_panes = 'A3'
+        for i, w in enumerate(tx_widths, 1):
+            ws2.column_dimensions[get_column_letter(i)].width = w
+        ws2.auto_filter.ref = f"A2:F{len(tx_rows) + 2}"
+
+        TYPE_LABELS = {'expense': '💸 Expense', 'income': '💵 Income'}
+
+        for ri, tx in enumerate(tx_rows, 3):
+            _, tx_date, place, amount, category, label, tx_type = tx
+            amount_val = round(float(amount or 0), 2)
+            is_reimb   = tx_type == 'expense' and amount_val < 0
+            type_label = '↩️ Reimb.' if is_reimb else TYPE_LABELS.get(tx_type, tx_type.title())
+
+            ws2.append([str(tx_date or ''), type_label, str(place or ''),
+                        str(category or ''), amount_val, ''])
+
+            if tx_type == 'income':
+                row_bg = C_GREEN
+            elif is_reimb:
+                row_bg = C_PURP
+            else:
+                row_bg = C_RED if ri % 2 == 0 else C_GREY
+
+            for ci in range(1, 7):
+                c = ws2.cell(ri, ci)
+                c.fill      = _fill(row_bg)
+                c.alignment = _aln('center' if ci in (1, 2) else 'left',
+                                   wrap=(ci == 6))
+
+            amt_c = ws2.cell(ri, 5)
+            amt_c.number_format = MONEY
+            amt_c.alignment     = _aln('right')
+            if tx_type == 'income':
+                amt_c.font = _fnt(color='166534', bold=True)
+            elif is_reimb:
+                amt_c.font = _fnt(color='5B21B6', bold=True)
+
+        # Net row
+        net_row = len(tx_rows) + 3
+        ws2.append(['', '', '', 'NET', round(net, 2), ''])
+        for ci in range(1, 7):
+            c = ws2.cell(net_row, ci)
+            c.fill = _fill(C_NAVY)
+            c.font = _fnt(bold=True, color=C_WHITE, size=11)
+        ws2.cell(net_row, 5).number_format = MONEY
+        ws2.cell(net_row, 5).alignment = _aln('right')
+
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET 3 — Category Detail
+        # ════════════════════════════════════════════════════════════════════
+        ws3 = wb.create_sheet('Category Detail')
+
+        ws3.append([f'Category Detail — {label_month}'])
+        ws3.merge_cells('A1:F1')
+        h = ws3.cell(1, 1)
+        h.fill      = _fill(C_NAVY)
+        h.font      = _fnt(bold=True, color=C_WHITE, size=13)
+        h.alignment = _aln('center')
+        ws3.row_dimensions[1].height = 26
+
+        cd_hdrs   = ['Category', 'Total Spent', 'Transactions', 'Avg / Transaction',
+                     '% of Expenses', '% of Income']
+        cd_widths = [28, 16, 14, 20, 16, 14]
+        ws3.append(cd_hdrs)
+        for i, _ in enumerate(cd_hdrs, 1):
+            c = ws3.cell(2, i)
+            c.fill      = _fill(C_BLUE)
+            c.font      = _fnt(bold=True, color=C_WHITE, size=10)
+            c.alignment = _aln('center')
+        ws3.row_dimensions[2].height = 19
+        ws3.freeze_panes = 'A3'
+        ws3.auto_filter.ref = 'A2:F2'
+        for i, w in enumerate(cd_widths, 1):
+            ws3.column_dimensions[get_column_letter(i)].width = w
+
+        cat_agg: dict = {}
+        for tx in tx_rows:
+            _, _, _, amount, category, _, tx_type = tx
+            amount_val = round(float(amount or 0), 2)
+            if tx_type != 'expense' or amount_val < 0:
+                continue
+            cat = str(category or 'Uncategorized')
+            if cat not in cat_agg:
+                cat_agg[cat] = {'total': 0.0, 'count': 0}
+            cat_agg[cat]['total'] += amount_val
+            cat_agg[cat]['count'] += 1
+
+        sorted_cats = sorted(cat_agg.items(), key=lambda x: -x[1]['total'])
+
+        for i, (cat, data) in enumerate(sorted_cats):
+            rn      = i + 3
+            avg     = data['total'] / data['count'] if data['count'] else 0
+            pct_exp = data['total'] / total_expenses if total_expenses > 0 else 0
+            pct_inc = data['total'] / total_income   if total_income   > 0 else ''
+            ws3.append([cat, round(data['total'], 2), data['count'], round(avg, 2),
+                        pct_exp, pct_inc])
+            bg = C_GREY if i % 2 == 0 else C_WHITE
+            for ci in range(1, 7):
+                ws3.cell(rn, ci).fill = _fill(bg)
+            for ci in (2, 4):
+                ws3.cell(rn, ci).number_format = MONEY
+                ws3.cell(rn, ci).alignment = _aln('right')
+            ws3.cell(rn, 3).alignment = _aln('right')
+            for ci in (5, 6):
+                if pct_inc != '' or ci == 5:
+                    ws3.cell(rn, ci).number_format = PCT
+                    ws3.cell(rn, ci).alignment = _aln('right')
+
+        # Grand-total row
+        gt_row   = len(sorted_cats) + 3
+        gt_total = sum(d['total'] for _, d in sorted_cats)
+        gt_count = sum(d['count'] for _, d in sorted_cats)
+        ws3.append(['TOTAL EXPENSES', round(gt_total, 2), gt_count, '',
+                    1.0 if sorted_cats else '', ''])
+        for ci in range(1, 7):
+            c = ws3.cell(gt_row, ci)
+            c.fill = _fill(C_NAVY)
+            c.font = _fnt(bold=True, color=C_WHITE, size=11)
+        ws3.cell(gt_row, 2).number_format = MONEY
+        ws3.cell(gt_row, 2).alignment = _aln('right')
+        ws3.cell(gt_row, 5).number_format = PCT
+
+        # ── Serialise ─────────────────────────────────────────────────────────
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        filename = f"budget_{month or 'all'}.xlsx"
+        return StreamingResponse(
+            buf,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+        )
+
+    except Exception as exc:
+        logging.exception('Excel export failed')
+        return JSONResponse(status_code=500, content={'error': str(exc)})
+
 
         # Title banner
         ws_tx.append([f'Personal Budget — {label_month}'])

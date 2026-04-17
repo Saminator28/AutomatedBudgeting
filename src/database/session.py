@@ -31,10 +31,41 @@ def get_engine(db_path: Path = _DB_PATH):
 def init_db(db_path: Path = _DB_PATH):
     """
     Create all tables if they do not already exist.
+    Also applies lightweight migrations for columns added after initial creation.
     Safe to call multiple times (CREATE TABLE IF NOT EXISTS semantics).
     """
+    from sqlalchemy import text
     engine = get_engine(db_path)
     metadata.create_all(engine)
+    # ── Lightweight column migrations ─────────────────────────────────────────
+    # These ALTER TABLE statements are idempotent — they fail silently if the
+    # column already exists (SQLite raises OperationalError for duplicate column).
+    _migrations = [
+        "ALTER TABLE auto_deleted_transactions ADD COLUMN keyword_matched TEXT",
+        "ALTER TABLE auto_deleted_transactions ADD COLUMN seen_months TEXT DEFAULT '[]'",
+        "ALTER TABLE auto_deleted_transactions ADD COLUMN tx_type TEXT",
+        "ALTER TABLE auto_deleted_transactions ADD COLUMN category TEXT",
+        "ALTER TABLE auto_deleted_transactions ADD COLUMN original_statement TEXT",
+        # keyword source tracking (default/user/learned)
+        "ALTER TABLE investment_keywords ADD COLUMN source TEXT NOT NULL DEFAULT 'default'",
+        "ALTER TABLE income_keywords ADD COLUMN source TEXT NOT NULL DEFAULT 'default'",
+        "ALTER TABLE ignore_keywords ADD COLUMN source TEXT NOT NULL DEFAULT 'default'",
+        "ALTER TABLE payment_app_keywords ADD COLUMN source TEXT NOT NULL DEFAULT 'default'",
+        "ALTER TABLE transfer_keywords ADD COLUMN source TEXT NOT NULL DEFAULT 'default'",
+        # source_statement: tracks which statement folder each transaction came from
+        # so reprocessing month M cleans ALL its rows regardless of report_month.
+        "ALTER TABLE transactions ADD COLUMN source_statement TEXT",
+        # Backfill: approximate existing rows as coming from their current report_month.
+        # Cross-month rows will be corrected on the next reprocess of the source statement.
+        "UPDATE transactions SET source_statement = report_month WHERE source_statement IS NULL",
+    ]
+    with engine.connect() as conn:
+        for stmt in _migrations:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # column already exists — ignore
     return engine
 
 

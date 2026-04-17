@@ -36,8 +36,9 @@ RUN npm install && npm run build
 WORKDIR /app
 
 # Copy and set entrypoint script as executable
+# sed strips Windows CRLF line endings that break the shebang on Linux
 COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
 
 # Create necessary directories
 RUN mkdir -p statements monthly_reports logs

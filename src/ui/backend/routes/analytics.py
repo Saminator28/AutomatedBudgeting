@@ -3,6 +3,7 @@
 import json
 import logging
 import math
+import os
 from pathlib import Path
 
 import requests
@@ -14,7 +15,17 @@ from src.ui.backend.deps import (
     _query_df,
 )
 
+_OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
+
 router = APIRouter()
+
+
+def _strip_one_time(df) -> object:
+    """Remove label='one-time' rows so forecasts/insights/budgets use only recurring spending."""
+    lbl = next((c for c in df.columns if c.lower() == 'label'), None)
+    if lbl is None:
+        return df
+    return df[df[lbl].astype(str).str.strip().str.lower() != 'one-time'].copy()
 
 
 # ── Insights ──────────────────────────────────────────────────────────────────
@@ -29,6 +40,7 @@ def get_monthly_insights(month: str):
         expenses_df = _query_df('expense', months=[month])
         if expenses_df.empty:
             return JSONResponse(status_code=404, content={"error": f"No data found for {month}"})
+        expenses_df = _strip_one_time(expenses_df)
 
         year, month_num = map(int, month.split('-'))
         prev_month_num = month_num - 1 if month_num > 1 else 12
@@ -37,6 +49,8 @@ def get_monthly_insights(month: str):
         prev_expenses_df = _query_df('expense', months=[prev_month])
         if prev_expenses_df.empty:
             prev_expenses_df = None
+        else:
+            prev_expenses_df = _strip_one_time(prev_expenses_df)
 
         model_loader = None
         try:
@@ -74,6 +88,7 @@ def get_budget_forecast(months_ahead: int = 1, savings_goal: float = None,
         if historical_df.empty:
             return JSONResponse(status_code=404, content={"error": "No historical data found"})
 
+        historical_df = _strip_one_time(historical_df)
         historical_df = historical_df.fillna('')
         n_months = historical_df['month'].nunique() if 'month' in historical_df.columns else 1
 
@@ -128,6 +143,7 @@ def get_spending_trends(months: int = 6):
         if historical_df.empty:
             return JSONResponse(status_code=404, content={"error": "No historical data found"})
 
+        historical_df = _strip_one_time(historical_df)
         forecaster = BudgetForecaster(use_ai=False)
         return forecaster.analyze_trends(historical_df, months)
 
@@ -218,9 +234,19 @@ def get_budget_comparison(month: str):
     try:
         from src.ai_analysis.budget_advisor import BudgetAdvisor
 
-        expenses_df = _query_df('expense', months=[month])
-        if expenses_df.empty:
+        all_expenses_df = _query_df('expense', months=[month])
+        if all_expenses_df.empty:
             return JSONResponse(status_code=404, content={"error": f"No data for month {month}"})
+
+        # Split one-time out before budget comparison so actual spend reflects only recurring
+        _lbl = next((c for c in all_expenses_df.columns if c.lower() == 'label'), None)
+        if _lbl:
+            _ot_mask = all_expenses_df[_lbl].astype(str).str.strip().str.lower() == 'one-time'
+            one_time_total = round(float(all_expenses_df.loc[_ot_mask, 'Amount'].sum()), 2)
+            expenses_df = all_expenses_df[~_ot_mask].copy()
+        else:
+            one_time_total = 0.0
+            expenses_df = all_expenses_df
 
         budget_file = _PROJECT_ROOT / 'config' / 'budgets.json'
         if not budget_file.exists():
@@ -235,6 +261,7 @@ def get_budget_comparison(month: str):
 
         advisor = BudgetAdvisor(use_ai=False)
         comparison = advisor.compare_to_budget(expenses_df, budget_goals)
+        comparison['one_time_total'] = one_time_total
         comparison['month'] = month
         return comparison
 
@@ -275,7 +302,7 @@ async def check_chat_availability():
             return {"available": False, "model_name": None}
 
         try:
-            resp = requests.get('http://localhost:11434/api/tags', timeout=3)
+            resp = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
             model_names = [m['name'] for m in resp.json().get('models', [])]
             is_available = any(
                 model_name in name or name.startswith(model_name + ':')
@@ -315,7 +342,7 @@ async def chat_with_assistant(request: dict = Body(...)):
 
         if model_name:
             try:
-                resp = requests.get('http://localhost:11434/api/tags', timeout=3)
+                resp = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
                 model_names = [m['name'] for m in resp.json().get('models', [])]
                 is_available = any(
                     model_name in name or name.startswith(model_name + ':')

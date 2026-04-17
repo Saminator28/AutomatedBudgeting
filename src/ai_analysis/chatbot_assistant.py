@@ -19,6 +19,7 @@ Architecture: Two-Model Pipeline
      suggestions, savings plans, and goal adjustments.
 """
 
+import os
 import pandas as pd
 import json
 import logging
@@ -28,6 +29,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+
+_OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +262,12 @@ class ChatbotAssistant:
             with eng.connect() as conn:
                 rows = conn.execute(_text(
                     "SELECT tx_date, place, amount, category "
-                    "FROM transactions WHERE tx_type='expense' AND report_month=:m "
+                    "FROM transactions WHERE tx_type='expense' "
+                    "AND INSTR(tx_date, '/') > 0 "
+                    "AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+                    ")=:m "
                     "ORDER BY tx_date"
                 ), {'m': month}).fetchall()
             if not rows:
@@ -565,7 +573,7 @@ Rules:
 
         try:
             _resp = requests.post(
-                'http://localhost:11434/api/chat',
+                f'{_OLLAMA_HOST}/api/chat',
                 json={
                     'model': self.intent_model,
                     'messages': [{"role": "user", "content": prompt}],
@@ -1024,7 +1032,7 @@ For all other requests, answer in plain conversational text."""
 
         try:
             _resp = requests.post(
-                'http://localhost:11434/api/chat',
+                f'{_OLLAMA_HOST}/api/chat',
                 json={
                     'model': self.finance_model,
                     'messages': messages,

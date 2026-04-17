@@ -96,16 +96,24 @@ def set_expense_label(payload: dict = Body(...)):
 
 @router.get("/api/available-months")
 def get_available_months():
-    """Return sorted list of months that have expense transactions in the DB."""
+    """Return sorted list of calendar months (YYYY-MM) derived from actual
+    transaction dates, so a July-dated row in an August statement appears
+    under July, not August."""
     if _DB_AVAILABLE:
         try:
             from sqlalchemy import text as _text
             with get_engine().connect() as conn:
                 rows = conn.execute(_text(
-                    "SELECT DISTINCT report_month FROM transactions "
-                    "WHERE tx_type='expense' ORDER BY report_month DESC"
+                    "SELECT DISTINCT "
+                    "CASE WHEN INSTR(tx_date, '/') > 0 THEN "
+                    "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER)) "
+                    "ELSE '' END AS tx_month "
+                    "FROM transactions WHERE tx_type='expense' "
+                    "AND tx_date IS NOT NULL AND tx_date != '' "
+                    "ORDER BY tx_month DESC"
                 )).fetchall()
-            return [r[0] for r in rows]
+            return [r[0] for r in rows if r[0]]
         except Exception as exc:
             logging.warning(f"DB available-months query failed: {exc}")
     return []
@@ -115,18 +123,32 @@ def get_available_months():
 
 @router.get("/api/all-expenses")
 def get_all_expenses(month: str = None, category: str = None, search: str = None):
-    """Return expense rows from the DB, optionally filtered by month/category/search."""
+    """Return expense rows from the DB, optionally filtered by month/category/search.
+    The 'month' filter and the 'month' field in the response both use the calendar
+    month of the actual transaction date (MM/DD/YYYY → YYYY-MM), so transactions are
+    always grouped by when they occurred, not which statement they came from.
+    """
     if _DB_AVAILABLE:
         try:
             from sqlalchemy import text as _text
             query = (
                 "SELECT tx_hash, tx_date, place, amount, category, label, statement, "
-                "report_month, rowid AS row_idx "
-                "FROM transactions WHERE tx_type='expense'"
+                "report_month, rowid AS row_idx, tx_type, "
+                "CASE WHEN INSTR(tx_date, '/') > 0 THEN "
+                "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
+                "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER)) "
+                "ELSE '' END AS tx_month "
+                "FROM transactions WHERE tx_type IN ('expense', 'transfer')"
             )
             params: dict = {}
             if month:
-                query += " AND report_month = :month"
+                query += (
+                    " AND INSTR(tx_date, '/') > 0"
+                    " AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date) - 3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date, '/') - 1) AS INTEGER))"
+                    ") = :month"
+                )
                 params['month'] = month
             if category:
                 query += " AND lower(category) = lower(:category)"
@@ -134,7 +156,7 @@ def get_all_expenses(month: str = None, category: str = None, search: str = None
             if search:
                 query += " AND lower(place) LIKE lower(:search)"
                 params['search'] = f'%{search}%'
-            query += " ORDER BY report_month DESC, tx_date"
+            query += " ORDER BY tx_date DESC, place"
             with get_engine().connect() as conn:
                 result = conn.execute(_text(query), params).fetchall()
             return [
@@ -146,8 +168,9 @@ def get_all_expenses(month: str = None, category: str = None, search: str = None
                     'category':  r[4] or '',
                     'label':     r[5] or 'recurring',
                     'statement': r[6] or '',
-                    'month':     r[7] or '',
+                    'month':     r[10] or r[7] or '',
                     'row_idx':   r[8],
+                    'tx_type':   r[9] or 'expense',
                 }
                 for r in result
             ]
@@ -169,14 +192,50 @@ def delete_transaction(tx_hash: str):
         from sqlalchemy import text as _text
         with get_engine().connect() as conn:
             row = conn.execute(
-                _text("SELECT place, amount, tx_type FROM transactions WHERE tx_hash = :h"),
+                _text("SELECT place, amount, tx_type, category, report_month, tx_date, statement "
+                      "FROM transactions WHERE tx_hash = :h"),
                 {'h': tx_hash}
             ).fetchone()
             if row is None:
                 return JSONResponse(status_code=404, content={'error': 'Transaction not found'})
             conn.execute(_text("DELETE FROM transactions WHERE tx_hash = :h"), {'h': tx_hash})
             conn.commit()
-        logging.info(f"🗑️ Deleted transaction {tx_hash} ({row[0]} ${row[1]})")
+        place, amount, tx_type, category, report_month, tx_date, statement = row
+        logging.info(f"🗑️ Deleted transaction {tx_hash} ({place} ${amount})")
+        # Log the manual deletion to auto_deleted_transactions so it shows in Settings
+        try:
+            from src.database.db_utils import log_auto_deleted as _log_auto_deleted
+            _log_auto_deleted(
+                get_engine(),
+                place=str(place or ''),
+                amount=float(amount or 0),
+                tx_date=str(tx_date or ''),
+                report_month=str(report_month or ''),
+                reason='manual_delete',
+                keyword_matched='',
+                tx_type=str(tx_type or ''),
+                category=str(category or ''),
+                original_statement=str(statement or ''),
+            )
+        except Exception as _log_exc:
+            logging.warning(f"auto-filter log failed: {_log_exc}")
+        # If the deleted row was investment-related, rebuild transfers for that month.
+        # Use the calendar month derived from tx_date (YYYY-MM) rather than report_month
+        # to match what _rebuild_transfers_for_month uses internally.
+        is_investment = (
+            str(category or '').strip() in _INVESTMENT_CATEGORIES
+            or tx_type == 'income' and any(kw in str(place or '').lower() for kw in ['fidelity', 'vanguard', 'schwab', 'etrade', 'robinhood', 'coinbase'])
+        )
+        if is_investment and tx_date:
+            try:
+                calendar_month = pd.to_datetime(str(tx_date)).strftime('%Y-%m')
+            except Exception as _parse_exc:
+                logging.warning(f"Failed to derive calendar month from tx_date '{tx_date}': {_parse_exc}")
+                calendar_month = report_month  # fall back to report_month
+            try:
+                _rebuild_transfers_for_month(calendar_month)
+            except Exception as exc:
+                logging.warning(f"Transfer rebuild after delete failed: {exc}")
         return {'success': True}
     except Exception as exc:
         logging.exception("Failed to delete transaction")
@@ -211,7 +270,12 @@ def edit_expense(payload: dict = Body(...)):
             with _eng.connect() as conn:
                 old_row = conn.execute(_text(
                     "SELECT category FROM transactions "
-                    "WHERE tx_type='expense' AND report_month=:m "
+                    "WHERE tx_type='expense' "
+                    "AND INSTR(tx_date, '/') > 0 "
+                    "AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+                    ")=:m "
                     "AND tx_date=:d AND UPPER(place)=UPPER(:p) "
                     "AND ROUND(amount,2)=ROUND(:a,2) LIMIT 1"
                 ), {'m': month, 'd': date, 'p': original_place, 'a': amount}).fetchone()
@@ -232,7 +296,12 @@ def edit_expense(payload: dict = Body(...)):
             if set_clauses:
                 sql = (
                     f"UPDATE transactions SET {', '.join(set_clauses)} "
-                    "WHERE tx_type='expense' AND report_month=:m "
+                    "WHERE tx_type='expense' "
+                    "AND INSTR(tx_date, '/') > 0 "
+                    "AND ("
+                    "SUBSTR(tx_date, LENGTH(tx_date)-3, 4) || '-' || "
+                    "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
+                    ")=:m "
                     "AND tx_date=:d AND UPPER(place)=UPPER(:p) "
                     "AND ROUND(amount,2)=ROUND(:a,2)"
                 )
@@ -334,21 +403,28 @@ def get_expense_categories(month: str = None):
         if not month:
             return []
 
-    exp_df = _query_df('expense', months=[month])
-    inc_df = _query_df('income', months=[month])
+    exp_df = _query_df('expense', date_months=[month])
+    inc_df = _query_df('income', date_months=[month])
 
     if exp_df.empty and inc_df.empty:
         return []
 
     category_totals: dict = defaultdict(float)
+    one_time_total = 0.0
 
     if not exp_df.empty and 'category' in exp_df.columns:
+        _lbl_col = next((c for c in exp_df.columns if c.lower() == 'label'), None)
         for _, row in exp_df.iterrows():
             cat = str(row.get('category', '')).strip() or 'Uncategorized'
+            row_lbl = str(row.get(_lbl_col, '')).strip().lower() if _lbl_col else ''
             try:
-                category_totals[cat] += float(row.get('Amount', 0) or 0)
+                amt = float(row.get('Amount', 0) or 0)
             except Exception:
-                pass
+                amt = 0.0
+            if row_lbl == 'one-time':
+                one_time_total += amt
+            else:
+                category_totals[cat] += amt
 
     if not inc_df.empty:
         for _, row in inc_df.iterrows():
@@ -360,16 +436,24 @@ def get_expense_categories(month: str = None):
             except Exception:
                 pass
 
-    return [
+    result = [
         {'category': cat, 'amount': round(total, 2)}
         for cat, total in category_totals.items()
         if cat
     ]
+    if one_time_total > 0:
+        result.append({'category': '⚡ Unusual Spending', 'amount': round(one_time_total, 2), 'one_time': True})
+    return result
 
 
 @router.get("/api/expenses-by-month")
 def get_expenses_by_month():
-    """Return per-category totals for every available month (for trend chart)."""
+    """Return per-category totals for every available month (for trend chart).
+
+    Groups by the calendar month of the actual transaction date, not the
+    statement's report_month, so off-cycle transactions (e.g. July-dated rows
+    in an August billing statement) are counted in the correct month.
+    """
     subcategories = {}
     try:
         with open(_CONFIG_ROOT / 'categories.json') as f:
@@ -378,33 +462,61 @@ def get_expenses_by_month():
         pass
     sub_to_parent = {sub: parent for parent, subs in subcategories.items() for sub in subs}
 
+    def _tx_date_month(d: str) -> str:
+        """Parse MM/DD/YYYY → YYYY-MM."""
+        if not d:
+            return ''
+        parts = str(d).strip().split('/')
+        if len(parts) == 3:
+            return f'{parts[2][:4]}-{parts[0].zfill(2)}'
+        return ''
+
     exp_df = _query_df('expense')
     inc_df = _query_df('income')
 
     if exp_df.empty and inc_df.empty:
         return []
 
+    if not exp_df.empty:
+        exp_df = exp_df.copy()
+        exp_df['tx_month'] = exp_df['Transaction Date'].apply(_tx_date_month)
+        _lbl = next((c for c in exp_df.columns if c.lower() == 'label'), None)
+        exp_df['_is_one_time'] = (exp_df[_lbl].astype(str).str.strip().str.lower() == 'one-time') if _lbl else False
+    if not inc_df.empty:
+        inc_df = inc_df.copy()
+        inc_df['tx_month'] = inc_df['Transaction Date'].apply(_tx_date_month)
+
     months_set: set = set()
-    if not exp_df.empty and 'month' in exp_df.columns:
-        months_set.update(exp_df['month'].dropna().unique())
-    if not inc_df.empty and 'month' in inc_df.columns:
-        months_set.update(inc_df['month'].dropna().unique())
+    if not exp_df.empty and 'tx_month' in exp_df.columns:
+        months_set.update(m for m in exp_df['tx_month'].dropna().unique() if m)
+    if not inc_df.empty and 'tx_month' in inc_df.columns:
+        months_set.update(m for m in inc_df['tx_month'].dropna().unique() if m)
 
     results = []
     for month_str in sorted(months_set):
         category_totals: dict = defaultdict(float)
 
-        exp_month = exp_df[exp_df['month'] == month_str] if not exp_df.empty else pd.DataFrame()
+        exp_month = exp_df[exp_df['tx_month'] == month_str] if not exp_df.empty else pd.DataFrame()
         if not exp_month.empty and 'category' in exp_month.columns:
-            for _, row in exp_month.iterrows():
+            has_flag = '_is_one_time' in exp_month.columns
+            ot_month = exp_month[exp_month['_is_one_time'] == True] if has_flag else pd.DataFrame()
+            reg_month = exp_month[exp_month['_is_one_time'] != True] if has_flag else exp_month
+            for _, row in reg_month.iterrows():
                 cat = str(row.get('category', '')).strip() or 'Uncategorized'
                 cat = sub_to_parent.get(cat, cat)
                 try:
                     category_totals[cat] += float(row.get('Amount', 0) or 0)
                 except Exception:
                     pass
+            if not ot_month.empty:
+                try:
+                    ot_total = float(ot_month['Amount'].sum())
+                    if ot_total > 0:
+                        category_totals['⚡ Unusual Spending'] += ot_total
+                except Exception:
+                    pass
 
-        inc_month = inc_df[inc_df['month'] == month_str] if not inc_df.empty else pd.DataFrame()
+        inc_month = inc_df[inc_df['tx_month'] == month_str] if not inc_df.empty else pd.DataFrame()
         if not inc_month.empty:
             for _, row in inc_month.iterrows():
                 if str(row.get('Label', '')).strip().lower() != 'reimbursement':
