@@ -556,6 +556,77 @@ def aggregate_by_transaction_month(debug: bool = False):
     print(f"\n✓ Aggregation complete — data written to DB")
     print("="*70)
 
+    # ── Snapshot budget goals → budget_history ────────────────────────────────
+    # For every month that now exists in the transactions table, if the user has
+    # saved budget goals, write one budget_history row per category so the Month
+    # Report Card and trend charts have data to display.
+    if _db_engine is not None:
+        try:
+            with _db_engine.connect() as conn:
+                goal_rows = conn.execute(_text(
+                    "SELECT category, goal_amount FROM budget_goals WHERE goal_amount IS NOT NULL"
+                )).fetchall()
+
+            if goal_rows:
+                budget_map = {r[0]: float(r[1]) for r in goal_rows}
+
+                # Get all distinct expense months currently in the DB
+                with _db_engine.connect() as conn:
+                    month_rows = conn.execute(_text(
+                        "SELECT DISTINCT report_month FROM transactions "
+                        "WHERE tx_type='expense' ORDER BY report_month"
+                    )).fetchall()
+                expense_months = [r[0] for r in month_rows if r[0]]
+
+                from datetime import datetime, timezone
+                now_iso = datetime.now(timezone.utc).isoformat()
+
+                for month in expense_months:
+                    # Compute actual spend per category for this month
+                    with _db_engine.connect() as conn:
+                        cat_rows = conn.execute(_text(
+                            "SELECT category, SUM(amount) "
+                            "FROM transactions "
+                            "WHERE tx_type='expense' AND report_month=:m "
+                            "  AND (label IS NULL OR label != 'one-time') "
+                            "GROUP BY category"
+                        ), {'m': month}).fetchall()
+                    actual_by_cat = {r[0]: float(r[1]) for r in cat_rows if r[0]}
+
+                    # Write a history row for every category that has a goal
+                    with _db_engine.connect() as conn:
+                        for category, goal_amt in budget_map.items():
+                            actual = actual_by_cat.get(category, 0.0)
+                            variance = actual - goal_amt
+                            variance_pct = (variance / goal_amt * 100) if goal_amt else 0.0
+                            conn.execute(_text("""
+                                INSERT INTO budget_history
+                                    (report_month, category, goal, actual, variance, variance_pct, created_at)
+                                VALUES (:m, :cat, :goal, :actual, :var, :vp, :ts)
+                                ON CONFLICT(report_month, category) DO UPDATE SET
+                                    goal        = excluded.goal,
+                                    actual      = excluded.actual,
+                                    variance    = excluded.variance,
+                                    variance_pct = excluded.variance_pct,
+                                    created_at  = excluded.created_at
+                            """), {
+                                'm':      month,
+                                'cat':    category,
+                                'goal':   goal_amt,
+                                'actual': actual,
+                                'var':    variance,
+                                'vp':     round(variance_pct, 2),
+                                'ts':     now_iso,
+                            })
+                        conn.commit()
+
+                if debug:
+                    total_goals = len(budget_map)
+                    print(f"\n  ✓ Wrote budget_history for {len(expense_months)} month(s), "
+                          f"{total_goals} goal(s) each")
+        except Exception as exc:
+            print(f"⚠  Budget history snapshot failed (non-fatal): {exc}")
+
 
 def main():
     """Main function."""

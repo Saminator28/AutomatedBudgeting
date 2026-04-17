@@ -531,12 +531,44 @@ For everything else, answer naturally with specific details from the data."""
         _this_year      = _now.year
         _last_year      = _now.year - 1
 
+        # Determine the latest month that actually has data so "last month" resolves correctly
+        _latest_data_month = _last_month_str
+        _available_months_str = ""
+        try:
+            from src.database.session import get_engine as _get_eng
+            from sqlalchemy import text as _sqlt
+            with _get_eng().connect() as _c:
+                _rows = _c.execute(_sqlt(
+                    "SELECT DISTINCT report_month FROM transactions ORDER BY report_month"
+                )).fetchall()
+            _available = [r[0] for r in _rows if r[0]]
+            if _available:
+                _latest_data_month = _available[-1]
+                _available_months_str = ", ".join(_available)
+        except Exception:
+            pass
+
+        # Load actual category list from config so the prompt stays in sync with user customizations
+        _cat_list: list = []
+        try:
+            _cat_cfg = Path(__file__).parent.parent.parent / 'config' / 'categories.json'
+            with open(_cat_cfg) as _cf:
+                _cat_list = json.load(_cf).get('categories', [])
+        except Exception:
+            pass
+        _cat_enum = ' | '.join(_cat_list) if _cat_list else (
+            'Dining | Shopping | Groceries | Entertainment | Alcohol/Bar | Utilities | '
+            'Transportation | Subscriptions | Gifts & Donations | Other'
+        )
+
         prompt = f"""You are an intent parser for a personal finance chatbot.
 Extract the user's intent from the message below and output ONLY valid JSON.
 
 Today's date: {_today_str}
+Months with data: {_available_months_str or 'unknown'}
+Latest month with data: {_latest_data_month}
 Temporal reference guide:
-  "last month" or "previous month" = {_last_month_str}
+  "last month" or "previous month" = {_latest_data_month}  (use the latest month with data, not calendar last month)
   "this month" or "current month"  = {_this_month_str}
   "this year"                      = {_this_year}
   "last year"                      = {_last_year}
@@ -550,7 +582,7 @@ Output a single JSON object with these fields (use null for unknown):
   "type": "expense_query | income_query | budget_request | savings_goal | goal_adjustment | general_advice",
   "period": "<YYYY-MM for a specific month | YYYY for a full year | null>",
   "months_window": <integer if user says 'last N months', else null>,
-  "category": "<Dining | Shopping | Groceries | Entertainment | Utilities | Health | Transportation | Subscriptions | Gifts & Donations | Home & Garden | Other | null>",
+  "category": "<{_cat_enum} | null>",
   "merchant": "<specific merchant name or null>",
   "action": "<total | average | max | min | list | count | null>",
   "goal_amount": <number or null>,
@@ -660,6 +692,8 @@ Rules:
             "shopping": "Shopping", "amazon": "Shopping",
             "groceries": "Groceries", "grocery": "Groceries",
             "entertainment": "Entertainment",
+            "alcohol": "Alcohol/Bar", "bar": "Alcohol/Bar", "liquor": "Alcohol/Bar",
+            "beer": "Alcohol/Bar", "wine": "Alcohol/Bar", "drinking": "Alcohol/Bar",
             "electricity": "Electric", "electric bill": "Electric", "electric": "Electric",
             "internet": "Internet/Cable", "cable": "Internet/Cable", "wifi": "Internet/Cable",
             "natural gas": "Natural Gas", "heating": "Natural Gas",
@@ -728,7 +762,17 @@ Rules:
             if 'month' in filtered_exp.columns:
                 if re.match(r'\d{4}-\d{2}$', period):
                     # Exact month: YYYY-MM
-                    filtered_exp = filtered_exp[filtered_exp['month'] == period]
+                    candidate = filtered_exp[filtered_exp['month'] == period]
+                    if candidate.empty and not filtered_exp.empty:
+                        # Requested month has no data — fall back to latest available month
+                        latest = sorted(filtered_exp['month'].unique())[-1]
+                        logger.warning(
+                            f"No data for requested period {period}, falling back to latest: {latest}"
+                        )
+                        self.conv_state.active_period = latest
+                        period = latest
+                        candidate = filtered_exp[filtered_exp['month'] == period]
+                    filtered_exp = candidate
                     if filtered_inc is not None and 'month' in filtered_inc.columns:
                         filtered_inc = filtered_inc[filtered_inc['month'] == period]
                 elif re.match(r'\d{4}$', period):
@@ -1055,7 +1099,22 @@ For all other requests, answer in plain conversational text."""
     def _calculate_facts_with_pandas(self, expenses_df: pd.DataFrame, user_message: str, income_df: Optional[pd.DataFrame] = None) -> str:
         """Provide simple summary stats and ALL transaction details - let LLM do the analysis"""
         if expenses_df.empty:
-            return "No expense data available for the requested period. Please process statements for YYYY-MM and try again."
+            # Build a helpful message listing what months are available
+            try:
+                from src.database.session import get_engine as _get_eng2
+                from sqlalchemy import text as _sqlt2
+                with _get_eng2().connect() as _c2:
+                    _avail = [r[0] for r in _c2.execute(_sqlt2(
+                        "SELECT DISTINCT report_month FROM transactions "
+                        "WHERE tx_type='expense' ORDER BY report_month"
+                    )).fetchall() if r[0]]
+                if _avail:
+                    return (f"No expense data for the requested period. "
+                            f"Available months: {', '.join(_avail)}. "
+                            f"Try asking about {_avail[-1]} instead.")
+            except Exception:
+                pass
+            return "No expense data available for the requested period. Please process statements first."
         
         # Determine column names
         amount_col = 'Amount' if 'Amount' in expenses_df.columns else 'amount'
@@ -1237,12 +1296,24 @@ For all other requests, answer in plain conversational text."""
                 return filtered_df
         
         if any(phrase in user_message for phrase in ['last month', 'previous month']):
-            # Calculate last month
-            first_of_current_month = current_date.replace(day=1)
-            last_month_date = first_of_current_month - timedelta(days=1)
-            month_name = last_month_date.strftime('%B').lower()
-            year = str(last_month_date.year)
-            logger.info(f"🔍 Detected 'last month': {month_name} {year}")
+            # Use the latest month that actually has data rather than calendar last month
+            if 'month' in expenses_df.columns and not expenses_df.empty:
+                latest_available = sorted(expenses_df['month'].unique())[-1]
+                try:
+                    latest_dt = datetime.strptime(latest_available, '%Y-%m')
+                    month_name = latest_dt.strftime('%B').lower()
+                    year = str(latest_dt.year)
+                except Exception:
+                    first_of_current_month = current_date.replace(day=1)
+                    last_month_date = first_of_current_month - timedelta(days=1)
+                    month_name = last_month_date.strftime('%B').lower()
+                    year = str(last_month_date.year)
+            else:
+                first_of_current_month = current_date.replace(day=1)
+                last_month_date = first_of_current_month - timedelta(days=1)
+                month_name = last_month_date.strftime('%B').lower()
+                year = str(last_month_date.year)
+            logger.info(f"🔍 Detected 'last month': using latest available {month_name} {year}")
         
         elif any(phrase in user_message for phrase in ['this month', 'current month']):
             month_name = current_date.strftime('%B').lower()

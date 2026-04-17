@@ -640,6 +640,55 @@ evenly so monthly budgets reflect the true recurring cost.
 
 ---
 
+### 24. Event-Based Spending Tracking
+**Priority:** Medium  
+**Complexity:** Low–Medium
+
+Group individual transactions under a named event (e.g. "Texas Vacation", "Wedding", "Home Renovation") so you can see exactly how much a specific event cost across all categories and dates.
+
+**How it works:**
+- User creates an event: name, optional date range, optional description
+- Transactions are tagged to an event manually from the All Transactions tab — either one at a time or with a bulk-select checkbox
+- Multiple events can coexist; a transaction can belong to at most one event
+- Event totals are computed live from the tagged transactions — no separate ledger needed
+
+**Events managed via a new Dashboard Events tab:**
+- Create / rename / delete events
+- Summary card per event: total spent, date range, # of transactions, breakdown by category
+- Expand an event to see the full transaction list (same inline-edit controls as the Transactions tab)
+- Remove a transaction from an event without deleting it
+
+**Tagging transactions from the Transactions tab:**
+- New "Event" column in the transaction table (blank if untagged)
+- Clicking the cell opens a dropdown of existing events + "New event…" option
+- Bulk-tag: select multiple rows via checkboxes → "Assign to event" action in the toolbar
+
+**Chatbot integration:**
+- "How much did I spend on the Texas vacation?" → chatbot filters by event tag and reports totals/breakdown
+- Intent model gains a new `event` field: `"event": "<event name or null>"`
+
+**Implementation notes:**
+
+*Database:*
+- New `events` table: `id`, `name` (unique), `description`, `date_start` (optional), `date_end` (optional), `created_at`
+- New `event_id` column on the `transactions` table (`INTEGER`, nullable, FK to `events.id`)
+- Index on `transactions.event_id` for fast event summaries
+
+*Backend:*
+- `GET /api/events` — list all events with computed totals (total_amount, tx_count, category breakdown)
+- `POST /api/events` — create event (`{ name, description, date_start, date_end }`)
+- `PATCH /api/events/:id` — rename / update description
+- `DELETE /api/events/:id` — delete event (clears `event_id` on linked transactions, does not delete transactions)
+- `POST /api/events/:id/transactions` — bulk-assign tx_hashes to an event (`{ tx_hashes: [...] }`)
+- `DELETE /api/events/:id/transactions` — bulk-remove tx_hashes from an event
+- Existing `/api/all-expenses` response gains an `event_id` and `event_name` field per row
+
+*Frontend:*
+- New `EventsTab.js` component, registered in the tab nav as `🎫 Events`
+- `TransactionsTab.js` — add "Event" column with the same inline-dropdown pattern used for category edits; add checkbox column + "Assign to event" toolbar button for bulk tagging
+
+---
+
 ## Ideas Under Consideration
 
 These don't have a clear implementation plan yet but have been requested:
@@ -649,3 +698,311 @@ These don't have a clear implementation plan yet but have been requested:
 - **Shared expense splitting** — handle joint accounts and split expenses between people
 - **Net worth tracking** — include investment account balances alongside spending data
 - **Dark mode** — for the dashboard UI
+
+---
+
+## Implementation Design: Budget & Goals Tab Redesign
+
+### Problem Statement
+
+The current "Budget & Goals" tab (`InsightsPanel.js` → `planSection === 'budget'`) has the right bones but the wrong mental model. The key issues:
+
+1. **Wrong baseline** — AI suggestions currently use `average_spend ± 10%`. They are not anchored to income at all unless Ollama is running, and even then the prompt uses gross income rather than the after-tax take-home that actually flows through bank statements.
+2. **No budget philosophy** — the user has no guide for *how* to set a budget. The table just dumps AI numbers with no context.
+3. **Post-month-only feedback** — because statements are processed at month-end, there is nothing to track *during* the month. The design should lean into this reality rather than fighting it.
+4. **Goals are fragile** — goals are stored in `config/budgets.json` as a flat `{category: amount}` map. There is no history, no variance tracking, no concept of "did I actually improve this quarter?"
+5. **No savings rate visibility** — income is used only to warn "goals exceed income." There is no savings rate metric, no surplus target, no connection between budget goals and long-term goals.
+6. **Forecast and Budget are separate but shouldn't be** — the forecast panel shows what you *will* spend; the budget panel shows what you *want* to spend. These should be on the same screen so the gap is obvious.
+
+---
+
+### Proposed Budget Philosophy
+
+**Use a hybrid of three well-established strategies, applied in order:**
+
+#### Step 1 — Pay Yourself First (foundation)
+Before allocating any category budgets, reserve savings first. The user sets a monthly savings target (either a dollar amount or a % of income). This comes off the top. Whatever remains is the "spendable income."
+
+> "If you save what's left after spending, you'll spend what's left after saving."
+> — classic personal finance principle
+
+#### Step 2 — 50/30/20 guardrails (orientation)
+The AI uses the user's **average net monthly income** (from processed income statements, already excluding bonuses) to classify every category as **Needs / Wants / Savings** and compute whether each bucket is in bounds:
+
+| Bucket | Target share of net income |
+|--------|---------------------------|
+| Needs (housing, groceries, utilities, insurance, healthcare, gas, auto maintenance) | ≤ 50% |
+| Wants (dining, entertainment, shopping, alcohol, subscriptions, personal care, gifts) | ≤ 30% |
+| Savings + Investments | ≥ 20% |
+
+This gives each category a guardrail value derived from **income**, not from past spending. The app shows both the guardrail and the historical average — the user picks a number between the two.
+
+#### Step 3 — Spend-baseline adjustment (reality check)
+For any category where the historical average is already *below* the guardrail (e.g. you already spend only 8% on Dining when the cap is 15%), the AI suggests the historical average as the goal — no reason to set a looser target. For categories above the guardrail, the AI suggests the guardrail amount and flags it red.
+
+#### Why not zero-based budgeting?
+Zero-based (every dollar assigned until income = 0) is the most rigorous but also the most brittle for this use case. Because statements are processed monthly rather than in real-time, the user cannot adjust mid-month. A guardrail system that reviews targets quarterly is more practical here.
+
+---
+
+### UX Redesign: Budget & Goals Tab Layout
+
+The "Budget & Forecast" top-level tab should be replaced with two clearly separated tools.
+
+#### Panel A — "My Budget" (monthly spending plan)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  YOUR MONTHLY BUDGET                                    ⚙ Budget Settings    │
+│  Based on avg income $5,274/mo  •  Analysis: last 3 months                  │
+│                                                                              │
+│  💰 Pay Yourself First Target: [  $800  ] / mo  (15.2% of income)     [Set] │
+│  Remaining spendable: $4,474/mo                                             │
+│                                                                              │
+│  📊 50/30/20 HEALTH CHECK                                                   │
+│  Needs    ████████████░░░░  $2,650  (50.2% — ⚠ slightly over 50% target)   │
+│  Wants    ██████░░░░░░░░░░  $820    (15.6% — ✓ well within 30% cap)         │
+│  Savings  ████░░░░░░░░░░░░  $800    (15.2% — ⚠ below 20% target)            │
+│                                                                              │
+│  ┌─────────────────┬────────────┬────────────┬────────────┬──────────────┐  │
+│  │ Category        │ Type       │ 3-mo Avg   │ AI Cap     │ Your Goal    │  │
+│  ├─────────────────┼────────────┼────────────┼────────────┼──────────────┤  │
+│  │ Rent/Mortgage   │ Need       │ $815       │ $1,582 (30%)│ [  $815  ]  │  │
+│  │ Groceries       │ Need       │ $477       │ $790 (15%) │ [  $450  ]  │  │
+│  │ Shopping        │ Want 🔴    │ $540       │ $395 (7.5%)│ [  $400  ]  │  │
+│  │ …               │ …          │ …          │ …          │ …           │  │
+│  └─────────────────┴────────────┴────────────┴────────────┴──────────────┘  │
+│                                                                              │
+│  [💾 Save Goals]  [🔄 Reset to AI Suggestions]  [📋 Export Budget as CSV]  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Panel B — "Month Review" (post-processing report card)
+
+Shown automatically when the currently selected month has been processed:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  JANUARY 2025 — BUDGET REPORT CARD                                          │
+│                                                                              │
+│  Total Budget: $4,474   Actual Spend: $4,198   Surplus: $276 ✓              │
+│                                                                              │
+│  Category       Goal       Actual     Diff       Bar                        │
+│  ──────────────────────────────────────────────────────                     │
+│  Rent/Mortgage  $815       $815       $0         ██████████ 100% ✓          │
+│  Groceries      $450       $521       +$71 🔴    ████████████ 116% ⚠        │
+│  Shopping       $400       $273       -$127 ✓    ███████ 68% ✓              │
+│  Alcohol/Bar    $80        $160       +$80 🔴    ████████████████ 200% 🔴   │
+│  …                                                                           │
+│                                                                              │
+│  📈 Trend: 3-month goal attainment                                           │
+│  [Nov] ████████░░ 82%   [Dec] ██████████░ 91%   [Jan] ████████████ 94% ↑   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### No More `config/budgets.json`
+
+Every other JSON config file (`investment_platforms.json`, `income_keywords.json`, etc.) has already been migrated to DB tables managed via the dashboard. Budget goals should follow the same pattern — no disk files, no container rebuilds needed to change a goal, and no drift between what the UI shows and what the file contains.
+
+`config/budgets.json` is **eliminated entirely**. The two tables below replace it.
+
+#### New `budget_goals` DB table (replaces `budgets.json`)
+
+One row per category. This is the single source of truth for what the user wants to spend.
+
+```sql
+CREATE TABLE budget_goals (
+  id               INTEGER PRIMARY KEY,
+  category         TEXT NOT NULL UNIQUE,
+  goal_amount      REAL,            -- user's saved goal (null = no goal set)
+  ai_cap           REAL,            -- income-anchored 50/30/20 ceiling
+  historical_avg   REAL,            -- 3-month rolling average at time of last AI run
+  bucket           TEXT,            -- 'Need' | 'Want' | 'Saving'
+  bucket_override  BOOLEAN DEFAULT 0, -- true = user manually changed the bucket
+  updated_at       TEXT             -- ISO timestamp of last save
+);
+
+-- Global budget settings (one row, updated in-place)
+CREATE TABLE budget_settings (
+  id                      INTEGER PRIMARY KEY,  -- always 1
+  savings_target_amount   REAL,
+  savings_target_pct      REAL,
+  strategy                TEXT DEFAULT '50/30/20',
+  avg_monthly_income_used REAL,
+  updated_at              TEXT
+);
+```
+
+Both tables are created in `src/database/models.py` alongside the existing keyword tables, seeded on startup (empty), and managed exclusively through the dashboard UI — the same pattern already used for `investment_keywords`, `income_keywords`, etc.
+
+#### New `budget_history` DB table (attainment tracking)
+
+Populated automatically each time `aggregate_monthly.py` runs:
+
+```sql
+CREATE TABLE budget_history (
+  id            INTEGER PRIMARY KEY,
+  report_month  TEXT NOT NULL,   -- YYYY-MM
+  category      TEXT NOT NULL,
+  goal          REAL,
+  actual        REAL,
+  variance      REAL,            -- actual − goal (negative = under budget ✓)
+  variance_pct  REAL,
+  created_at    TEXT,
+  UNIQUE(report_month, category)
+);
+```
+
+---
+
+### AI Integration Strategy
+
+The 50/30/20 framework provides the *structure*; AI provides the *intelligence within each bucket*. Here is where AI adds real value at each layer:
+
+#### AI Role 1 — Automatic bucket classification
+Rather than hard-coding a lookup table of which categories are Needs vs. Wants, the AI classifies each category the user actually has in their data:
+
+- **Heuristic baseline** (no LLM required): a built-in map covers the 80% case —
+  `Rent/Mortgage`, `Electric`, `Natural Gas`, `Water/Sewer`, `Internet/Cable`, `Groceries`, `Healthcare`, `Insurance`, `Gas/Fuel`, `Auto Maintenance` → Need;
+  `Dining`, `Entertainment`, `Shopping`, `Alcohol/Bar`, `Personal Care`, `Gifts & Donations`, `Subscriptions`, `Travel` → Want;
+  `Investment` → Saving.
+- **LLM override for unknowns**: any category not in the map is sent to the intent model with a short prompt — "Is '{category}' a household necessity (Need), a discretionary expense (Want), or a savings vehicle (Saving)? One word." This fires once per new category and the answer is cached in `budget_goals.bucket`.
+- **User override always wins**: if the user changes a bucket in the UI, `bucket_override = true` and AI never re-classifies that row.
+
+#### AI Role 2 — Smart allocation within the Needs 50% pool
+This is the most useful AI contribution. Once the user's 50% Needs ceiling is computed (e.g., 50% of $5,274 = $2,637), the AI distributes that pool across Need-bucket categories proportionally — but with adjustments:
+
+1. **Fixed-cost lock**: categories where the 3-month average has near-zero variance (σ < $10) are locked at their actual average. You can't reduce rent by optimizing a budget goal. These go in first and are subtracted from the pool before anything else is allocated.
+2. **Variable-need allocation**: the remaining pool is split among variable Need categories (groceries, gas, healthcare) proportionally to their 3-month averages, then rounded to the nearest $5.
+3. **LLM coaching for over-allocated pools**: if fixed-cost Needs alone exceed 50% of income (e.g., rent is 45%, leaving almost nothing), the AI generates a plain-English note — "Your fixed housing and utility costs account for 47% of income, leaving only 3% of income for groceries, gas, and healthcare combined. You may want to adjust your savings target down temporarily." This surfaces in the UI as a callout card, not a blocking error.
+
+#### AI Role 3 — Personalized percentage split suggestion
+The standard 50/30/20 split doesn't fit everyone. After computing what the user actually spends, the AI checks whether 50/30/20 is even achievable and suggests an adjusted split if not:
+
+- If fixed Needs already consume >50%: suggest 60/20/20 or 65/15/20 and explain why
+- If the user's Want spending is unusually low (<15%): suggest relaxing the savings target to reward good habits without over-restricting
+- The suggestion is shown as a banner: "Based on your spending, a **55/25/20** split is more realistic for your income level. [Apply this split]"
+- Applying it updates `budget_settings.strategy` to `'custom'` and recalculates all `ai_cap` values
+
+#### AI Role 4 — Trend-aware goal adjustment
+A flat 3-month average misses direction. If groceries have been $400 → $450 → $480 over three months, suggesting $443 (the average) sets the user up to fail immediately.
+
+- For each category, compute the month-over-month trend: `slope = linear_regression(monthly_amounts)`
+- If slope > +5%/month for two or more consecutive months: `suggested_goal = latest_month_actual × 1.05` (acknowledge the trend, set a mild ceiling)
+- If slope < −5%/month: `suggested_goal = avg × 0.95` (you're improving, encourage continuation)
+- The trend direction (`📈`, `📉`, `➡`) and the adjustment rationale are shown in the `AI Cap` column tooltip
+
+#### AI Role 5 — Month-end coaching narrative
+After each month is processed and `budget_history` rows are written, the LLM generates a 3–5 sentence budget debrief, displayed as a card at the top of the Report Card panel:
+
+> "January was a mixed month. You came in under budget on Shopping (−$127) and Auto Maintenance (−$34), but Groceries ran $71 over your $450 goal — likely due to the holiday stocking-up pattern in late December carried into early January. The most significant miss was Alcohol/Bar at 200% of goal. If that's a one-time event, carry $80 of the overage into a one-time buffer next month. Your overall savings rate was 12.3%, short of the 15% target by $143."
+
+This fires as a POST to `/api/budget/debrief/{month}` and is cached in `budget_history` as a `coaching_note TEXT` column so it doesn't re-run on every page load.
+
+---
+
+### Correlation with the Overview Tab
+
+The Overview tab and the Budget & Forecast tab both call the same `InsightsPanel` component, which hits `/api/budget-suggestions` and `/api/budget/{month}`. They are already sharing data — but there is a subtle mismatch today: the Overview panel re-runs the AI suggestion every load using a fresh 3-month average, while the Budget tab might show goals the user saved weeks ago. They can diverge.
+
+**Fix**: distinguish between "AI suggestions" (ephemeral, always fresh) and "your saved goals" (stable, from the DB):
+
+- `/api/budget-suggestions` → always fresh AI output; used to populate the AI Cap column and the 50/30/20 health bars
+- `/api/budget/goals` → the user's saved `budget_goals` rows; used for the "Your Goal" column and the Overview summary widget
+- The Overview InsightsPanel "budget snapshot" widget shows goals from `budget_goals`, not the live AI suggestion — so if the user hasn't saved goals yet it says "No budget set — go to the Budget tab to set one" rather than showing a fresh AI estimate that may not match what the user agreed to
+
+This keeps the two panels consistent: the Budget tab is where you *set* goals, the Overview is where you *track* them.
+
+---
+
+### Backend Changes
+
+#### `src/database/models.py`
+- Add `budget_goals`, `budget_settings`, and `budget_history` tables
+- Migrate on startup: if `config/budgets.json` exists, import its flat `{category: amount}` values into `budget_goals` rows (one-time migration), then delete the file
+
+#### `GET /api/budget/goals` — new endpoint
+Returns all rows from `budget_goals` plus the single `budget_settings` row. This is what the Overview widget and the "Your Goal" column read from.
+
+#### `GET /api/budget-suggestions` — improvements
+- Accept `strategy`: `50_30_20` (default) | `spending_baseline` | `custom`
+- Accept `savings_target` (dollar amount or %; used to compute spendable pool)
+- Always return per-category: `ai_cap`, `bucket`, `historical_avg`, `trend_slope`, `trend_direction`
+- Return top-level: `need_pct`, `want_pct`, `savings_pct` (actual vs targets), `personalized_split_suggestion`
+- Fixed-cost categories flagged with `is_fixed_cost: true` in the response
+
+#### `POST /api/budget/goals` — replaces `POST /api/budget/save`
+Writes to `budget_goals` and `budget_settings` tables. Accepts the same category map the UI already sends, extended with `bucket`, `ai_cap`, and the top-level settings fields.
+
+#### `GET /api/budget/{month}` — improvements
+- Read goals from `budget_goals` DB table (not the file)
+- Include `variance_trend`: last 3 months of `budget_history` rows per category
+- Include `overall_attainment_pct`
+- Include `savings_rate_actual` = (total_income − total_expenses) / total_income
+
+#### `POST /api/budget/debrief/{month}` — new endpoint
+Generates and caches the AI coaching narrative for a given month. Returns the text immediately if already cached in `budget_history.coaching_note`.
+
+#### `GET /api/budget/history` — new endpoint
+`GET /api/budget/history?months=6` — returns aggregated `budget_history` rows for the trend chart.
+
+#### `scripts/aggregate_monthly.py` — additions
+After writing transactions to DB, snapshot `budget_goals` into `budget_history` rows for the processed month. Also trigger the coaching debrief generation if a finance model is configured.
+
+---
+
+### Frontend Changes (`InsightsPanel.js` / `App.js`)
+
+1. **Pay Yourself First input** — dollar amount or % toggle at the top of the Budget panel. Saves to `budget_settings`. Recomputes spendable pool and the 50/30/20 health bars live as the user types.
+
+2. **50/30/20 health bars** — three stacked horizontal bars (Needs / Wants / Savings) that recompute live as goals are edited. Color: green = in target range, amber = within 5% of boundary, red = over.
+
+3. **`Bucket` column** (Need / Want / Saving) — read from `budget_goals.bucket`. Editable via a small dropdown; saving sets `bucket_override = true`. AI-classified buckets show a subtle "AI" badge that disappears once overridden.
+
+4. **Separate `AI Cap` and `Your Goal` columns** — `AI Cap` is always the income-anchored ceiling from `/api/budget-suggestions`; it updates when you change the savings target. `Your Goal` is your saved value from `budget_goals`.
+
+5. **Fixed-cost rows** — categories flagged `is_fixed_cost` show a lock icon in the Goal cell; the AI Cap column shows their actual average with a tooltip "Fixed cost — AI does not reduce this."
+
+6. **Month Report Card** — shown below the budget table when `selectedMonth` has `budget_history` rows. Includes the AI coaching narrative card at the top, per-category progress bars, and a 3-month attainment trend.
+
+7. **Overview budget widget** — reads from `/api/budget/goals` (saved goals) not from `/api/budget-suggestions` (fresh AI). Shows "No goals set" state with a link to the Budget tab if `budget_goals` is empty.
+
+8. **Persist `planSection` to `localStorage`** — sub-section no longer resets on tab switch.
+
+---
+
+### Implementation Sequence
+
+**Phase 1 — DB migration (no visible UI change)**
+- Add `budget_goals`, `budget_settings`, `budget_history` tables to `models.py`
+- One-time migration: import `config/budgets.json` flat values into `budget_goals` on startup; delete the file
+- Add `GET /api/budget/goals` and `POST /api/budget/goals` endpoints; deprecate `POST /api/budget/save`
+- Update `GET /api/budget/{month}` to read from `budget_goals` table
+- Update `aggregate_monthly.py` to write `budget_history` rows post-processing
+
+**Phase 2 — AI suggestion improvements (backend only)**
+- Add bucket classification (heuristic map + LLM fallback for unknowns)
+- Add trend slope computation to `budget_advisor.py`
+- Add fixed-cost detection (low-variance categories)
+- Smart Needs pool allocation
+- Personalized split suggestion
+- Update `/api/budget-suggestions` response shape
+
+**Phase 3 — Budget panel UI**
+- Pay Yourself First input + live spendable pool
+- 50/30/20 health bars
+- `Bucket` column with dropdown + AI badge
+- Separate `AI Cap` and `Your Goal` columns
+- Fixed-cost lock icon
+
+**Phase 4 — Report Card + coaching**
+- Month Report Card below budget table
+- AI coaching narrative card (POST `/api/budget/debrief/{month}`, cache in DB)
+- 3-month attainment trend mini-chart
+- Overview widget reads saved goals from DB
+
+**Phase 5 — Strategy picker (optional)**
+- Settings > Budget tab: strategy selector (50/30/20 | Spending Baseline | Custom)
+- Custom mode: user sets their own Needs/Wants/Savings % targets

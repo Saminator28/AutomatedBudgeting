@@ -1172,11 +1172,12 @@ class StatementParser:
     
     def classify_transactions(self, transactions: List[Dict], is_bank_account: bool) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
         """
-        Classify transactions into income, expenses, and manual_review.
-        
-        For bank accounts: Uses Credits/Debits columns, or balance comparison as fallback
-        For credit cards: Uses Credits/Debits columns
-        Payment apps: Sent to manual_review for user classification
+        Classify transactions into income, expenses, and a small set of
+        suspicious-balance rows.
+
+        Payment apps: classified as expenses by default.
+        Suspicious-balance rows: routed to the auxiliary list so process_monthly
+        can treat them as uncategorized expenses for the user to correct via the UI.
         """
         income = []
         expenses = []
@@ -1297,7 +1298,7 @@ class StatementParser:
         # Classify transactions
         income, expenses, manual_review, investment_transfers = self.classify_transactions(transactions, is_bank_account)
         if debug:
-            print(f"  {len(income)} income, {len(expenses)} expenses, {len(manual_review)} manual review, {len(investment_transfers)} transfers")
+            print(f"  {len(income)} income, {len(expenses)} expenses, {len(manual_review)} suspicious-balance, {len(investment_transfers)} transfers")
         
         # Convert to DataFrames
         income_df = pd.DataFrame(income) if income else pd.DataFrame()

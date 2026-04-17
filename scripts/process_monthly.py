@@ -308,12 +308,8 @@ Best match:"""
 
     return None
 
-def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = False, force: bool = False, manual_only: bool = False, debug: bool = False):
-    """Process all PDF statements in a monthly directory.
-    
-    Args:
-        manual_only: If True, only process manual_review.csv without reprocessing PDFs
-    """
+def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = False, force: bool = False, debug: bool = False):
+    """Process all PDF statements in a monthly directory."""
     
     def parse_date_for_sort(date_str):
         """Parse date string to datetime for sorting."""
@@ -370,194 +366,16 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         except Exception:
             pass
 
-    # Load previously classified transactions from manual review (skip if forcing reprocess)
-    manual_review_file = csv_dir / 'manual_review.csv'
-    previously_classified_income = []
-    previously_classified_expenses = []
-    transactions_to_keep_in_manual_review = []  # Track transactions that need to stay
     valid_categories = load_valid_categories()
     
     # Load merchant history for learning from past corrections (exclude current month and future)
     merchant_history = MerchantHistory(month_dir.parent, min_confidence=1, exclude_month=month_name)
-    
-    if not force and manual_review_file.exists():
-        try:
-            prev_manual_review = pd.read_csv(manual_review_file, sep=None, engine='python')
-            print(f"[DEBUG] Read manual_review.csv with {len(prev_manual_review)} rows")
-            if 'Classification' in prev_manual_review.columns:
-                # Normalise to str so .str accessor never fails on an all-NaN float column
-                prev_manual_review['Classification'] = (
-                    prev_manual_review['Classification'].fillna('').astype(str)
-                )
-                
-                # Separate classified from unclassified (Classification must be filled in by user)
-                classified = prev_manual_review[
-                    prev_manual_review['Classification'].str.strip() != ''
-                ]
-                
-                # Keep unclassified transactions in manual_review
-                unclassified = prev_manual_review[
-                    prev_manual_review['Classification'].str.strip() == ''
-                ]
-                if not unclassified.empty:
-                    transactions_to_keep_in_manual_review.extend(unclassified.to_dict('records'))
-                
-                if not classified.empty:
-                    # Validate and correct categories for classified transactions
-                    if 'category' in classified.columns:
-                        corrected_categories = []
-                        corrections_made = []
-                        invalid_categories = []
-                        
-                        for idx, row in classified.iterrows():
-                            original_category = row.get('category', 'Uncategorized')
-                            place = row.get('Place', 'unknown')
-                            is_uncategorized_txn = row.get('_uncategorized', False)
-                            # Handle CSV reading - empty string or False means not uncategorized
-                            if is_uncategorized_txn == '' or pd.isna(is_uncategorized_txn):
-                                is_uncategorized_txn = False
-                            else:
-                                is_uncategorized_txn = bool(is_uncategorized_txn)
-                            
-                            corrected_category, is_valid = validate_and_correct_category(
-                                original_category, 
-                                valid_categories, 
-                                use_llm=use_llm
-                            )
-                            
-                            # Track invalid categories for user to fix
-                            if not is_valid:
-                                invalid_categories.append({
-                                    'place': place,
-                                    'invalid_category': original_category
-                                })
-                            
-                            # Track if category was corrected
-                            if str(original_category).strip() != '' and corrected_category != original_category:
-                                corrections_made.append({
-                                    'place': place,
-                                    'original': original_category,
-                                    'corrected': corrected_category
-                                })
-                            
-                            # Merchant history will learn from this correction automatically
-                            # No need to manually update patterns
-                            
-                            corrected_categories.append(corrected_category)
-                        
-                        # Update the category column with corrected values
-                        classified = classified.copy()
-                        classified['category'] = corrected_categories
-                        
-                        # Mark these as manually categorized to prevent re-categorization
-                        classified['_manual_category'] = True
-                        
-                        # Drop the marker column before saving
-                        classified = classified.drop('_uncategorized', axis=1, errors='ignore')
-                        
-                        # Log corrections
-                        if corrections_made:
-                            print(f"\n📝 Category Corrections:")
-                            for correction in corrections_made:
-                                print(f"  ✓ '{correction['original']}' → '{correction['corrected']}' ({correction['place']})")
-                        
-                        # Warn about invalid categories
-                        if invalid_categories:
-                            print(f"\n❌ INVALID CATEGORIES FOUND - Please fix these in manual_review.csv:")
-                            for invalid in invalid_categories:
-                                print(f"  ✗ '{invalid['invalid_category']}' for '{invalid['place']}'")
-                        
 
-                    # Split by classification (case-insensitive) and validate requirements
-                    income_classified = classified[classified['Classification'].str.strip().str.lower() == 'income']
-                    expense_classified = classified[classified['Classification'].str.strip().str.lower() == 'expense']
-                    # Accept both correct and common misspelling
-                    reimbursement_classified = classified[
-                        classified['Classification'].str.strip().str.lower().isin(['reimbursement', 'reimbursment'])
-                    ]
-                    
-                    # Debug output
-                    if not reimbursement_classified.empty:
-                        print(f"[DEBUG] Found {len(reimbursement_classified)} reimbursement(s) before validation:")
-                        for _, row in reimbursement_classified.iterrows():
-                            cat_val = row.get('category', 'NO_COLUMN')
-                            print(f"  - {row['Place']}: category='{cat_val}' (type: {type(cat_val)})")
-                    
-                    # Validate expenses have categories
-                    if not expense_classified.empty:
-                        missing_category = expense_classified[
-                            expense_classified['category'].isna() | 
-                            (expense_classified['category'].astype(str).str.strip() == '') |
-                            (expense_classified['category'].astype(str).str.strip() == 'Uncategorized') |
-                            (expense_classified['category'].astype(str).str.strip() == 'nan')
-                        ]
-                        if not missing_category.empty:
-                            print(f"\n⚠ WARNING: {len(missing_category)} Expense(s) missing category - will remain in manual_review.csv:")
-                            for _, row in missing_category.iterrows():
-                                print(f"  ✗ {row['Place']} - needs category")
-                            # Add to keep list so they stay in manual_review.csv
-                            transactions_to_keep_in_manual_review.extend(missing_category.to_dict('records'))
-                            # Keep only expenses with valid categories
-                            expense_classified = expense_classified[
-                                expense_classified['category'].notna() & 
-                                (expense_classified['category'].astype(str).str.strip() != '') &
-                                (expense_classified['category'].astype(str).str.strip() != 'Uncategorized') &
-                                (expense_classified['category'].astype(str).str.strip() != 'nan')
-                            ]
-                    
-                    # Validate reimbursements have categories
-                    if not reimbursement_classified.empty:
-                        # Check if category column exists
-                        if 'category' not in reimbursement_classified.columns:
-                            print(f"\n⚠ WARNING: Reimbursement(s) missing 'category' column - will remain in manual_review.csv")
-                            reimbursement_classified = pd.DataFrame()  # Empty it
-                        else:
-                            missing_category = reimbursement_classified[
-                                reimbursement_classified['category'].isna() | 
-                                (reimbursement_classified['category'].astype(str).str.strip() == '') |
-                                (reimbursement_classified['category'].astype(str).str.strip() == 'Uncategorized')
-                            ]
-                            if not missing_category.empty:
-                                print(f"\n⚠ WARNING: {len(missing_category)} Reimbursement(s) missing category - will remain in manual_review.csv:")
-                                for _, row in missing_category.iterrows():
-                                    print(f"  ✗ {row['Place']} - needs category")
-                                # Add to keep list so they stay in manual_review.csv
-                                transactions_to_keep_in_manual_review.extend(missing_category.to_dict('records'))
-                                # Keep only reimbursements with valid categories
-                                reimbursement_classified = reimbursement_classified[
-                                    reimbursement_classified['category'].notna() & 
-                                    (reimbursement_classified['category'].astype(str).str.strip() != '') &
-                                    (reimbursement_classified['category'].astype(str).str.strip() != 'Uncategorized')
-                                ]
-                    
-                    if not income_classified.empty:
-                        previously_classified_income = income_classified.to_dict('records')
-                        print(f"📥 Found {len(previously_classified_income)} transaction(s) classified as Income")
-                    
-                    if not expense_classified.empty:
-                        previously_classified_expenses = expense_classified.to_dict('records')
-                        print(f"📥 Found {len(previously_classified_expenses)} transaction(s) classified as Expense")
-                    
-                    if not reimbursement_classified.empty:
-                        # Add reimbursements as negative expenses ONLY (not to income)
-                        for record in reimbursement_classified.to_dict('records'):
-                            negative_expense = record.copy()
-                            negative_expense['Amount'] = -abs(float(record['Amount']))
-                            previously_classified_expenses.append(negative_expense)
-                        print(f"📥 Found {len(reimbursement_classified)} reimbursement(s) - will add as negative expenses to offset {list(reimbursement_classified['category'].unique())}")
-        except Exception as e:
-            print(f"⚠ Warning: Could not read previous manual_review.csv: {e}")
-    
     # Check if this month is already processed (DB first, CSV fallback)
     output_file = csv_dir / "expenses.csv"
-    if (output_file.exists() or _has_db_data) and not force and not manual_only:
-        # Don't skip completely - we still need to process manual_review.csv updates
-        # Jump to manual-only processing instead of continuing to PDFs
-        print(f"✓ Month {month_name} already processed - will only update manual_review.csv")
-        # Fall through to manual-only section below by NOT returning
 
-    # If manual-only mode OR already processed, update classifications without re-parsing PDFs
-    if manual_only or ((output_file.exists() or _has_db_data) and not force):
+    # If already processed, check for manual_transactions.csv updates only
+    if (output_file.exists() or _has_db_data) and not force:
         has_work = False
         
         # Load existing expenses and income files
@@ -768,147 +586,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                             print(f"\n✓ Merged {len(manual_df)} manual transaction(s) from manual_transactions.csv")
             except Exception as e:
                 print(f"  ⚠ Warning: Could not import manual transactions: {e}")
-        
-        # Process manual_review.csv classified transactions
-        if previously_classified_income or previously_classified_expenses:
-            has_work = True
-        
-        # Add classified transactions from manual_review.csv
-        if previously_classified_expenses:
-            prev_exp_df = pd.DataFrame(previously_classified_expenses)
-            # Drop internal columns that shouldn't be in expenses.csv
-            prev_exp_df = prev_exp_df.drop(['Classification', '_manual_category', 'Type', '_classification', '_statement_beginning_balance'], axis=1, errors='ignore')
-            
-            # Categorize if they don't have a category or it's Uncategorized
-            needs_categorization = False
-            if 'category' not in prev_exp_df.columns:
-                needs_categorization = True
-            elif prev_exp_df['category'].isna().all() or \
-                 (prev_exp_df['category'].astype(str).str.strip().isin(['', 'Uncategorized', 'nan'])).all():
-                needs_categorization = True
-            
-            if needs_categorization and use_llm:
-                print(f"\n📂 Categorizing {len(prev_exp_df)} expense(s) from manual_review.csv...")
-                categorizer = TransactionCategorizer(use_llm=True, merchant_history=merchant_history)
-                prev_exp_df = categorizer.categorize_dataframe(
-                    prev_exp_df,
-                    description_column='Place',
-                    amount_column='Amount'
-                )
-            elif 'category' not in prev_exp_df.columns:
-                # Add empty category column if it doesn't exist
-                prev_exp_df['category'] = 'Uncategorized'
-                
-            if not expenses_df.empty:
-                expenses_df = pd.concat([expenses_df, prev_exp_df], ignore_index=True)
-            else:
-                expenses_df = prev_exp_df
-            
-            # Sort by date
-            expenses_df['_sort_date'] = pd.to_datetime(expenses_df['Transaction Date'], format='%m/%d/%Y', errors='coerce')
-            expenses_df = expenses_df.sort_values('_sort_date', na_position='last')
-            expenses_df = expenses_df.drop('_sort_date', axis=1)
-            
-            # Save without breakdown summary (summary will be in monthly_reports)
-            expenses_df = expenses_df.drop(['one_time_purchase', 'user_notes'], axis=1, errors='ignore')
-            if debug:
-                expenses_df.to_csv(output_file, index=False)
 
-        if previously_classified_income:
-            prev_inc_df = pd.DataFrame(previously_classified_income)
-            prev_inc_df = prev_inc_df.drop(['Classification', '_manual_category', 'Type', '_classification', '_statement_beginning_balance'], axis=1, errors='ignore')
-            if not income_df.empty:
-                income_df = pd.concat([income_df, prev_inc_df], ignore_index=True)
-            else:
-                income_df = prev_inc_df
-            
-            # Sort by date
-            income_df['_sort_date'] = pd.to_datetime(income_df['Transaction Date'], format='%m/%d/%Y', errors='coerce')
-            income_df = income_df.sort_values('_sort_date', na_position='last')
-            # Always remove category from income (income doesn't need categories)
-            income_df = income_df.drop(['_sort_date', 'category'], axis=1, errors='ignore')
-            income_df = income_df.drop_duplicates(subset=['Transaction Date', 'Place', 'Amount'], keep='first')
-            if debug:
-                income_df.to_csv(income_file, index=False)
-        if manual_review_file.exists():
-            try:
-                manual_review_df = pd.read_csv(manual_review_file, sep=None, engine='python')
-                # Normalise string columns so .str accessor never fails on all-NaN float columns
-                if 'Classification' in manual_review_df.columns:
-                    manual_review_df['Classification'] = (
-                        manual_review_df['Classification'].fillna('').astype(str)
-                    )
-                
-                # Check if Classification column exists
-                if 'Classification' not in manual_review_df.columns:
-                    print(f"⚠ Warning: manual_review.csv missing 'Classification' column - skipping update")
-                    print(f"   Columns found: {list(manual_review_df.columns)}")
-                else:
-                    # Transactions to keep in manual review:
-                    # 1. Unclassified (no Classification or empty)
-                    # 2. Expenses without category
-                    # 3. Reimbursements without category
-                    
-                    unclassified = manual_review_df[
-                        manual_review_df['Classification'].str.strip() == ''
-                    ]
-                    
-                    # Find expenses/reimbursements missing categories (check if category column exists)
-                    needs_category = pd.DataFrame()
-                    if 'category' in manual_review_df.columns:
-                        needs_category = manual_review_df[
-                            (manual_review_df['Classification'].str.strip().str.lower().isin(['expense', 'reimbursement'])) &
-                            (manual_review_df['category'].isna() | 
-                             (manual_review_df['category'].astype(str).str.strip() == '') |
-                             (manual_review_df['category'].astype(str).str.strip() == 'Uncategorized') |
-                             (manual_review_df['category'].astype(str).str.strip() == 'nan'))
-                        ]
-                        
-                        # Try to categorize these transactions using merchant history + LLM
-                        if not needs_category.empty and use_llm:
-                            print(f"\n📂 Auto-categorizing {len(needs_category)} expense(s) in manual_review.csv...")
-                            categorizer = TransactionCategorizer(use_llm=True, merchant_history=merchant_history)
-                            
-                            # Create a copy for categorization
-                            to_categorize = needs_category.copy()
-                            categorized = categorizer.categorize_dataframe(
-                                to_categorize,
-                                description_column='Place',
-                                amount_column='Amount'
-                            )
-                            
-                            # Ensure category column is object dtype before assignment
-                            if 'category' not in manual_review_df.columns:
-                                manual_review_df['category'] = ''
-                            manual_review_df['category'] = manual_review_df['category'].astype('object')
-                            
-                            # Update the category column in the original dataframe
-                            manual_review_df.loc[needs_category.index, 'category'] = categorized['category'].values
-                            
-                            # After categorization, check if any are still Uncategorized
-                            needs_category = manual_review_df[
-                                (manual_review_df['Classification'].str.strip().str.lower().isin(['expense', 'reimbursement'])) &
-                                (manual_review_df['category'].isna() | 
-                                 (manual_review_df['category'].astype(str).str.strip() == '') |
-                                 (manual_review_df['category'].astype(str).str.strip() == 'Uncategorized') |
-                                 (manual_review_df['category'].astype(str).str.strip() == 'nan'))
-                            ]
-                    
-                    # Combine both sets
-                    to_keep = pd.concat([unclassified, needs_category], ignore_index=True).drop_duplicates()
-                    
-                    if not to_keep.empty:
-                        to_keep.to_csv(manual_review_file, index=False)
-                        print(f"✓ {len(to_keep)} transaction(s) remain in manual_review.csv")
-                    else:
-                        # All classified - remove the file
-                        manual_review_file.unlink()
-                        print(f"✓ All transactions classified - removed manual_review.csv")
-            except Exception as e:
-                print(f"⚠ Warning: Could not update manual_review.csv: {e}")
-                import traceback
-                traceback.print_exc()
-        
         # Check if any work was done
         if not has_work:
             print(f"✓ No manual transactions or classified items to process")
@@ -966,15 +644,6 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 income_df.to_csv(income_file, index=False)
             print(f"✓ Updated {len(income_df)} income transaction(s)")
         
-        # Summary
-        if previously_classified_income or previously_classified_expenses:
-            total_moved = len(previously_classified_income) + len(previously_classified_expenses)
-            print(f"\n✓ Moved {total_moved} manually classified transaction(s):")
-            if previously_classified_income:
-                print(f"  - {len(previously_classified_income)} to income.csv")
-            if previously_classified_expenses:
-                print(f"  - {len(previously_classified_expenses)} to expenses.csv")
-        
         return True
     
     # If forcing reprocess, remove all generated CSVs
@@ -989,10 +658,6 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         if income_file.exists():
             files_to_remove.append(("income.csv", income_file))
         
-        manual_review_file = csv_dir / 'manual_review.csv'
-        if manual_review_file.exists():
-            files_to_remove.append(("manual_review.csv", manual_review_file))
-        
         # Remove all rejected CSVs from previous processing
         rejected_files = list(csv_dir.glob("*_rejected.csv"))
         for rejected_file in rejected_files:
@@ -1001,7 +666,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         if files_to_remove:
             for file_name, file_path in files_to_remove:
                 file_path.unlink()
-            print(f"🗑️  Removed {len(files_to_remove)} existing file(s) (expenses, income, manual_review, rejected)")
+            print(f"🗑️  Removed {len(files_to_remove)} existing file(s) (expenses, income, rejected)")
     
     # Find all PDF files in the directory
     pdf_files = sorted(list(month_dir.glob("*.pdf")))
@@ -1061,9 +726,8 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                 expenses_df['_classification'] = 'Expense'
                 df_list.append(expenses_df)
             if not manual_review_df.empty:
-                # Manual review already has Type column set by parser (Income or Expense hint)
-                # Use _classification to track that it's manual review internally
-                manual_review_df['_classification'] = 'Manual Review'
+                # Suspicious-balance transactions — treat as expenses, user can fix via UI
+                manual_review_df['_classification'] = 'Expense'
                 df_list.append(manual_review_df)
                 
             
@@ -1283,80 +947,24 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
         except Exception:
             payment_app_keywords = ['PAYMENT APP', 'DIGITAL WALLET', 'P2P TRANSFER']
 
-        # Separate expenses, income, and manual review from combined_df based on _classification column
+        # Separate expenses and income from combined_df based on _classification column
         expenses_rows = combined_df[combined_df['_classification'] == 'Expense'].copy() if '_classification' in combined_df.columns else combined_df.copy()
         income_rows = combined_df[combined_df['_classification'] == 'Income'].copy() if '_classification' in combined_df.columns else pd.DataFrame()
-        manual_review_rows = combined_df[combined_df['_classification'] == 'Manual Review'].copy() if '_classification' in combined_df.columns else pd.DataFrame()
-        
-        # Check for payment apps in expenses
-        if not expenses_rows.empty:
-            payment_mask = expenses_rows['Place'].str.upper().str.contains(
-                '|'.join(payment_app_keywords), na=False, regex=True
-            )
-            payment_apps_df = expenses_rows[payment_mask].copy()
-            expenses_df = expenses_rows[~payment_mask].copy()
-        
+
+        expenses_df = expenses_rows.copy()
         if not income_rows.empty:
             income_df = income_rows.copy()
 
-        if not manual_review_rows.empty:
-            payment_apps_df = manual_review_rows.copy()
-        
         # Drop _classification column as it was only for internal use
-        # Keep Type column in payment_apps_df (it shows Income/Expense hint)
         expenses_df = expenses_df.drop('_classification', axis=1, errors='ignore')
         income_df = income_df.drop('_classification', axis=1, errors='ignore')
-        payment_apps_df = payment_apps_df.drop('_classification', axis=1, errors='ignore')
-        if not manual_review_rows.empty:
-            payment_apps_df = manual_review_rows.copy()
-        
-        # Add previously classified expenses
-        if previously_classified_expenses:
-            prev_exp_df = pd.DataFrame(previously_classified_expenses)
-            prev_exp_df = prev_exp_df.drop(['Classification', '_manual_category', '_classification', '_statement_beginning_balance'], axis=1, errors='ignore')
-            if not expenses_df.empty:
-                expenses_df = pd.concat([expenses_df, prev_exp_df], ignore_index=True)
-            else:
-                expenses_df = prev_exp_df
-        
-        # Add previously classified income
-        if previously_classified_income:
-            prev_inc_df = pd.DataFrame(previously_classified_income)
-            prev_inc_df = prev_inc_df.drop(['Classification', '_manual_category', 'Type', '_classification', '_statement_beginning_balance'], axis=1, errors='ignore')
-            if not income_df.empty:
-                income_df = pd.concat([income_df, prev_inc_df], ignore_index=True)
-            else:
-                income_df = prev_inc_df
-        
-        # Add Classification column for payment apps
-        if not payment_apps_df.empty:
-            if 'Classification' not in payment_apps_df.columns:
-                payment_apps_df['Classification'] = ''
-        
-        # Add any unclassified transactions from previous manual_review.csv
-        if manual_review_file.exists():
-            try:
-                prev_manual_review = pd.read_csv(manual_review_file, sep=None, engine='python')
-                if 'Classification' in prev_manual_review.columns:
-                    # Keep only unclassified transactions
-                    unclassified = prev_manual_review[(prev_manual_review['Classification'].isna()) | 
-                                                     (prev_manual_review['Classification'] == '')]
-                    if not unclassified.empty:
-                        if not payment_apps_df.empty:
-                            payment_apps_df = pd.concat([payment_apps_df, unclassified], ignore_index=True)
-                        else:
-                            payment_apps_df = unclassified
-            except Exception as e:
-                pass  # Silently continue if can't read previous file
-        
+
         # Filter out rows with no amount (shouldn't happen, but safety check)
         if not expenses_df.empty and 'Amount' in expenses_df.columns:
             expenses_df = expenses_df[expenses_df['Amount'].notna()]
         if not income_df.empty and 'Amount' in income_df.columns:
             income_df = income_df[income_df['Amount'].notna()]
-        if not payment_apps_df.empty and 'Amount' in payment_apps_df.columns:
-            payment_apps_df = payment_apps_df[payment_apps_df['Amount'].notna()]
-        
+
         # Use expenses_df as the main combined_df for the rest of processing
         combined_df = expenses_df
         
@@ -1646,39 +1254,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             merchant_column='Place',
             month=month_dir.name
         )
-        
-        
-        # Don't categorize manual review transactions - leave them for manual classification
-        # (User will fill in Classification column manually)
-        if not payment_apps_df.empty:
-            print(f"\n📋 {len(payment_apps_df)} transaction(s) flagged for manual review (not auto-categorized)")
-            # Ensure they have empty category column to indicate manual classification needed
-            if 'category' not in payment_apps_df.columns:
-                payment_apps_df['category'] = ''
-        
-        # Extract uncategorized transactions from expenses and add to manual review
-        if 'category' in combined_df.columns:
-            uncategorized_expenses = combined_df[combined_df['category'] == 'Uncategorized'].copy()
-            if not uncategorized_expenses.empty:
-                # Remove uncategorized from expenses
-                combined_df = combined_df[combined_df['category'] != 'Uncategorized']
-                
-                # Add Classification column if not present
-                if 'Classification' not in uncategorized_expenses.columns:
-                    uncategorized_expenses['Classification'] = ''
-                
-                # Mark as uncategorized (not payment app) so we can add to patterns later
-                uncategorized_expenses['_uncategorized'] = True
-                
-                # Merge with payment apps for manual review
-                if not payment_apps_df.empty:
-                    payment_apps_df = pd.concat([payment_apps_df, uncategorized_expenses], ignore_index=True)
-                else:
-                    payment_apps_df = uncategorized_expenses
-                
-                print(f"\n📋 Added {len(uncategorized_expenses)} uncategorized expense(s) to manual review")
-        
-        
+
         # Save combined results
         print(f"\n{'='*70}")
         print(f"Combining transactions from {len(pdf_files)} statement(s)")
@@ -1791,56 +1367,6 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             else:
                 print(f"✓ Processed {len(combined_transfers)} investment transfer(s)")
 
-        # Save manual review transactions (payment apps + uncategorized + previously unprocessed)
-        # Merge new manual review transactions with ones that need to stay from previous run
-        if transactions_to_keep_in_manual_review:
-            keep_df = pd.DataFrame(transactions_to_keep_in_manual_review)
-            if not payment_apps_df.empty:
-                payment_apps_df = pd.concat([payment_apps_df, keep_df], ignore_index=True)
-            else:
-                payment_apps_df = keep_df
-        
-        if not payment_apps_df.empty:
-            manual_review_file = csv_dir / 'manual_review.csv'
-            
-            # Remove internal columns but KEEP category
-            manual_review_to_save = payment_apps_df.drop(['_is_bank_account', 'Credits', 'Debits', '_needs_manual_review', '_uncategorized', '_classification', '_statement_beginning_balance', 'Balance'], axis=1, errors='ignore')
-            
-            # Drop Type hint — leave Classification blank so user must pick Income or Reimbursement
-            manual_review_to_save = manual_review_to_save.drop('Type', axis=1, errors='ignore')
-            if 'Classification' not in manual_review_to_save.columns:
-                manual_review_to_save['Classification'] = ''
-            
-            # Reorder columns to put Classification first for visibility
-            cols = ['Transaction Date', 'Place', 'Amount', 'Classification']
-            other_cols = [c for c in manual_review_to_save.columns if c not in cols]
-            manual_review_to_save = manual_review_to_save[cols + other_cols]
-            
-            manual_review_to_save.to_csv(manual_review_file, index=False)
-            print(f"✓ Saved {len(manual_review_to_save)} transaction(s) to {manual_review_file} for manual review")
-            print(f"  ℹ  Classification column pre-filled with Income/Expense hint - you can change it to:")
-            print(f"     - 'Income' = goes to income.csv")
-            print(f"     - 'Expense' = goes to expenses.csv (also set category)")
-            print(f"     - 'Reimbursement' = goes to expenses.csv as negative (also set category to offset)")
-        else:
-            # No transactions to review (no new payment apps and no previously unprocessed)
-            manual_review_file = csv_dir / 'manual_review.csv'
-            if manual_review_file.exists():
-                # All transactions have been processed, remove the file
-                manual_review_file.unlink()
-                print(f"  ℹ  All manual_review.csv transactions classified - file removed")
-            else:
-                print(f"  (No transactions require manual review)")
-        
-        # Report on previously classified transactions
-        if previously_classified_income or previously_classified_expenses:
-            total_moved = len(previously_classified_income) + len(previously_classified_expenses)
-            print(f"\n✓ Moved {total_moved} manually classified transaction(s):")
-            if previously_classified_income:
-                print(f"  - {len(previously_classified_income)} to income.csv")
-            if previously_classified_expenses:
-                print(f"  - {len(previously_classified_expenses)} to expenses.csv")
-        
         print(f"{'='*70}")
         
         return True
@@ -1881,11 +1407,6 @@ def main():
         action='store_true',
         default=False,
         help='Force reprocessing all PDFs even if CSV already exists'
-    )
-    parser_args.add_argument(
-        '--manual-only',
-        action='store_true',
-        help='Only process manual_review.csv classifications without reprocessing PDFs (lightweight mode)'
     )
     parser_args.add_argument(
         '--debug',
@@ -1974,7 +1495,7 @@ def main():
     # Process each month
     success_count = 0
     for month_dir in months_to_process:
-        success = process_month(month_dir, statement_parser, use_llm, args.force, args.manual_only, args.debug)
+        success = process_month(month_dir, statement_parser, use_llm, args.force, args.debug)
         if success:
             success_count += 1
     

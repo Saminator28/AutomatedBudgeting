@@ -484,13 +484,13 @@ Your answer:"""
             
             if self.use_llm and self.llm_available:
                 print("\n💡 Note: LLM was unable to categorize these items.")
-                print("  Manually categorize these in expenses.csv, then they'll auto-categorize next time!")
+                print("  Edit the category in the 'All Transactions' tab — the system learns from your corrections!")
             else:
                 print("\n💡 To categorize these:")
-                print("  1. Manually categorize in expenses.csv")
-                print("  2. Re-run next month - system learns from your corrections!")
+                print("  Edit the category in the 'All Transactions' tab in the dashboard.")
+                print("  The system learns from your corrections and auto-categorizes matching merchants next time.")
                 if not self.llm_available:
-                    print("  OR: Start Ollama and use --llm for AI-powered categorization")
+                    print("  OR: Run 'make ollama-serve' then re-process for AI-powered categorization")
         else:
             print("\n✓ All transactions successfully categorized!")
         
