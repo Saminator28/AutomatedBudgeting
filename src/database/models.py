@@ -195,6 +195,7 @@ budget_goals = Table(
     Column('historical_avg', Float),           # 3-month rolling avg at last AI run
     Column('bucket',         Text),            # 'Need' | 'Want' | 'Saving'
     Column('bucket_override', Boolean, default=False),  # true = user set bucket manually
+    Column('locked',         Boolean, default=False),   # true = user pinned; carries amount across months
     Column('updated_at',     Text),            # ISO timestamp of last save
 )
 
@@ -239,4 +240,16 @@ budget_goals_monthly = Table(
     Column('goal_amount', Float),
     Column('updated_at',  Text),
     UniqueConstraint('month', 'category', name='uq_budget_goals_monthly'),
+)
+
+# ── config_categories ─────────────────────────────────────────────────────────
+# Source of truth for user-configurable categories and hierarchy.
+# The Settings > Categories UI reads/writes here.
+# config_categories is the single source of truth for category names and hierarchy.
+config_categories = Table(
+    'config_categories', metadata,
+    Column('id',         Integer, primary_key=True, autoincrement=True),
+    Column('name',       Text,    nullable=False, unique=True),
+    Column('parent',     Text,    nullable=True),   # NULL = top-level category
+    Column('sort_order', Integer, server_default='0'),
 )

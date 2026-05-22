@@ -156,17 +156,18 @@ def get_monthly_directories(statements_dir: Path) -> list:
 
 
 def load_valid_categories():
-    """Load valid category names from categories.json."""
-    config_path = Path(__file__).parent.parent / 'config' / 'categories.json'
+    """Load valid category names from the config_categories DB table."""
     try:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-            categories = config.get('categories', [])
-            if isinstance(categories, list):
-                return categories
-            return []
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from src.database.session import get_engine
+        from sqlalchemy import text
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text('SELECT name FROM config_categories ORDER BY sort_order, name')).fetchall()
+        return [r[0] for r in rows]
     except Exception as e:
-        print(f"⚠ Warning: Could not load categories from categories.json: {e}")
+        print(f"⚠ Warning: Could not load categories from DB: {e}")
         return []
 
 
@@ -713,6 +714,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                             report_month=month_name,
                             reason='transfer_keyword',
                             keyword_matched=_kft_kw.lower(),
+                            original_statement=bank_name,
                         )
                 except Exception:
                     pass
@@ -826,7 +828,12 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             
             # Remove dates in format MM/DD/YY or MM/DD/YYYY from descriptions
             place = re.sub(r'\s+\d{1,2}/\d{1,2}/\d{2,4}\b', '', place)
-            
+            # Also strip bare M/DD/YY dates at the start (after LLM strips prefix)
+            place = re.sub(r'^\d{1,2}/\d{2}(?:/\d{2,4})?\s*', '', place)
+
+            # Remove "At HH:MM" / "at H:MM" time fragments anywhere in the name
+            place = re.sub(r'\bAt\s+\d{1,2}:\d{2}\s*', '', place, flags=re.IGNORECASE)
+
             # Remove trailing " At" or "At" patterns
             place = re.sub(r'\s+At\s*$', '', place, flags=re.IGNORECASE)
             
@@ -848,9 +855,8 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             # Remove "WEB PMTS" and trailing codes
             place = re.sub(r'\s+WEB PMTS.*$', '', place, flags=re.IGNORECASE)
             
-            # Clean up account masks (XXXXXX followed by digits)
-            place = re.sub(r'XXXXXX\d+', '', place)
-            place = re.sub(r'Xxxxxx\d+', '', place)
+            # Clean up account masks (XXXXXX followed by digits, any casing)
+            place = re.sub(r'[Xx]{3,}\d*', '', place)
             
             # Remove "To" prefix for transfers
             place = re.sub(r'^(Online-Phone Transfer To|ONLINE-PHONE TRANSFER TO)\s+', '', place, flags=re.IGNORECASE)
@@ -1009,9 +1015,9 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                     # Log both sides to auto_deleted_transactions
                     if _db_engine is not None:
                         try:
-                            for side_place, side_date in (
-                                (transfer['place1'], transfer['date1']),
-                                (transfer['place2'], transfer['date2']),
+                            for side_place, side_date, side_source in (
+                                (transfer['place1'], transfer['date1'], transfer['source1']),
+                                (transfer['place2'], transfer['date2'], transfer['source2']),
                             ):
                                 _log_auto_deleted(
                                     _db_engine,
@@ -1021,6 +1027,7 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
                                     report_month=month_name,
                                     reason='cross_account',
                                     keyword_matched='',
+                                    original_statement=str(side_source),
                                 )
                         except Exception:
                             pass

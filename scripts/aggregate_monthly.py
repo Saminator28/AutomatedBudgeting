@@ -36,6 +36,22 @@ def _load_investment_keywords_from_db(engine) -> list:
         pass
     return []
 
+
+def _load_investment_categories_from_db(engine) -> set:
+    """Load investment category names from config_categories (any name containing 'invest')."""
+    defaults = {'Investment', 'Investment Transfer'}
+    try:
+        from sqlalchemy import text as _text
+        with engine.connect() as conn:
+            rows = conn.execute(_text(
+                "SELECT name FROM config_categories WHERE LOWER(name) LIKE '%invest%'"
+            )).fetchall()
+        if rows:
+            return {r[0] for r in rows}
+    except Exception:
+        pass
+    return defaults
+
 def _build_merchant_category_map(expenses_df: pd.DataFrame) -> dict:
     """
     Build a normalized-merchant → most-common-category map from expense data.
@@ -181,6 +197,8 @@ def aggregate_by_transaction_month(debug: bool = False):
 
     # Load investment keywords from DB (single source of truth)
     _INVESTMENT_PLATFORM_KEYWORDS = _load_investment_keywords_from_db(_db_engine)
+    # Load investment category names from DB (handles renamed categories)
+    _INVESTMENT_CATEGORIES = _load_investment_categories_from_db(_db_engine)
 
     # ── Read ALL expenses and income from DB ──────────────────────────────────
     all_expenses = []
@@ -256,6 +274,13 @@ def aggregate_by_transaction_month(debug: bool = False):
 
         combined_expenses = _auto_classify_expenses(combined_expenses)
 
+        # Auto-label investment-category rows as 'investment_transfer' so they always
+        # appear in the Investments tab regardless of what the category is named.
+        # user_corrected rows will override this in the restore step below.
+        if 'category' in combined_expenses.columns:
+            _inv_label_mask = combined_expenses['category'].astype(str).str.strip().isin(_INVESTMENT_CATEGORIES)
+            combined_expenses.loc[_inv_label_mask, 'Label'] = 'investment_transfer'
+
         combined_expenses['_parsed_date'] = pd.to_datetime(
             combined_expenses['Transaction Date'], format='mixed', errors='coerce'
         )
@@ -287,7 +312,10 @@ def aggregate_by_transaction_month(debug: bool = False):
 
             # Mirror Investment Transfer rows to the transfers pipeline
             if 'category' in output_df.columns:
-                inv_mask = output_df['category'].astype(str).str.strip().isin(['Investment', 'Investment Transfer'])
+                inv_mask = (
+                    output_df['category'].astype(str).str.strip().isin(_INVESTMENT_CATEGORIES) |
+                    output_df.get('Label', pd.Series(dtype=str)).astype(str).str.strip().eq('investment_transfer')
+                )
                 inv_rows = output_df[inv_mask].copy()
                 if not inv_rows.empty:
                     t = pd.DataFrame({
@@ -557,31 +585,81 @@ def aggregate_by_transaction_month(debug: bool = False):
     print("="*70)
 
     # ── Snapshot budget goals → budget_history ────────────────────────────────
-    # For every month that now exists in the transactions table, if the user has
-    # saved budget goals, write one budget_history row per category so the Month
-    # Report Card and trend charts have data to display.
+    # For every expense month in the DB:
+    #   1. Use per-month goals from budget_goals_monthly when available.
+    #   2. Fall back to the global budget_goals template otherwise.
+    #   3. Exclude parent-category goals when any of their children also have goals
+    #      (prevents double-counting e.g. Healthcare + Medical in totals).
     if _db_engine is not None:
         try:
             with _db_engine.connect() as conn:
-                goal_rows = conn.execute(_text(
+                # Global template — used as fallback for months with no per-month goals
+                global_goal_rows = conn.execute(_text(
                     "SELECT category, goal_amount FROM budget_goals WHERE goal_amount IS NOT NULL"
                 )).fetchall()
+                global_budget_map = {r[0]: float(r[1]) for r in global_goal_rows}
 
-            if goal_rows:
-                budget_map = {r[0]: float(r[1]) for r in goal_rows}
+                # All per-month goals grouped by month
+                try:
+                    monthly_rows = conn.execute(_text(
+                        "SELECT month, category, goal_amount FROM budget_goals_monthly "
+                        "WHERE goal_amount IS NOT NULL ORDER BY month, category"
+                    )).fetchall()
+                    monthly_goals_by_month: dict = {}
+                    for r in monthly_rows:
+                        monthly_goals_by_month.setdefault(r[0], {})[r[1]] = float(r[2])
+                except Exception:
+                    monthly_goals_by_month = {}
+
+                # Subcategory hierarchy: parent → [children]
+                try:
+                    sub_rows = conn.execute(_text(
+                        "SELECT name, parent FROM config_categories WHERE parent IS NOT NULL"
+                    )).fetchall()
+                    parent_to_children: dict = {}
+                    for _name, _parent in sub_rows:
+                        parent_to_children.setdefault(_parent, []).append(_name)
+                except Exception:
+                    parent_to_children = {}
 
                 # Get all distinct expense months currently in the DB
-                with _db_engine.connect() as conn:
-                    month_rows = conn.execute(_text(
-                        "SELECT DISTINCT report_month FROM transactions "
-                        "WHERE tx_type='expense' ORDER BY report_month"
-                    )).fetchall()
-                expense_months = [r[0] for r in month_rows if r[0]]
+                month_rows = conn.execute(_text(
+                    "SELECT DISTINCT report_month FROM transactions "
+                    "WHERE tx_type='expense' ORDER BY report_month"
+                )).fetchall()
+            expense_months = [r[0] for r in month_rows if r[0]]
 
+            if not global_budget_map and not monthly_goals_by_month:
+                if debug:
+                    print("\n  (No budget goals set — skipping budget_history snapshot)")
+            else:
                 from datetime import datetime, timezone
                 now_iso = datetime.now(timezone.utc).isoformat()
 
                 for month in expense_months:
+                    # Prefer per-month goals; fall back to global template
+                    raw_map = monthly_goals_by_month.get(month) or global_budget_map
+                    if not raw_map:
+                        continue
+
+                    # Strip parent-category goals when any of their children also have goals
+                    # to prevent double-counting in totals. We still keep parent rows with
+                    # goal=0 so any spending classified at the parent level remains visible.
+                    budget_map = {}
+                    for cat, amt in raw_map.items():
+                        children_of = parent_to_children.get(cat, [])
+                        if children_of and any(c in raw_map for c in children_of):
+                            # Parent has children with goals — store goal as 0 (actual still tracked)
+                            budget_map[cat] = 0.0
+                        else:
+                            budget_map[cat] = amt
+
+                    # Also include any parent categories that have actual spending but
+                    # no direct goal entry (so their transactions still appear in history)
+                    for parent_cat, children_list in parent_to_children.items():
+                        if parent_cat not in budget_map and any(c in budget_map for c in children_list):
+                            budget_map[parent_cat] = 0.0
+
                     # Compute actual spend per category for this month
                     with _db_engine.connect() as conn:
                         cat_rows = conn.execute(_text(
@@ -593,8 +671,13 @@ def aggregate_by_transaction_month(debug: bool = False):
                         ), {'m': month}).fetchall()
                     actual_by_cat = {r[0]: float(r[1]) for r in cat_rows if r[0]}
 
-                    # Write a history row for every category that has a goal
+                    # Write a history row for every category that has a goal.
+                    # Delete first so stale rows (e.g. parent categories from a previous run
+                    # that no longer belong) don't linger in the table.
                     with _db_engine.connect() as conn:
+                        conn.execute(_text(
+                            "DELETE FROM budget_history WHERE report_month=:m"
+                        ), {'m': month})
                         for category, goal_amt in budget_map.items():
                             actual = actual_by_cat.get(category, 0.0)
                             variance = actual - goal_amt
@@ -603,12 +686,6 @@ def aggregate_by_transaction_month(debug: bool = False):
                                 INSERT INTO budget_history
                                     (report_month, category, goal, actual, variance, variance_pct, created_at)
                                 VALUES (:m, :cat, :goal, :actual, :var, :vp, :ts)
-                                ON CONFLICT(report_month, category) DO UPDATE SET
-                                    goal        = excluded.goal,
-                                    actual      = excluded.actual,
-                                    variance    = excluded.variance,
-                                    variance_pct = excluded.variance_pct,
-                                    created_at  = excluded.created_at
                             """), {
                                 'm':      month,
                                 'cat':    category,
@@ -621,9 +698,8 @@ def aggregate_by_transaction_month(debug: bool = False):
                         conn.commit()
 
                 if debug:
-                    total_goals = len(budget_map)
-                    print(f"\n  ✓ Wrote budget_history for {len(expense_months)} month(s), "
-                          f"{total_goals} goal(s) each")
+                    print(f"\n  ✓ Wrote budget_history for {len(expense_months)} month(s) "
+                          f"(per-month goals used where available, parents excluded when children present)")
         except Exception as exc:
             print(f"⚠  Budget history snapshot failed (non-fatal): {exc}")
 

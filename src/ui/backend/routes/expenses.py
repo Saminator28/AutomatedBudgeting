@@ -67,8 +67,9 @@ def set_expense_label(payload: dict = Body(...)):
         amount = round(float(payload.get('amount', 0)), 2)
     except Exception:
         return JSONResponse(status_code=400, content={'error': 'Invalid amount'})
-    if label not in ('recurring', 'one-time'):
-        return JSONResponse(status_code=400, content={'error': 'label must be recurring or one-time'})
+    _VALID_EXPENSE_LABELS = {'recurring', 'one-time', 'annual', 'semi-annual', 'investment_transfer'}
+    if label not in _VALID_EXPENSE_LABELS:
+        return JSONResponse(status_code=400, content={'error': f'label must be one of: {", ".join(sorted(_VALID_EXPENSE_LABELS))}'})
 
     ok = False
     if _DB_AVAILABLE:
@@ -88,6 +89,13 @@ def set_expense_label(payload: dict = Body(...)):
     for stmt_dir in sorted(_STATEMENTS_BASE.iterdir()):
         if stmt_dir.is_dir():
             _update_csv_label(stmt_dir / 'expenses.csv', date, place, amount, label)
+
+    # Investment label: rebuild the transfers table so the row appears in the Investments tab
+    if label == 'investment_transfer' and ok:
+        try:
+            _rebuild_transfers_for_month(month)
+        except Exception as exc:
+            logging.warning(f'Transfer rebuild after label change failed: {exc}')
 
     return {'ok': ok, 'date': date, 'place': place, 'amount': amount, 'label': label}
 
@@ -288,8 +296,12 @@ def edit_expense(payload: dict = Body(...)):
             if new_category:
                 set_clauses.append('category=:new_cat'); params['new_cat'] = new_category
                 set_clauses.append('user_corrected=1')
+                # Auto-set investment label when re-categorized as an investment category
+                if new_category in _INVESTMENT_CATEGORIES and not new_label:
+                    new_label = 'investment_transfer'
             if new_label:
                 set_clauses.append('label=:new_lbl'); params['new_lbl'] = new_label
+                set_clauses.append('user_corrected=1')
             if new_amount is not None:
                 set_clauses.append('amount=:new_amt'); params['new_amt'] = round(float(new_amount), 2)
 
@@ -346,8 +358,9 @@ def edit_expense(payload: dict = Body(...)):
                     break
 
     new_cat_eff = new_category or ''
-    if new_cat_eff or old_category:
-        if old_category in _INVESTMENT_CATEGORIES or new_cat_eff in _INVESTMENT_CATEGORIES:
+    _is_inv_label = new_label == 'investment_transfer' if new_label else False
+    if new_cat_eff or old_category or _is_inv_label:
+        if old_category in _INVESTMENT_CATEGORIES or new_cat_eff in _INVESTMENT_CATEGORIES or _is_inv_label:
             try:
                 _rebuild_transfers_for_month(month)
             except Exception as exc:
@@ -356,31 +369,145 @@ def edit_expense(payload: dict = Body(...)):
     return {'success': True}
 
 
+
 # ── Categories ────────────────────────────────────────────────────────────────
+
+@router.get("/api/categories/full")
+def get_categories_full():
+    """Return {categories: [...], subcategories: {...}} from the config_categories DB table."""
+    if _DB_AVAILABLE:
+        try:
+            from sqlalchemy import text as _text
+            with get_engine().connect() as conn:
+                rows = conn.execute(_text(
+                    "SELECT name, parent FROM config_categories ORDER BY sort_order, name"
+                )).fetchall()
+            cats = [r[0] for r in rows]
+            subs: dict = {}
+            for name, parent in rows:
+                if parent:
+                    subs.setdefault(parent, []).append(name)
+            return {'categories': cats, 'subcategories': subs}
+        except Exception:
+            logging.exception("Failed to load categories from DB")
+    return {'categories': [], 'subcategories': {}}
+
+
+@router.put("/api/categories")
+def update_categories(payload: dict = Body(...)):
+    """Overwrite the categories list and subcategory hierarchy in the config_categories DB table."""
+    cats = payload.get('categories', [])
+    subs = payload.get('subcategories', {})
+    if not isinstance(cats, list) or not all(isinstance(c, str) for c in cats):
+        return JSONResponse(status_code=400, content={'error': 'categories must be a list of strings'})
+    if not isinstance(subs, dict):
+        return JSONResponse(status_code=400, content={'error': 'subcategories must be a dict'})
+    # Validate subcategory entries reference known categories
+    cat_set = set(cats)
+    for parent, children in subs.items():
+        if parent not in cat_set:
+            return JSONResponse(status_code=400, content={'error': f'subcategory parent "{parent}" not in categories list'})
+        if not isinstance(children, list):
+            return JSONResponse(status_code=400, content={'error': f'children of "{parent}" must be a list'})
+        for child in children:
+            if child not in cat_set:
+                return JSONResponse(status_code=400, content={'error': f'subcategory child "{child}" not in categories list'})
+
+    # ── Write to DB ────────────────────────────────────────────────────────────
+    if _DB_AVAILABLE:
+        try:
+            from sqlalchemy import text as _text
+            child_to_parent: dict[str, str] = {}
+            for parent, children in subs.items():
+                for child in children:
+                    child_to_parent[child] = parent
+            with get_engine().connect() as conn:
+                conn.execute(_text("DELETE FROM config_categories"))
+                for i, cat in enumerate(cats):
+                    conn.execute(_text(
+                        "INSERT INTO config_categories (name, parent, sort_order) VALUES (:n, :p, :s)"
+                    ), {'n': cat, 'p': child_to_parent.get(cat), 's': i})
+                conn.commit()
+            logging.info(f"config_categories updated: {len(cats)} categories, {len(subs)} parent groups")
+
+            # Reload investment categories so renaming takes effect immediately
+            from src.ui.backend import deps as _deps
+            _deps._reload_investment_categories()
+
+            # Auto-classify any new categories into a bucket and upsert into budget_goals
+            # so they immediately appear in the budget editor with a bucket assigned.
+            try:
+                from src.ai_analysis.budget_advisor import BudgetAdvisor
+                from datetime import datetime, timezone
+                advisor = BudgetAdvisor(use_ai=False)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                with get_engine().connect() as conn:
+                    existing_cats = {r[0] for r in conn.execute(_text(
+                        "SELECT category FROM budget_goals"
+                    )).fetchall()}
+                    existing_overrides = {r[0] for r in conn.execute(_text(
+                        "SELECT category FROM budget_goals WHERE bucket_override=1"
+                    )).fetchall()}
+                new_cats = [c for c in cats if c not in existing_cats]
+                if new_cats:
+                    with get_engine().connect() as conn:
+                        for cat in new_cats:
+                            if cat in existing_overrides:
+                                continue  # user has manually set the bucket — don't override
+                            bucket = advisor.classify_bucket(cat)
+                            conn.execute(_text("""
+                                INSERT INTO budget_goals (category, bucket, bucket_override, updated_at)
+                                VALUES (:cat, :bkt, 0, :ts)
+                                ON CONFLICT(category) DO UPDATE SET
+                                    bucket = CASE WHEN bucket_override=1 THEN bucket ELSE excluded.bucket END,
+                                    updated_at = excluded.updated_at
+                            """), {'cat': cat, 'bkt': bucket, 'ts': now_iso})
+                        conn.commit()
+                    logging.info(f"Auto-bucketed {len(new_cats)} new category/categories into budget_goals")
+            except Exception as _ab_err:
+                logging.warning(f"Auto-bucket classification failed (non-fatal): {_ab_err}")
+
+        except Exception as exc:
+            logging.exception("Failed to update config_categories in DB")
+            return JSONResponse(status_code=500, content={'error': str(exc)})
+
+    return {'success': True, 'categories': cats, 'subcategories': subs}
+
 
 @router.get("/api/categories")
 def get_flat_categories():
-    """Return the flat list of category names from categories.json."""
-    config_path = _CONFIG_ROOT / 'categories.json'
-    try:
-        with open(config_path, 'r') as f:
-            config = _json.load(f)
-        return [{'category': c} for c in config.get('categories', [])]
-    except Exception:
-        return []
+    """Return the flat list of category names."""
+    if _DB_AVAILABLE:
+        try:
+            from sqlalchemy import text as _text
+            with get_engine().connect() as conn:
+                rows = conn.execute(_text(
+                    "SELECT name FROM config_categories ORDER BY sort_order, name"
+                )).fetchall()
+            return [{'category': r[0]} for r in rows]
+        except Exception:
+            logging.exception("Failed to load flat categories from DB")
+    return []
 
 
 @router.get("/api/category-subcategories")
 def get_category_subcategories():
-    """Return parent→subcategory mapping from categories.json."""
-    config_path = _CONFIG_ROOT / 'categories.json'
-    try:
-        with open(config_path, 'r') as f:
-            config = _json.load(f)
-        return config.get('subcategories', {})
-    except Exception as exc:
-        logging.exception("Failed to load category subcategories")
-        return {}
+    """Return parent→subcategory mapping."""
+    if _DB_AVAILABLE:
+        try:
+            from sqlalchemy import text as _text
+            with get_engine().connect() as conn:
+                rows = conn.execute(_text(
+                    "SELECT name, parent FROM config_categories "
+                    "WHERE parent IS NOT NULL ORDER BY sort_order"
+                )).fetchall()
+            result: dict = {}
+            for name, parent in rows:
+                result.setdefault(parent, []).append(name)
+            return result
+        except Exception:
+            logging.exception("Failed to load category subcategories from DB")
+    return {}
 
 
 # ── Expense categories ────────────────────────────────────────────────────────
@@ -410,21 +537,19 @@ def get_expense_categories(month: str = None):
         return []
 
     category_totals: dict = defaultdict(float)
-    one_time_total = 0.0
 
     if not exp_df.empty and 'category' in exp_df.columns:
         _lbl_col = next((c for c in exp_df.columns if c.lower() == 'label'), None)
         for _, row in exp_df.iterrows():
             cat = str(row.get('category', '')).strip() or 'Uncategorized'
             row_lbl = str(row.get(_lbl_col, '')).strip().lower() if _lbl_col else ''
+            if row_lbl == 'one-time':
+                continue  # exclude one-time expenses from graphs
             try:
                 amt = float(row.get('Amount', 0) or 0)
             except Exception:
                 amt = 0.0
-            if row_lbl == 'one-time':
-                one_time_total += amt
-            else:
-                category_totals[cat] += amt
+            category_totals[cat] += amt
 
     if not inc_df.empty:
         for _, row in inc_df.iterrows():
@@ -436,14 +561,11 @@ def get_expense_categories(month: str = None):
             except Exception:
                 pass
 
-    result = [
+    return [
         {'category': cat, 'amount': round(total, 2)}
         for cat, total in category_totals.items()
         if cat
     ]
-    if one_time_total > 0:
-        result.append({'category': '⚡ Unusual Spending', 'amount': round(one_time_total, 2), 'one_time': True})
-    return result
 
 
 @router.get("/api/expenses-by-month")
@@ -456,8 +578,13 @@ def get_expenses_by_month():
     """
     subcategories = {}
     try:
-        with open(_CONFIG_ROOT / 'categories.json') as f:
-            subcategories = _json.load(f).get("subcategories", {})
+        from sqlalchemy import text as _sub_text
+        with get_engine().connect() as _sc:
+            _sub_rows = _sc.execute(_sub_text(
+                'SELECT name, parent FROM config_categories WHERE parent IS NOT NULL'
+            )).fetchall()
+        for _sname, _sparent in _sub_rows:
+            subcategories.setdefault(_sparent, []).append(_sname)
     except Exception:
         pass
     sub_to_parent = {sub: parent for parent, subs in subcategories.items() for sub in subs}
@@ -508,13 +635,7 @@ def get_expenses_by_month():
                     category_totals[cat] += float(row.get('Amount', 0) or 0)
                 except Exception:
                     pass
-            if not ot_month.empty:
-                try:
-                    ot_total = float(ot_month['Amount'].sum())
-                    if ot_total > 0:
-                        category_totals['⚡ Unusual Spending'] += ot_total
-                except Exception:
-                    pass
+            # one-time expenses are excluded from graphs entirely
 
         inc_month = inc_df[inc_df['tx_month'] == month_str] if not inc_df.empty else pd.DataFrame()
         if not inc_month.empty:

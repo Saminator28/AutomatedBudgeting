@@ -111,14 +111,61 @@ class BudgetAdvisor:
     # ── Fixed-cost detection ─────────────────────────────────────────────────
 
     @staticmethod
-    def _is_fixed_cost(monthly_amounts: List[float], cv_threshold: float = 0.05) -> bool:
-        """True if the coefficient of variation is < 5% — truly fixed recurring costs like rent.
-        Using CV (std/mean) instead of absolute std avoids flagging small variable bills."""
+    def _fixedness_tier(
+        monthly_amounts: List[float],
+        bounds: Tuple[float, float] = (0.05, 0.20),
+    ) -> str:
+        """Return 'fixed', 'semi-fixed', or 'variable' based on CV of non-zero amounts.
+
+        fixed      CV < 5%  — rent, annual subscriptions. Never reduce.
+        semi-fixed CV 5-20% — electric (seasonal), phone. Forecast, don't cut.
+        variable   CV > 20% — gas, groceries, entertainment. Subject to targets.
+        """
         if len(monthly_amounts) < 2:
-            return False
+            return 'variable'
         nonzero = [v for v in monthly_amounts if v > 0]
         if len(nonzero) < 2:
+            return 'variable'
+        mean = float(np.mean(nonzero))
+        if mean == 0:
+            return 'variable'
+        cv = float(np.std(nonzero)) / mean
+        lo, hi = bounds
+        if cv < lo:
+            return 'fixed'
+        elif cv < hi:
+            return 'semi-fixed'
+        else:
+            return 'variable'
+
+    @staticmethod
+    def _is_fixed_cost(monthly_amounts: List[float], cv_threshold: float = 0.05) -> bool:
+        """True if CV < 5% — truly fixed recurring costs like rent (backward compat)."""
+        return BudgetAdvisor._fixedness_tier(monthly_amounts) == 'fixed'
+
+    @staticmethod
+    def _is_committed_spend(
+        monthly_amounts: List[float],
+        months: int,
+        presence_threshold: float = 0.80,
+        cv_threshold: float = 0.15,
+    ) -> bool:
+        """True if spend is present in >= 80% of months AND CV of non-zero values < 15%.
+
+        Catches committed recurring wants (e.g., $250/mo charitable giving) that don't
+        qualify as 'fixed' (CV too high) but are clearly a regular committed obligation.
+        These should be forecast at their historical average — not reduced toward a
+        discretionary income-% target.
+        """
+        if months < 1:
             return False
+        nonzero = [v for v in monthly_amounts if v > 0]
+        presence = len(nonzero) / months
+        if presence < presence_threshold:
+            return False
+        if len(nonzero) < 2:
+            # Present every month with only one data point — treat as committed
+            return True
         mean = float(np.mean(nonzero))
         if mean == 0:
             return False
@@ -214,10 +261,15 @@ class BudgetAdvisor:
             monthly = cat_data.groupby('month')[amt_col].sum()
             monthly_amounts = sorted(monthly.items(), key=lambda x: x[0])
             amounts_list = [float(v) for _, v in monthly_amounts]
-            avg = float(monthly.mean()) if not monthly.empty else 0.0
+            # Use full analysis-window average (sum / months), not months-present average
+            # (monthly.mean()). This correctly amortizes sporadic spending — e.g. a single
+            # $5,000 investment in one of three months should budget ~$1,667/month, not $5,000.
+            avg = float(monthly.sum() / months) if (not monthly.empty and months > 0) else 0.0
             std = float(monthly.std()) if len(monthly) > 1 else 0.0
             slope_pct, direction = self._trend_slope(amounts_list)
-            is_fixed = self._is_fixed_cost(amounts_list)
+            tier = self._fixedness_tier(amounts_list)
+            is_fixed = (tier == 'fixed')
+            is_committed = self._is_committed_spend(amounts_list, months)
             category_stats[category] = {
                 'mean':           float(cat_data[amt_col].mean()),
                 'monthly_avg':    avg,
@@ -230,6 +282,8 @@ class BudgetAdvisor:
                 'trend_slope':    slope_pct,
                 'trend_direction': direction,
                 'is_fixed_cost':  is_fixed,
+                'fixedness_tier': tier,
+                'is_committed':   is_committed,
             }
 
         # ── Income-based pool calculations ───────────────────────────────────
@@ -249,8 +303,8 @@ class BudgetAdvisor:
             savings_target = avg_monthly_income * _save_frac
             spendable_income = avg_monthly_income - savings_target
             savings_target_amt = savings_target
-        needs_ceiling  = avg_monthly_income * _need_frac if avg_monthly_income > 0 else spendable_income * _need_frac
-        wants_ceiling  = avg_monthly_income * _want_frac if avg_monthly_income > 0 else spendable_income * _want_frac
+        needs_ceiling  = spendable_income * _need_frac
+        wants_ceiling  = spendable_income * _want_frac
         savings_target_amt = avg_monthly_income - spendable_income if avg_monthly_income > 0 else 0.0
 
         # ── Classify categories into buckets ─────────────────────────────────
@@ -262,6 +316,17 @@ class BudgetAdvisor:
         need_cats  = {c: category_stats[c] for c in category_stats if buckets.get(c) == 'Need'}
         want_cats  = {c: category_stats[c] for c in category_stats if buckets.get(c) == 'Want'}
         saving_cats = {c: category_stats[c] for c in category_stats if buckets.get(c) == 'Saving'}
+
+        # ── Goal mode: predictive (forecast) vs aspirational (target) ─────────
+        # predictive  → goal = forecast of expected spend; no income-% reduction
+        # aspirational → goal = target to work toward; income % caps apply
+        goal_modes: Dict[str, str] = {}
+        for cat, stats in category_stats.items():
+            tier = stats.get('fixedness_tier', 'variable')
+            if tier in ('fixed', 'semi-fixed') or stats.get('is_committed', False):
+                goal_modes[cat] = 'predictive'
+            else:
+                goal_modes[cat] = 'aspirational'
 
         # ── Smart Needs allocation ────────────────────────────────────────────
         needs_alloc: Dict[str, float] = {}
@@ -303,7 +368,9 @@ class BudgetAdvisor:
 
         # ── Build final suggestions ───────────────────────────────────────────
         if self.use_ai and self.model_loader:
-            ai_budgets = self._generate_ai_budgets(category_stats, months, avg_monthly_income)
+            ai_budgets = self._generate_ai_budgets(
+                category_stats, months, avg_monthly_income, goal_modes=goal_modes
+            )
         else:
             ai_budgets = {}
 
@@ -314,17 +381,24 @@ class BudgetAdvisor:
             is_fixed = stats['is_fixed_cost']
             direction = stats['trend_direction']
             slope_pct = stats['trend_slope']
+            goal_mode = goal_modes.get(category, 'aspirational')
+            tier = stats.get('fixedness_tier', 'variable')
+            is_committed = stats.get('is_committed', False)
 
-            # AI cap = income-anchored ceiling
-            if avg_monthly_income > 0:
+            # AI cap = spendable-anchored ceiling.
+            # Predictive categories (fixed/semi-fixed/committed) get no cap — they are
+            # forecasts, not targets. Only aspirational categories get income-% guidance.
+            if goal_mode == 'predictive':
+                ai_cap = None  # don't clamp — it's a forecast
+            elif spendable_income > 0:
                 if bucket == 'Need':
                     ai_cap = needs_alloc.get(category)
                     if ai_cap is None:
                         target_pct = self.INCOME_TARGETS.get(category, 0.05)
-                        ai_cap = avg_monthly_income * target_pct
+                        ai_cap = spendable_income * target_pct
                 elif bucket == 'Want':
                     target_pct = self.INCOME_TARGETS.get(category, 0.03)
-                    ai_cap = min(avg_monthly_income * target_pct, wants_ceiling * 0.3)
+                    ai_cap = spendable_income * target_pct  # per-category target, no blanket half-ceiling
                 else:
                     ai_cap = None  # savings — user controls
             else:
@@ -339,18 +413,33 @@ class BudgetAdvisor:
                 # Trend-aware fallback
                 if direction == 'increasing' and slope_pct > 5:
                     suggested = avg * 1.05
-                    reasoning = f'Trending up {slope_pct:+.1f}%/mo — slight ceiling applied'
+                    if goal_mode == 'predictive':
+                        reasoning = f'Forecast: trending up {slope_pct:+.1f}%/mo'
+                    else:
+                        reasoning = f'Trending up {slope_pct:+.1f}%/mo — slight ceiling applied'
                 elif direction == 'decreasing' and slope_pct < -5:
                     suggested = avg * 0.95
-                    reasoning = f'Trending down {slope_pct:.1f}%/mo — reward continued reduction'
+                    if goal_mode == 'predictive':
+                        reasoning = f'Forecast: trending down {slope_pct:.1f}%/mo'
+                    else:
+                        reasoning = f'Trending down {slope_pct:.1f}%/mo — reward continued reduction'
                 else:
                     suggested = avg
 
-                if ai_cap is not None and suggested > ai_cap and not is_fixed:
+                # Only apply income cap for aspirational categories
+                if goal_mode == 'aspirational' and ai_cap is not None and suggested > ai_cap:
                     suggested = ai_cap
                     reasoning = f'Capped at income-based {bucket} target'
                 elif not reasoning:
-                    reasoning = 'Based on 3-month average'
+                    if goal_mode == 'predictive':
+                        if is_committed and not is_fixed:
+                            reasoning = 'Committed recurring expense — forecast at historical average'
+                        elif tier == 'semi-fixed':
+                            reasoning = 'Semi-fixed cost (seasonal variation) — forecast, not a reduction target'
+                        else:
+                            reasoning = 'Fixed cost — forecast at historical average'
+                    else:
+                        reasoning = 'Based on 3-month average'
 
                 priority = (
                     'Essential' if category in self.ESSENTIAL_CATEGORIES
@@ -361,16 +450,19 @@ class BudgetAdvisor:
             change_pct = ((suggested - avg) / avg * 100) if avg > 0 else 0.0
 
             budgets[category] = {
-                'suggested_amount':  round(float(suggested), 2),
-                'ai_cap':            round(float(ai_cap), 2) if ai_cap is not None else None,
-                'historical_avg':    round(float(avg), 2),
-                'bucket':            bucket,
-                'bucket_override':   bool(bucket_overrides.get(category)),
-                'trend_slope':       stats['trend_slope'],
-                'trend_direction':   stats['trend_direction'],
-                'is_fixed_cost':     is_fixed,
-                'reasoning':         reasoning,
-                'priority':          priority,
+                'suggested_amount':    round(float(suggested), 2),
+                'ai_cap':              round(float(ai_cap), 2) if ai_cap is not None else None,
+                'historical_avg':      round(float(avg), 2),
+                'bucket':              bucket,
+                'bucket_override':     bool(bucket_overrides.get(category)),
+                'trend_slope':         stats['trend_slope'],
+                'trend_direction':     stats['trend_direction'],
+                'is_fixed_cost':       is_fixed,
+                'fixedness_tier':      tier,
+                'is_committed':        is_committed,
+                'goal_mode':           goal_mode,
+                'reasoning':           reasoning,
+                'priority':            priority,
                 'change_from_average': round(float(change_pct), 1),
             }
 
@@ -432,10 +524,16 @@ class BudgetAdvisor:
             'strategy':                   strategy,
         }
     
-    def _generate_ai_budgets(self, category_stats: Dict, months: int, avg_monthly_income: float = 0.0) -> Dict:
+    def _generate_ai_budgets(
+        self,
+        category_stats: Dict,
+        months: int,
+        avg_monthly_income: float = 0.0,
+        goal_modes: Optional[Dict[str, str]] = None,
+    ) -> Dict:
         """Use LLM to generate intelligent budget recommendations."""
+        goal_modes = goal_modes or {}
         try:
-            # Build comprehensive prompt
             prompt = f"""As a financial advisor, analyze this {months}-month spending data and suggest realistic monthly budget goals.
 
 SPENDING ANALYSIS:
@@ -446,14 +544,19 @@ SPENDING ANALYSIS:
                 monthly_avg = stats.get('monthly_avg', stats['mean'])
                 pct_of_total = (monthly_avg / total_avg * 100) if total_avg > 0 else 0
                 pct_of_income = (monthly_avg / avg_monthly_income * 100) if avg_monthly_income > 0 else None
+                mode = goal_modes.get(category, 'aspirational')
+                tier = stats.get('fixedness_tier', 'variable')
+                is_committed = stats.get('is_committed', False)
 
-                prompt += f"\n{category}:\n"
+                prompt += f"\n{category} [mode={mode}, tier={tier}]:\n"
                 prompt += f"  - Monthly Average: ${monthly_avg:,.2f} ({pct_of_total:.1f}% of total spending)"
                 if pct_of_income is not None:
                     prompt += f" | {pct_of_income:.1f}% of income"
                 prompt += "\n"
                 prompt += f"  - Range: ${stats['min']:,.2f} - ${stats['max']:,.2f}\n"
                 prompt += f"  - Trend: {stats.get('trend_direction', 'stable')} ({stats.get('trend_slope', 0):+.1f}%/mo)\n"
+                if is_committed:
+                    prompt += f"  - NOTE: Committed recurring expense (appears consistently at similar amounts)\n"
 
             prompt += f"\nTOTAL AVERAGE MONTHLY SPENDING: ${total_avg:,.2f}\n"
             if avg_monthly_income > 0:
@@ -462,24 +565,37 @@ SPENDING ANALYSIS:
 
             prompt += """
 
-BUDGET RULES TO APPLY (use these as hard targets, not suggestions):
-- Housing / Rent / Mortgage: target ≤ 30% of gross monthly income
-- Housing + Utilities combined: target ≤ 35% of gross monthly income
-- Groceries + Dining combined: target ≤ 15% of gross monthly income
-- Transportation (all transport categories combined): target ≤ 15% of gross monthly income
-- Savings / Investments: target ≥ 20% of gross monthly income
-- All other necessities: apply 50/30/20 rule judgment
-- Discretionary (dining out, entertainment, shopping): flag if over 30% of income total
-- For INCREASING trend categories: set goal at 5% above latest month (acknowledge trend)
-- For DECREASING trend categories: set goal at 5% below average (reward improvement)
+GOAL MODES — READ CAREFULLY BEFORE SETTING ANY AMOUNTS:
+
+PREDICTIVE categories [mode=predictive]: These are FIXED or COMMITTED recurring expenses.
+  Your job is FORECASTING, not reducing. Set suggested_amount = the historical average.
+  DO NOT apply income % targets. DO NOT suggest cuts. These include utilities, rent,
+  insurance, AND any discretionary category that appears consistently every month at
+  a similar amount (e.g., regular charitable giving, recurring subscriptions).
+  Reasoning should say something like: "Forecast based on consistent historical spend."
+
+ASPIRATIONAL categories [mode=aspirational]: These are discretionary/variable expenses
+  where budget guidance is helpful. Apply income % targets as gentle guidance — but be
+  realistic. If actual spending is close to the guideline, keep it there. Never suggest
+  near-$0 for a category the person genuinely uses.
+
+INCOME % GUIDELINES (for ASPIRATIONAL categories only):
+- Housing / Rent / Mortgage: ≤ 30% of gross income
+- Housing + Utilities combined: ≤ 35% of gross income
+- Groceries + Dining combined: ≤ 15% of gross income
+- Transportation (all): ≤ 15% of gross income
+- Savings / Investments: ≥ 20% of gross income
+- Entertainment + Shopping combined: ≤ 10% of gross income
+- INCREASING trend categories: suggest 5% above latest month (acknowledge trend)
+- DECREASING trend categories: suggest 5% below average (reward improvement)
 
 Format your response as JSON:
 {
   "CategoryName": {
     "suggested_amount": 450.00,
-    "reasoning": "Housing at 28% of income keeps you within the 30% guideline.",
+    "reasoning": "Forecast based on consistent $450/mo historical spend.",
     "priority": "Essential",
-    "change_from_average": -5.5
+    "change_from_average": 0.0
   }
 }
 
@@ -518,7 +634,8 @@ Provide ONLY valid JSON, no other text."""
             logger.error(f"Error generating AI budgets: {e}")
             return {}
     
-    # Income-based target percentages (gross monthly income)
+    # Income-based target percentages (gross monthly income).
+    # Used only for ASPIRATIONAL categories — predictive categories bypass these targets.
     INCOME_TARGETS = {
         # Housing
         'Rent/Mortgage': 0.28,
@@ -529,9 +646,12 @@ Provide ONLY valid JSON, no other text."""
         'Natural Gas':   0.02,
         'Water/Sewer':   0.02,
         'Internet/Cable': 0.02,
+        'Phone Bill':    0.02,
         # Food
         'Groceries':     0.10,
         'Dining':        0.05,
+        'Restaurants':   0.05,
+        'Fast Food':     0.03,
         # Transport
         'Transportation': 0.10,
         'Gas/Fuel':       0.05,
@@ -543,6 +663,10 @@ Provide ONLY valid JSON, no other text."""
         # Savings / Investments
         'Savings':       0.20,
         'Investments':   0.20,
+        # Committed wants — used only when category stays aspirational (not committed)
+        'Gifts & Donations': 0.05,
+        'Subscriptions': 0.02,
+        'Pet Care':      0.03,
         # Discretionary
         'Entertainment': 0.05,
         'Alcohol/Bar':   0.02,

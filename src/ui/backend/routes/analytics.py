@@ -174,6 +174,38 @@ def get_budget_suggestions(analysis_months: int = 3, savings_target: float = Non
             if _n_one_time > 0:
                 logging.info(f"📊 Excluding {_n_one_time} one-time expense(s) from budget projection averages")
             historical_df = historical_df[~_one_time_mask]
+            # Strip annual/semi-annual from 3-month baseline — they distort averages
+            # because a $1,200 annual payment in month 1 makes that category look 4×
+            # more expensive than it really is month-to-month.
+            _annual_mask = historical_df[_lbl_col].astype(str).str.strip().str.lower() == 'annual'
+            _semi_mask   = historical_df[_lbl_col].astype(str).str.strip().str.lower() == 'semi-annual'
+            _n_ann = int(_annual_mask.sum()); _n_semi = int(_semi_mask.sum())
+            if _n_ann + _n_semi > 0:
+                logging.info(f"📊 Stripping {_n_ann} annual + {_n_semi} semi-annual from 3-month baseline (amortized separately)")
+            historical_df = historical_df[~_annual_mask & ~_semi_mask]
+
+        # Pre-compute amortized monthly contributions from annual/semi-annual labeled expenses.
+        # Annual:      look back 12 months; total / 12 = monthly cost
+        # Semi-annual: look back 6 months;  total / 6  = monthly cost
+        _amortized_by_cat: dict = {}
+        try:
+            for _hist_df, _divisor, _lv in (
+                (_query_df('expense', recent_n=12), 12, 'annual'),
+                (_query_df('expense', recent_n=6),   6, 'semi-annual'),
+            ):
+                if _hist_df.empty:
+                    continue
+                _h_lbl = next((c for c in _hist_df.columns if c.lower() == 'label'), None)
+                _h_cat = next((c for c in _hist_df.columns if c.lower() == 'category'), None)
+                _h_amt = next((c for c in _hist_df.columns if c.lower() == 'amount'), None)
+                if not (_h_lbl and _h_cat and _h_amt):
+                    continue
+                for _cat, _grp in _hist_df[_hist_df[_h_lbl].astype(str).str.strip().str.lower() == _lv].groupby(_h_cat):
+                    _amortized_by_cat[_cat] = _amortized_by_cat.get(_cat, 0.0) + float(_grp[_h_amt].sum()) / _divisor
+            if _amortized_by_cat:
+                logging.info(f"📅 Amortized monthly amounts: { {k: round(v, 2) for k, v in _amortized_by_cat.items()} }")
+        except Exception as _amort_e:
+            logging.warning(f"Could not compute amortized amounts: {_amort_e}")
 
         income_df = _query_df('income', recent_n=analysis_months)
         total_income = 0.0
@@ -253,6 +285,127 @@ def get_budget_suggestions(analysis_months: int = 3, savings_target: float = Non
         )
         logging.info(f"💰 Generated budget suggestions (AI: {suggestions.get('ai_generated', False)}, income: ${avg_monthly_income:,.2f})")
 
+        # ── Reconcile suggestions against active config_categories ────────────
+        # 1. Load all active categories and their hierarchy from DB.
+        # 2. Remove suggestions for retired/stale categories not in config_categories.
+        # 3. Add entries for active categories with no historical spending, assigning a
+        #    small proportional amount from the remaining bucket pool so NO category
+        #    is left blank.
+        # 4. Enforce total suggested ≤ spendable_income.
+        try:
+            engine = _get_eng()
+            with engine.connect() as conn:
+                _cc_rows = conn.execute(_sqlt(
+                    "SELECT name, parent FROM config_categories ORDER BY sort_order, name"
+                )).fetchall()
+                # Load existing user goals so we can seed zero-spend categories from them
+                _user_goals = {r[0]: r[1] for r in conn.execute(_sqlt(
+                    "SELECT category, goal_amount FROM budget_goals WHERE goal_amount IS NOT NULL"
+                )).fetchall()}
+
+            active_cats = {r[0] for r in _cc_rows}
+            parent_cats = {r[0] for r in _cc_rows if r[1] is None and
+                           any(r2[1] == r[0] for r2 in _cc_rows)}  # has children
+            leaf_cats   = active_cats - parent_cats
+
+            sug = suggestions.get('suggested_budgets', {})
+            spendable = suggestions.get('spendable_income', avg_monthly_income) or 0.0
+
+            # Step 1: remove stale (retired) categories not in config_categories
+            for stale in list(sug.keys()):
+                if stale not in active_cats:
+                    del sug[stale]
+
+            # Step 2: compute bucket totals from existing suggestions
+            bucket_allocated: dict = {'Need': 0.0, 'Want': 0.0, 'Saving': 0.0}
+            for _cat, _b in sug.items():
+                _bkt = _b.get('bucket', 'Want')
+                bucket_allocated[_bkt] = bucket_allocated.get(_bkt, 0.0) + _b.get('suggested_amount', 0.0)
+
+            needs_pool   = suggestions.get('needs_ceiling', spendable * 0.50) or 0.0
+            wants_pool   = suggestions.get('wants_ceiling', spendable * 0.30) or 0.0
+
+            # Step 3: add zero-spend active categories
+            zero_spend_cats = [c for c in leaf_cats if c not in sug]
+            for cat in zero_spend_cats:
+                _ov = bucket_overrides.get(cat)
+                _bkt = advisor.classify_bucket(cat, _ov)
+                # Suggested amount: prefer amortized monthly cost (annual/semi-annual),
+                # then user goal, then proportional pool allocation
+                if cat in _amortized_by_cat and _amortized_by_cat[cat] > 0:
+                    _suggested = round(_amortized_by_cat[cat], 2)
+                    _reasoning = f'Annual/semi-annual amortized ${_suggested:.0f}/mo — no recurring monthly spending'
+                elif cat in _user_goals and _user_goals[cat] and _user_goals[cat] > 0:
+                    _suggested = float(_user_goals[cat])
+                    _reasoning = 'No historical spending — seeded from user goal'
+                else:
+                    # Proportional fallback: distribute remaining pool evenly among
+                    # zero-spend cats in this bucket (minimum $5, max $50)
+                    _n_zero = sum(1 for c in zero_spend_cats if advisor.classify_bucket(c, bucket_overrides.get(c)) == _bkt and c not in _amortized_by_cat)
+                    _remaining = max(0.0, (needs_pool if _bkt == 'Need' else wants_pool if _bkt == 'Want' else 0.0) - bucket_allocated.get(_bkt, 0.0))
+                    _slice = _remaining / max(_n_zero, 1)
+                    _suggested = round(min(max(_slice, 5.0), 50.0) / 5) * 5  # $5 increments, $5–$50
+                    _reasoning = 'No historical spending — allocated from budget pool'
+                bucket_allocated[_bkt] = bucket_allocated.get(_bkt, 0.0) + _suggested
+                sug[cat] = {
+                    'suggested_amount': _suggested,
+                    'ai_cap':           None,
+                    'historical_avg':   round(_amortized_by_cat.get(cat, 0.0), 2),
+                    'bucket':           _bkt,
+                    'bucket_override':  bool(_ov),
+                    'trend_slope':      0.0,
+                    'trend_direction':  'stable',
+                    'is_fixed_cost':    False,
+                    'has_amortized':    cat in _amortized_by_cat,
+                    'amortized_monthly': round(_amortized_by_cat.get(cat, 0.0), 2),
+                    'reasoning':        _reasoning,
+                    'priority':         'Important',
+                    'change_from_average': 0.0,
+                }
+                logging.info(f"  📋 Zero-spend category '{cat}' → bucket={_bkt}, suggested=${_suggested:.2f}")
+
+            # Step 3.5: inject amortized monthly amounts into categories that DO have
+            # regular monthly spending (the 3-month baseline excluded annual/semi-annual,
+            # so we add them back at their true monthly cost)
+            for _cat, _monthly_add in _amortized_by_cat.items():
+                if _monthly_add > 0 and _cat in sug and not sug[_cat].get('has_amortized'):
+                    sug[_cat]['suggested_amount'] = round(sug[_cat]['suggested_amount'] + _monthly_add, 2)
+                    sug[_cat]['historical_avg']   = round((sug[_cat].get('historical_avg') or 0.0) + _monthly_add, 2)
+                    sug[_cat]['amortized_monthly'] = round(_monthly_add, 2)
+                    sug[_cat]['has_amortized'] = True
+                    logging.info(f"  📅 Added ${_monthly_add:.2f}/mo amortized to '{_cat}'")
+
+            # Step 4: enforce total ≤ spendable_income (scale down proportionally if over)
+            if spendable > 0:
+                # Cap Saving-bucket suggestions at the formula-based savings ceiling so a
+                # sporadic large investment in a recent month doesn't crowd out all other
+                # categories (savings_target is income * strategy save-fraction).
+                savings_ceiling = suggestions.get('savings_target', spendable * 0.20) or 0.0
+                saving = {c: b for c, b in sug.items() if b.get('bucket') == 'Saving'}
+                saving_total_uncapped = sum(b.get('suggested_amount', 0) for b in saving.values())
+                if saving_total_uncapped > savings_ceiling > 0 and len(saving) > 0:
+                    _save_scale = savings_ceiling / saving_total_uncapped
+                    for _sc in saving:
+                        sug[_sc]['suggested_amount'] = round(sug[_sc]['suggested_amount'] * _save_scale, 2)
+                    logging.info(f"  ✂️  Capped savings suggestions from ${saving_total_uncapped:.2f} → ${savings_ceiling:.2f} (strategy ceiling)")
+
+                # Exclude Saving-bucket categories from the cap check (user controls savings)
+                non_saving = {c: b for c, b in sug.items() if b.get('bucket') != 'Saving'}
+                saving = {c: b for c, b in sug.items() if b.get('bucket') == 'Saving'}
+                saving_total = sum(b.get('suggested_amount', 0) for b in saving.values())
+                non_saving_total = sum(b.get('suggested_amount', 0) for b in non_saving.values())
+                max_non_saving = max(0.0, spendable - saving_total)
+                if non_saving_total > max_non_saving and non_saving_total > 0:
+                    scale = max_non_saving / non_saving_total
+                    for cat in non_saving:
+                        sug[cat]['suggested_amount'] = round(sug[cat]['suggested_amount'] * scale, 2)
+                    logging.info(f"  ⚖️  Scaled down non-saving suggestions by {scale:.2f}× to stay within spendable pool ${spendable:.2f}")
+
+            suggestions['suggested_budgets'] = sug
+            suggestions['total_budget'] = sum(b.get('suggested_amount', 0) for b in sug.values())
+        except Exception as _rce:
+            logging.warning(f"Could not reconcile suggestions with config_categories: {_rce}")
+
         # Cache ai_cap and historical_avg back to budget_goals (upsert, don't overwrite user goals)
         try:
             engine = _get_eng()
@@ -320,11 +473,23 @@ def get_budget_goals(month: str = None):
         from sqlalchemy import text as _sqlt
         engine = _get_eng()
         with engine.connect() as conn:
-            # Always load the global template (bucket, ai_cap, historical_avg)
-            global_rows = conn.execute(_sqlt(
-                "SELECT category, goal_amount, ai_cap, historical_avg, bucket, bucket_override "
-                "FROM budget_goals"
-            )).fetchall()
+            # Current valid category names — used to filter out stale goal rows
+            try:
+                known_cats = {r[0] for r in conn.execute(_sqlt(
+                    "SELECT name FROM config_categories"
+                )).fetchall()}
+            except Exception:
+                known_cats = set()
+
+            # Always load the global template (bucket, ai_cap, historical_avg, locked)
+            # Only keep rows whose category still exists in config_categories
+            global_rows = [
+                r for r in conn.execute(_sqlt(
+                    "SELECT category, goal_amount, ai_cap, historical_avg, bucket, bucket_override, locked "
+                    "FROM budget_goals"
+                )).fetchall()
+                if not known_cats or r[0] in known_cats
+            ]
             settings_row = conn.execute(_sqlt(
                 "SELECT savings_target_amount, savings_target_pct, strategy, avg_monthly_income_used "
                 "FROM budget_settings WHERE id=1"
@@ -335,9 +500,12 @@ def get_budget_goals(month: str = None):
             has_month_goals = False
             if month:
                 try:
-                    monthly_rows = conn.execute(_sqlt(
-                        "SELECT category, goal_amount FROM budget_goals_monthly WHERE month=:m"
-                    ), {'m': month}).fetchall()
+                    monthly_rows = [
+                        r for r in conn.execute(_sqlt(
+                            "SELECT category, goal_amount FROM budget_goals_monthly WHERE month=:m"
+                        ), {'m': month}).fetchall()
+                        if not known_cats or r[0] in known_cats
+                    ]
                     has_month_goals = len(monthly_rows) > 0
                 except Exception:
                     pass  # table may not exist yet on first run
@@ -351,7 +519,7 @@ def get_budget_goals(month: str = None):
             except Exception:
                 pass
 
-        # Build goal_details from global rows (bucket, ai_cap, historical_avg)
+        # Build goal_details from global rows (bucket, ai_cap, historical_avg, locked)
         goal_details = {
             r[0]: {
                 'goal_amount':    r[1],
@@ -359,6 +527,7 @@ def get_budget_goals(month: str = None):
                 'historical_avg': r[3],
                 'bucket':         r[4],
                 'bucket_override': bool(r[5]),
+                'locked':         bool(r[6]) if r[6] is not None else False,
             }
             for r in global_rows
         }
@@ -375,8 +544,18 @@ def get_budget_goals(month: str = None):
                                          'bucket_override': False}
 
         # goals = flat {category: amount} for backward compat
-        goals = {cat: d['goal_amount'] for cat, d in goal_details.items()
-                 if d['goal_amount'] is not None}
+        # For a new (unsaved) month: only carry locked categories' amounts forward.
+        # Unlocked categories intentionally get no amount so the AI fills them fresh
+        # based on that month's spending patterns and the chosen strategy.
+        # For a saved month: return all saved amounts regardless of lock state.
+        if has_month_goals:
+            # Saved month — use exact per-month amounts
+            goals = {cat: d['goal_amount'] for cat, d in goal_details.items()
+                     if d['goal_amount'] is not None}
+        else:
+            # New month — only locked categories carry their global-template amount
+            goals = {cat: d['goal_amount'] for cat, d in goal_details.items()
+                     if d['goal_amount'] is not None and d.get('locked', False)}
 
         settings_dict: dict = {}
         if settings_row:
@@ -411,10 +590,11 @@ async def save_budget_goals_db(body: dict = Body(...)):
         from sqlalchemy import text as _sqlt
         from datetime import datetime, timezone
 
-        # Accept both {budgets: {...}, settings: {...}, bucket_overrides: {...}} and a flat {category: amount} map
+        # Accept both {budgets: {...}, settings: {...}, bucket_overrides: {...}, locks: {...}} and a flat {category: amount} map
         budgets          = body.get('budgets', body if not body.get('settings') else {})
         settings         = body.get('settings', {})
         bucket_overrides = body.get('bucket_overrides', {})
+        locks            = body.get('locks', {})  # {category: bool} — true = locked, false = unlocked
         month            = body.get('month')  # YYYY-MM, or None for global template
         now = datetime.now(timezone.utc).isoformat()
 
@@ -467,6 +647,16 @@ async def save_budget_goals_db(body: dict = Body(...)):
                         updated_at      = excluded.updated_at
                 """), {'cat': category, 'bkt': bucket, 'ts': now})
 
+            # Persist lock state (cross-month, lives on the global template)
+            for category, is_locked in locks.items():
+                conn.execute(_sqlt("""
+                    INSERT INTO budget_goals (category, locked, updated_at)
+                    VALUES (:cat, :lk, :ts)
+                    ON CONFLICT(category) DO UPDATE SET
+                        locked     = excluded.locked,
+                        updated_at = excluded.updated_at
+                """), {'cat': category, 'lk': bool(is_locked), 'ts': now})
+
             if settings:
                 conn.execute(_sqlt("""
                     INSERT INTO budget_settings
@@ -494,6 +684,150 @@ async def save_budget_goals_db(body: dict = Body(...)):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+# NOTE: /api/budget/category-history and /api/budget/history are defined later
+# but they must be registered BEFORE /api/budget/{month} to avoid being swallowed.
+# They are moved to appear here via forward declarations; see actual impl below.
+# ----- moved up: category-history -----
+@router.get("/api/budget/category-history")
+def get_category_history(months: int = 6):
+    """Return per-category actual spending for the last N completed months (oldest→newest).
+
+    Response shape: { "YYYY-MM": {"Category": actual, ...}, ... }
+    plus a helper key "months_ordered": ["YYYY-MM", ...]
+    """
+    try:
+        from src.database.session import get_engine as _get_eng
+        from sqlalchemy import text as _sqlt
+
+        engine = _get_eng()
+        with engine.connect() as conn:
+            rows = conn.execute(_sqlt("""
+                SELECT report_month, category, actual
+                FROM budget_history
+                WHERE actual IS NOT NULL
+                ORDER BY report_month DESC
+                LIMIT :lim
+            """), {'lim': months * 60}).fetchall()
+
+        # Collect unique months (descending), take last `months`
+        months_seen: list = []
+        by_month: dict = {}
+        for report_month, category, actual in rows:
+            if report_month not in by_month:
+                by_month[report_month] = {}
+                months_seen.append(report_month)
+            by_month[report_month][category] = actual
+
+        # Keep only the requested number of months, return oldest-first
+        months_ordered = sorted(months_seen[:months])
+        return {"months_ordered": months_ordered, "by_month": {m: by_month[m] for m in months_ordered}}
+
+    except Exception as e:
+        logging.exception("Failed to fetch category history")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.get("/api/budget/committed")
+def get_committed_costs(lookback_months: int = 3):
+    """Detect recurring / committed costs from recent transactions.
+
+    A merchant is flagged as 'committed' when it appears in ≥2 of the last
+    ``lookback_months`` months AND its coefficient of variation (std/mean) is
+    below 15% (i.e. amount is very consistent).
+
+    Returns:
+      {
+        committed_total: float,
+        income_pct: float | null,
+        items: [
+          { merchant, category, monthly_amount, months_seen, cv_pct, is_fixed }
+        ]
+      }
+    """
+    try:
+        import statistics
+        from src.database.session import get_engine as _get_eng
+        from sqlalchemy import text as _sqlt
+
+        engine = _get_eng()
+        with engine.connect() as conn:
+            # Fetch expense transactions from last N months
+            rows = conn.execute(_sqlt("""
+                SELECT report_month, place, category, amount
+                FROM transactions
+                WHERE tx_type = 'expense'
+                  AND report_month >= date('now', :offset)
+                ORDER BY report_month, place
+            """), {'offset': f'-{lookback_months} months'}).fetchall()
+
+        # Group amounts & categories by merchant per month
+        from collections import defaultdict
+        merchant_months: dict = defaultdict(lambda: defaultdict(list))
+        merchant_categories: dict = defaultdict(lambda: defaultdict(int))  # place → {category: count}
+        for report_month, place, category, amount in rows:
+            if place and amount and amount > 0:
+                merchant_months[place][report_month].append(amount)
+                if category:
+                    merchant_categories[place][category] += 1
+
+        # Fetch avg_monthly_income from budget_settings for income_pct calculation
+        avg_income: float = 0.0
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(_sqlt(
+                    "SELECT avg_monthly_income FROM budget_settings ORDER BY updated_at DESC LIMIT 1"
+                )).fetchone()
+                if row and row[0]:
+                    avg_income = float(row[0])
+        except Exception:
+            pass
+
+        items = []
+        for place, month_dict in merchant_months.items():
+            months_present = [m for m in month_dict if month_dict[m]]
+            if len(months_present) < 2:
+                continue
+            # representative monthly amount = median of per-month totals
+            monthly_totals = [sum(month_dict[m]) for m in months_present]
+            median_amt = statistics.median(monthly_totals)
+            if median_amt <= 0:
+                continue
+            mean_amt = statistics.mean(monthly_totals)
+            std_amt = statistics.stdev(monthly_totals) if len(monthly_totals) > 1 else 0.0
+            cv = std_amt / mean_amt if mean_amt > 0 else 1.0
+
+            if cv > 0.15:
+                continue  # too variable to be considered committed
+
+            # Category resolution: most-common category for this merchant
+            cat_counts = merchant_categories.get(place, {})
+            cat = max(cat_counts, key=cat_counts.get) if cat_counts else 'Uncategorized'
+
+            items.append({
+                'merchant': place,
+                'category': cat or 'Uncategorized',
+                'monthly_amount': round(median_amt, 2),
+                'months_seen': len(months_present),
+                'cv_pct': round(cv * 100, 1),
+                'is_fixed': cv < 0.05,
+            })
+
+        # Sort by descending monthly amount
+        items.sort(key=lambda x: x['monthly_amount'], reverse=True)
+        committed_total = round(sum(i['monthly_amount'] for i in items), 2)
+        income_pct = round(committed_total / avg_income * 100, 1) if avg_income > 0 else None
+
+        return {
+            'committed_total': committed_total,
+            'income_pct': income_pct,
+            'items': items,
+        }
+
+    except Exception as e:
+        logging.exception("Failed to fetch committed costs")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 # Keep old endpoint as a thin alias so any existing clients don't break
 @router.post("/api/budget/save")
 async def save_budget_goals_legacy(budgets: dict = Body(...)):
@@ -506,6 +840,67 @@ async def save_budget_goals_legacy(budgets: dict = Body(...)):
         elif isinstance(val, (int, float)):
             flat[cat] = val
     return await save_budget_goals_db({'budgets': flat})
+
+
+@router.get("/api/budget/rollover/{month}")
+def get_budget_rollover(month: str):
+    """Return per-category surplus (rollover) from the month prior to `month`.
+
+    A category has a rollover when its ``variance`` in ``budget_history`` is
+    negative (actual < goal = under budget).  We expose the absolute surplus
+    so the UI can add it to the current month's goal as an effective cap.
+
+    Response shape:
+      {
+        "source_month": "YYYY-MM",
+        "rollovers": { "Category": surplus_amount, ... },
+        "total_rollover": float
+      }
+    """
+    try:
+        from src.database.session import get_engine as _get_eng
+        from sqlalchemy import text as _sqlt
+        import datetime
+
+        # Compute the month before `month`
+        year, mo = int(month[:4]), int(month[5:7])
+        prev_mo = mo - 1
+        prev_year = year
+        if prev_mo == 0:
+            prev_mo = 12
+            prev_year -= 1
+        source_month = f"{prev_year:04d}-{prev_mo:02d}"
+
+        engine = _get_eng()
+        with engine.connect() as conn:
+            rows = conn.execute(_sqlt("""
+                SELECT category, goal, actual, variance
+                FROM budget_history
+                WHERE report_month = :m
+            """), {'m': source_month}).fetchall()
+
+        rollovers: dict = {}
+        for category, goal, actual, variance in rows:
+            if variance is not None and variance < 0 and goal and goal > 0:
+                # variance = actual − goal; negative means under budget (surplus)
+                surplus = abs(variance)
+                rollovers[category] = round(surplus, 2)
+
+        return {
+            'source_month': source_month,
+            'rollovers': rollovers,
+            'total_rollover': round(sum(rollovers.values()), 2),
+        }
+
+    except Exception as e:
+        logging.exception("Failed to fetch budget rollover")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.get("/api/budget/history")
+def get_budget_history_early(months: int = 6):
+    """Return budget_history rows for the trend chart (registered before {month} wildcard)."""
+    return get_budget_history(months=months)
 
 
 @router.get("/api/budget/{month}")
@@ -552,8 +947,43 @@ def get_budget_comparison(month: str):
                 )).fetchall()
                 global_goals = {r[0]: r[1] for r in grows}
 
-            # Monthly goals take priority; global fills in any missing categories
-            merged_goals = {**global_goals, **monthly_goals}
+                # Monthly goals take priority; global fills in any missing categories
+                raw_merged = {**global_goals, **monthly_goals}
+
+                # Load current valid category names from DB (source of truth).
+                # Filter merged goals to only known categories so stale DB rows
+                # (old/deleted categories) don't inflate the total.
+                try:
+                    cat_rows = conn.execute(_sqlt(
+                        "SELECT name FROM config_categories"
+                    )).fetchall()
+                    known_cats = {r[0] for r in cat_rows}
+                except Exception:
+                    known_cats = set()
+
+                # Load subcategory map so we can fold child goals up into parents
+                # when no direct goal exists for the parent (e.g. Housing → Rent/Mortgage + Home Maintenance)
+                try:
+                    sub_rows = conn.execute(_sqlt(
+                        "SELECT name, parent FROM config_categories WHERE parent IS NOT NULL"
+                    )).fetchall()
+                    subcat_map: dict = {}
+                    for _name, _parent in sub_rows:
+                        subcat_map.setdefault(_parent, []).append(_name)
+                except Exception:
+                    subcat_map = {}
+
+            # Keep only goals whose category still exists in the dashboard
+            merged_goals = {cat: amt for cat, amt in raw_merged.items() if not known_cats or cat in known_cats}
+
+            # For parent categories that have no direct goal but whose children do,
+            # synthesize a parent goal = sum of child goals so the overview shows it.
+            for parent, children in subcat_map.items():
+                if parent not in merged_goals or merged_goals[parent] is None:
+                    child_sum = sum(merged_goals[c] for c in children if c in merged_goals and merged_goals[c])
+                    if child_sum > 0:
+                        merged_goals[parent] = child_sum
+
             budget_goals = {
                 cat: {'suggested_amount': float(amt), 'priority': 'Important'}
                 for cat, amt in merged_goals.items()
@@ -561,6 +991,7 @@ def get_budget_comparison(month: str):
         except Exception as db_err:
             logging.warning(f"Failed to read budget goals from DB: {db_err}")
             budget_goals = {}
+            merged_goals = {}
 
         if not budget_goals:
             return JSONResponse(
@@ -570,6 +1001,7 @@ def get_budget_comparison(month: str):
 
         advisor = BudgetAdvisor(use_ai=False)
         comparison = advisor.compare_to_budget(expenses_df, budget_goals)
+
         comparison['one_time_total'] = one_time_total
         comparison['month'] = month
 
@@ -703,9 +1135,27 @@ Be specific, practical, and warm. Mention 1-2 categories by name. Keep it under 
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@router.get("/api/budget/history")
+@router.delete("/api/budget/goals/{month}")
+def delete_budget_goals_month(month: str):
+    """Delete all saved per-month goal entries for a given month (YYYY-MM)."""
+    try:
+        from src.database.session import get_engine as _get_eng
+        from sqlalchemy import text as _sqlt
+        engine = _get_eng()
+        with engine.connect() as conn:
+            conn.execute(_sqlt(
+                "DELETE FROM budget_goals_monthly WHERE month=:m"
+            ), {'m': month})
+            conn.commit()
+        logging.info(f"Deleted budget goals for month {month}")
+        return {"deleted": month}
+    except Exception as e:
+        logging.exception("Failed to delete budget goals month")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 def get_budget_history(months: int = 6):
-    """Return budget_history rows for the trend chart."""
+    """Return budget_history rows for the trend chart (called via early-registered route)."""
     try:
         from src.database.session import get_engine as _get_eng
         from sqlalchemy import text as _sqlt
@@ -718,6 +1168,17 @@ def get_budget_history(months: int = 6):
                 ORDER BY report_month DESC, category
                 LIMIT :lim
             """), {'lim': months * 50}).fetchall()  # rough upper bound
+
+            # Load parent→children map to avoid double-counting parent+child goals
+            try:
+                sub_rows = conn.execute(_sqlt(
+                    "SELECT name, parent FROM config_categories WHERE parent IS NOT NULL"
+                )).fetchall()
+                _parent_to_children: dict = {}
+                for _name, _parent in sub_rows:
+                    _parent_to_children.setdefault(_parent, []).append(_name)
+            except Exception:
+                _parent_to_children = {}
 
         by_month: dict = {}
         for row in rows:
@@ -734,10 +1195,21 @@ def get_budget_history(months: int = 6):
         sorted_months = sorted(by_month.values(), key=lambda x: x['month'], reverse=True)[:months]
         for m_data in sorted_months:
             cats = m_data['categories']
-            m_data['total_goal']   = sum(v['goal']   or 0 for v in cats.values())
-            m_data['total_actual'] = sum(v['actual'] or 0 for v in cats.values())
-            total_goal = m_data['total_goal']
-            total_actual = m_data['total_actual']
+            # Exclude parent goals when any of their children are also present in this month's data
+            # (prevents double-counting e.g. Healthcare + Medical, Entertainment + Hobbies + Subscriptions)
+            total_goal = 0
+            total_actual = 0
+            for cat, v in cats.items():
+                children = _parent_to_children.get(cat, [])
+                if children and any(c in cats for c in children):
+                    # This is a parent whose children are also tracked — skip its goal to avoid double-count
+                    # Still count its actual (transactions classified directly as the parent)
+                    total_actual += v['actual'] or 0
+                else:
+                    total_goal   += v['goal']   or 0
+                    total_actual += v['actual'] or 0
+            m_data['total_goal']   = round(total_goal, 2)
+            m_data['total_actual'] = round(total_actual, 2)
             m_data['attainment_pct'] = (
                 round((1 - abs(total_actual - total_goal) / total_goal) * 100, 1)
                 if total_goal > 0 else None

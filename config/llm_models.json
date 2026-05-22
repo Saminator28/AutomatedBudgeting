@@ -1,5 +1,5 @@
 {
-  "primary_model": "qwen3.5:9b",
+  "primary_model": "gemma4:31b",
   "secondary_model": "",
   "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor",
   "description": "LLM model configuration for the chatbot two-model pipeline and statement categorization",

@@ -90,6 +90,24 @@ def _normalize_merchant_key(place: str) -> str:
     return ' '.join(s.split())
 
 
+def _normalize_whitelist_key(place: str) -> str:
+    """Date/time-stripped normalization for cross-month whitelist matching.
+
+    Strips date (M/DD/YY) and time (H:MM) patterns and masked-account tokens
+    (xxxxxxNNNN) from the standard normalized key so the same recurring transfer
+    description is recognized across different months even when the embedded
+    date or time in the description varies.
+    """
+    s = _normalize_merchant_key(place)
+    # Strip date-like patterns: 1/01/25, 12/01/2025, 12/25
+    s = re.sub(r'\d{1,2}/\d{2}(?:/\d{2,4})?', '', s)
+    # Strip time-like patterns: 4:31, 14:30
+    s = re.sub(r'\d{1,2}:\d{2}', '', s)
+    # Strip masked-account tokens like xxxxxx5218
+    s = re.sub(r'x+\d+', '', s)
+    return ' '.join(s.split()).strip()
+
+
 def _sync_merchant_metadata(engine, keywords: list[str], all_places: list[str]) -> None:
     """
     Upsert merchant_metadata rows for every unique place seen in transactions
@@ -296,6 +314,75 @@ def seed_institution_cache(engine, config_root: Path = _CONFIG_ROOT) -> int:
     return inserted
 
 
+# ── Default categories (seeded on first startup) ──────────────────────────────
+# Clean built-in defaults for new installs.  On first startup the app checks
+# whether config_categories is empty; if so, it seeds from this list.
+_DEFAULT_CATEGORIES: list[tuple[str, 'str | None']] = [
+    ('Groceries',          None),
+    ('Dining',             None),
+    ('Transportation',     None),
+    ('Gas/Fuel',           'Transportation'),
+    ('Auto Maintenance',   'Transportation'),
+    ('Parking',            'Transportation'),
+    ('Public Transit',     'Transportation'),
+    ('Housing',            None),
+    ('Rent/Mortgage',      'Housing'),
+    ('Home Maintenance',   'Housing'),
+    ('Utilities',          None),
+    ('Electric',           'Utilities'),
+    ('Natural Gas',        'Utilities'),
+    ('Water/Sewer',        'Utilities'),
+    ('Internet/Cable',     'Utilities'),
+    ('Phone',              'Utilities'),
+    ('Healthcare',         None),
+    ('Medical',            'Healthcare'),
+    ('Dental',             'Healthcare'),
+    ('Pharmacy',           'Healthcare'),
+    ('Health Insurance',   'Healthcare'),
+    ('Entertainment',      None),
+    ('Streaming',          'Entertainment'),
+    ('Hobbies',            'Entertainment'),
+    ('Shopping',           None),
+    ('Clothing',           'Shopping'),
+    ('Electronics',        'Shopping'),
+    ('Personal Care',      None),
+    ('Fitness & Wellness', None),
+    ('Travel',             None),
+    ('Pets',               None),
+    ('Education',          None),
+    ('Gifts & Donations',  None),
+    ('Banking Fees',       None),
+    ('Investments/Savings', None),
+]
+
+
+def seed_categories_if_empty(engine, config_root: Path = _CONFIG_ROOT) -> int:
+    """
+    Populate config_categories from built-in defaults only when the table is empty.
+    Safe to call on every startup.  Returns the number of rows inserted.
+    """
+    with engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM config_categories")).scalar()
+        if count > 0:
+            return 0
+
+        rows_to_insert: list[tuple[str, 'str | None']] | None = None
+        if not rows_to_insert:
+            rows_to_insert = list(_DEFAULT_CATEGORIES)
+
+        inserted = 0
+        for i, (name, parent) in enumerate(rows_to_insert):
+            conn.execute(text(
+                'INSERT OR IGNORE INTO config_categories (name, parent, sort_order) '
+                'VALUES (:n, :p, :s)'
+            ), {'n': name, 'p': parent, 's': i})
+            inserted += 1
+        conn.commit()
+
+    logger.info(f'seed_categories_if_empty: inserted {inserted} categories')
+    return inserted
+
+
 # ── Direct DataFrame writers ──────────────────────────────────────────────────
 
 _COL_MAP = {
@@ -416,7 +503,7 @@ def _auto_mark_bank_transfers(engine, month: str) -> int:
                 return 0
 
             rows = conn.execute(text(
-                "SELECT tx_hash, place, amount, tx_date FROM transactions "
+                "SELECT tx_hash, place, amount, tx_date, tx_type, statement FROM transactions "
                 "WHERE report_month=:m AND tx_type IN ('expense','income') "
                 "AND user_corrected=0"
             ), {'m': month}).fetchall()
@@ -425,11 +512,11 @@ def _auto_mark_bank_transfers(engine, month: str) -> int:
         whitelisted = get_whitelisted_places(engine, reason='transfer_keyword')
 
         to_transfer = []
-        for tx_hash, place, amount, tx_date in rows:
+        for tx_hash, place, amount, tx_date, orig_tx_type, orig_statement in rows:
             mk = _normalize_merchant_key(place)
             matched_kw = next((kw for kw in xfer_kws if kw in mk), None)
             if matched_kw and not any(kw in mk for kw in inv_kws):
-                if mk in whitelisted:
+                if mk in whitelisted or _normalize_whitelist_key(mk) in whitelisted:
                     continue  # User whitelisted this — keep as expense/income
                 to_transfer.append((tx_hash, place, amount, tx_date, matched_kw))
                 log_auto_deleted(
@@ -440,6 +527,8 @@ def _auto_mark_bank_transfers(engine, month: str) -> int:
                     report_month=month,
                     reason='transfer_keyword',
                     keyword_matched=matched_kw,
+                    tx_type=orig_tx_type or 'expense',
+                    original_statement=str(orig_statement or ''),
                 )
 
         if to_transfer:
@@ -630,6 +719,7 @@ def log_auto_deleted(engine, place: str, amount: float, tx_date: str,
     """
     from datetime import datetime as _dt
     place_norm = _normalize_merchant_key(place)
+    place_wl_norm = _normalize_whitelist_key(place)  # date/time-stripped for cross-month dedup
     now = _dt.now().isoformat()[:19]
     try:
         with engine.connect() as conn:
@@ -641,10 +731,20 @@ def log_auto_deleted(engine, place: str, amount: float, tx_date: str,
                     'AND report_month=:rm AND reason=:r'
                 ), {'pn': place_norm, 'amt': float(amount or 0), 'rm': report_month, 'r': reason}).fetchone()
             else:
+                # Try date-stripped key first so recurring transfers with varying date/time
+                # in their description aggregate to one record across months.
                 row = conn.execute(text(
                     'SELECT id, whitelisted, seen_months FROM auto_deleted_transactions '
                     'WHERE place_normalized=:pn AND ROUND(COALESCE(amount,0),2)=ROUND(:amt,2) AND reason=:r'
-                ), {'pn': place_norm, 'amt': float(amount or 0), 'r': reason}).fetchone()
+                ), {'pn': place_wl_norm, 'amt': float(amount or 0), 'r': reason}).fetchone()
+                if not row and place_wl_norm != place_norm:
+                    # Fallback: exact key — finds records written before this fix was applied
+                    row = conn.execute(text(
+                        'SELECT id, whitelisted, seen_months FROM auto_deleted_transactions '
+                        'WHERE place_normalized=:pn AND ROUND(COALESCE(amount,0),2)=ROUND(:amt,2) AND reason=:r'
+                    ), {'pn': place_norm, 'amt': float(amount or 0), 'r': reason}).fetchone()
+                # New records use the stripped key so all months map to the same entry
+                place_norm = place_wl_norm
 
             if row:
                 if row[1]:  # whitelisted — never re-record
@@ -775,6 +875,10 @@ def delete_auto_deleted_record(engine, record_id: int) -> bool:
 def get_whitelisted_places(engine, reason: str = '') -> set:
     """Return the set of normalized place names that are whitelisted.
     Optionally filter by *reason* (e.g. 'transfer_keyword', 'cross_account').
+
+    Returns BOTH the stored keys and their date/time-stripped variants so that
+    a whitelist entry created from a January occurrence also protects February's
+    transaction even when the description contains a varying date/time stamp.
     """
     try:
         with engine.connect() as conn:
@@ -787,7 +891,9 @@ def get_whitelisted_places(engine, reason: str = '') -> set:
                 rows = conn.execute(text(
                     'SELECT place_normalized FROM auto_deleted_transactions WHERE whitelisted=1'
                 )).fetchall()
-        return {r[0] for r in rows}
+        raw_keys = {r[0] for r in rows}
+        # Include date-stripped variants for cross-month matching
+        return raw_keys | {_normalize_whitelist_key(k) for k in raw_keys}
     except Exception:
         return set()
 
@@ -807,20 +913,23 @@ def _clear_auto_filter_for_month(engine, month: str) -> None:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
-                "SELECT id, reason, seen_months, occurrence_count "
+                "SELECT id, reason, seen_months, occurrence_count, whitelisted "
                 "FROM auto_deleted_transactions"
             )).fetchall()
-            for row_id, reason, seen_months_json, occ in rows:
+            for row_id, reason, seen_months_json, occ, is_whitelisted_flag in rows:
                 seen = json.loads(seen_months_json or '[]') if seen_months_json else []
                 if month not in seen:
                     continue
                 seen.remove(month)
                 new_occ = max(0, (occ or 1) - 1)
-                if not seen and reason != 'manual_delete':
+                if not seen and reason != 'manual_delete' and not is_whitelisted_flag:
+                    # Non-whitelisted, non-manual records with no remaining months are safe to delete
                     conn.execute(text(
                         "DELETE FROM auto_deleted_transactions WHERE id=:id"
                     ), {'id': row_id})
                 else:
+                    # Whitelisted records are NEVER deleted — they represent a permanent user decision.
+                    # manual_delete records are kept even with empty seen_months for future propagation.
                     conn.execute(text(
                         "UPDATE auto_deleted_transactions "
                         "SET seen_months=:sm, occurrence_count=:oc WHERE id=:id"

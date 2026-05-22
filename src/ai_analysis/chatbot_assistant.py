@@ -548,12 +548,15 @@ For everything else, answer naturally with specific details from the data."""
         except Exception:
             pass
 
-        # Load actual category list from config so the prompt stays in sync with user customizations
+        # Load actual category list from DB so the prompt stays in sync with user customizations
         _cat_list: list = []
         try:
-            _cat_cfg = Path(__file__).parent.parent.parent / 'config' / 'categories.json'
-            with open(_cat_cfg) as _cf:
-                _cat_list = json.load(_cf).get('categories', [])
+            from src.database.session import get_engine as _get_cat_engine
+            from sqlalchemy import text as _cat_text
+            with _get_cat_engine().connect() as _cc:
+                _cat_list = [r[0] for r in _cc.execute(_cat_text(
+                    'SELECT name FROM config_categories ORDER BY sort_order, name'
+                )).fetchall()]
         except Exception:
             pass
         _cat_enum = ' | '.join(_cat_list) if _cat_list else (
@@ -799,12 +802,18 @@ Rules:
         if _targeted and state.active_category and 'category' in filtered_exp.columns:
             cat_lower = state.active_category.lower()
 
-            # Expand parent categories to include subcategories from categories.json
+            # Expand parent categories to include subcategories from DB
             # (e.g. "Utilities" → ["Electric", "Natural Gas", "Water/Sewer", "Internet/Cable"])
             try:
-                _cfg_path = Path(__file__).parent.parent.parent / 'config' / 'categories.json'
-                with open(_cfg_path) as _f:
-                    _subcategories = json.load(_f).get('subcategories', {})
+                from src.database.session import get_engine as _get_sub_engine
+                from sqlalchemy import text as _sub_text
+                with _get_sub_engine().connect() as _sc:
+                    _sub_rows = _sc.execute(_sub_text(
+                        'SELECT name, parent FROM config_categories WHERE parent IS NOT NULL'
+                    )).fetchall()
+                _subcategories = {}
+                for _sname, _sparent in _sub_rows:
+                    _subcategories.setdefault(_sparent, []).append(_sname)
             except Exception:
                 _subcategories = {}
 

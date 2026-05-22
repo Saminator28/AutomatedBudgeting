@@ -591,55 +591,6 @@ tax_receipts_2025/
 
 ---
 
-### 23. Annual Expense Amortization
-**Priority:** High  
-**Complexity:** Low–Medium
-
-When a large payment covers an entire year (car insurance, HOA dues, software subscriptions
-billed annually, etc.) it distorts the month it lands in — that month looks drastically
-over-budget while every other month looks artificially cheap. Amortization spreads the cost
-evenly so monthly budgets reflect the true recurring cost.
-
-**How it works:**
-- User flags a transaction as an annual expense and sets the coverage period
-  (e.g., car insurance paid Jan 15, 2026 — covers Jan 2026 – Dec 2026, $1,200)
-- The app divides the amount by 12 and creates a **virtual monthly allocation** of $100
-  in each covered month under the same category
-- The original transaction is kept intact and visible (labelled `annual_lump_sum`), but the
-  dashboard's monthly totals use the amortized $100 figure instead of the full $1,200
-
-**User workflow:**
-- On any transaction row, click **⋯ → Amortize annually**
-- Drawer opens with pre-filled fields: amount, category, start month, end month (defaults
-  to 11 months after start), and a friendly label (e.g., "Car Insurance 2026")
-- Save — the allocation is stored in a new `annual_allocations` table
-
-**Dashboard changes:**
-- Monthly expense totals on Overview and the category breakdown charts reflect amortized
-  amounts when the "Amortized view" toggle is on (default: on)
-- Toggle off to see raw transaction totals (useful for cash-flow planning)
-- A small `÷12` badge appears on the category bar/slice that has active amortized entries
-  so the user knows the figure has been adjusted
-- **Annual Expenses** section in the Budgeting tab lists all active amortizations with
-  status (coverage months remaining), next renewal alert, and an edit/delete option
-
-**Renewal alerts:**
-- 60 days before a coverage period ends, a banner appears in the dashboard:
-  "Car Insurance renewal coming up in ~60 days — last year's cost was $1,200"
-- After the new payment is detected from the next statement, the old allocation auto-closes
-  and the user is prompted to create the new one
-
-**Implementation notes:**
-- `annual_allocations` table: `id`, `tx_hash` (links to the source transaction),
-  `label`, `category`, `total_amount`, `monthly_amount`, `start_month`, `end_month`,
-  `created_at`
-- `GET /api/annual-allocations` — list all; `POST` to create; `DELETE /:id` to remove
-- Monthly totals endpoint adds amortized amounts when `?amortized=true` (default)
-- The source transaction's `label` is set to `annual_lump_sum` so it can be excluded from
-  raw totals when amortized view is active
-
----
-
 ### 24. Event-Based Spending Tracking
 **Priority:** Medium  
 **Complexity:** Low–Medium

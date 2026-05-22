@@ -4,8 +4,8 @@ export_excel.py — Excel export for the Automated Budgeting API.
 GET /api/transactions/export?month=YYYY-MM
 
 Three-sheet workbook:
-  1. Monthly Budget   — template-style layout; categories come from categories.json
-                        so it automatically reflects any additions/removals.
+  1. Monthly Budget   — template-style layout; categories come from the config_categories
+                        DB table so it automatically reflects any additions/removals.
                         Budget column is blank for the user to fill in;
                         Actual is populated from the DB;
                         Remaining = Budget − Actual (live formula).
@@ -26,17 +26,20 @@ from src.ui.backend.deps import _DB_AVAILABLE, get_engine
 
 router = APIRouter()
 
-# categories.json lives at <project_root>/config/categories.json
-# This file: src/ui/backend/export_excel.py → parents[3] = project root
-_CONF_ROOT = Path(__file__).parents[3] / 'config'
-
-
 def _load_categories() -> tuple[list[str], dict[str, list[str]]]:
-    """Return (categories_list, subcategory_map) from categories.json."""
+    """Return (categories_list, subcategory_map) from the config_categories DB table."""
     try:
-        with open(_CONF_ROOT / 'categories.json') as fh:
-            data = _json.load(fh)
-        return data.get('categories', []), data.get('subcategories', {})
+        from sqlalchemy import text as _text
+        with get_engine().connect() as conn:
+            rows = conn.execute(_text(
+                "SELECT name, parent FROM config_categories ORDER BY sort_order, name"
+            )).fetchall()
+        cats = [r[0] for r in rows]
+        subs: dict = {}
+        for name, parent in rows:
+            if parent:
+                subs.setdefault(parent, []).append(name)
+        return cats, subs
     except Exception:
         return [], {}
 
@@ -53,7 +56,7 @@ def export_transactions(month: str = ''):
         from openpyxl.utils import get_column_letter
         from sqlalchemy import text as _text
 
-        # ── Load categories (dynamic, from categories.json) ──────────────────
+        # ── Load categories (dynamic, from config_categories DB) ─────────────
         all_cats, subcats = _load_categories()
         child_set = {c for children in subcats.values() for c in children}
         top_level = [c for c in all_cats if c not in child_set]
@@ -224,7 +227,7 @@ def export_transactions(month: str = ''):
         total_income_brow = brow - 1
         brow += 1
 
-        # Expenses section — categories come from categories.json
+        # Expenses section — categories come from config_categories DB
         _sec('EXPENSES')
         _col_hdrs()
 
@@ -242,7 +245,7 @@ def export_transactions(month: str = ''):
             else:
                 _brow_data(cat, cat_actuals.get(cat, 0.0))
 
-        # Any spend not in categories.json
+        # Any spend not in config_categories DB
         known_cats = set(all_cats)
         uncategorized = (
             cat_actuals.get('Uncategorized', 0.0)
