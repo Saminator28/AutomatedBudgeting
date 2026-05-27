@@ -48,7 +48,7 @@ Set monthly spending limits per category and track progress:
 
 - Each category shows a progress bar (spent vs. limit)
 - Green when under 80% of limit, yellow at 80–100%, red when over
-- Edit limits directly in the tab; limits persist to `config/budget_limits.json`
+- Edit limits directly in the tab; saved values persist in the budget tables in `budget.db`
 
 ---
 
@@ -99,7 +99,7 @@ The backend (`src/ui/backend/main.py`) serves two roles:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/available-months` | List months that have processed data |
-| `GET` | `/api/expenses` | All expense transactions for a month |
+| `GET` | `/api/all-expenses` | All expense transactions for a month |
 | `GET` | `/api/income-entries` | All income transactions for a month |
 | `GET` | `/api/expense-categories` | Aggregated totals by category |
 | `GET` | `/api/manual-transactions` | Manually entered transactions |
@@ -111,12 +111,11 @@ Query parameters used by most read endpoints: `?month=2025-06`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/upload-statement` | Upload a PDF file |
-| `POST` | `/api/process-statements` | Start background parsing job |
-| `PUT` | `/api/update-transaction` | Edit merchant name or category |
+| `POST` | `/api/statements/{month}/upload` | Upload one or more PDF files for a month |
+| `POST` | `/api/statements/{month}/process` | Start background parsing job for a month |
 | `PATCH` | `/api/expense/edit` | Edit merchant name, category, or amount for an expense row |
 | `POST` | `/api/manual-transactions` | Add a manual transaction entry |
-| `DELETE` | `/api/manual-transactions/{id}` | Remove a manual transaction |
+| `DELETE` | `/api/manual-transactions/{tx_id}` | Remove a manual transaction |
 
 #### Interactive API Docs
 
@@ -187,11 +186,9 @@ The React app (`src/ui/src/`) is a single-page application built with Create Rea
 | File | Purpose |
 |------|---------|
 | `App.js` | Root component; tab navigation; month selector |
-| `TransactionsTab.js` | All Transactions and Review tables |
-| `OverviewTab.js` | Charts and summary cards |
-| `BudgetTab.js` | Budget limits and progress bars |
-| `InvestmentsTab.js` | Investment transaction list |
-| `StatementsTab.js` | Upload UI and processing status |
+| `TransactionsTab.js` | Transaction table, inline edits, manual transactions, and reclassification flows |
+| `InsightsPanel.js` | Overview analytics, budgets, forecast, report card, and chatbot UI |
+| `SettingsTab.js` | Categories, keywords, merchant rules, and auto-filter management |
 
 ### Building the Frontend
 
@@ -210,9 +207,11 @@ For local development with live reload, see the [Developer Guide](DEVELOPER_GUID
 ## Docker Details
 
 The application runs as a single Docker container with:
-- `network_mode: host` — shares the host network so the container can reach Ollama at `localhost:11434`
 - Volume mount: `./src/ui/data:/app/src/ui/data` — data directory is persisted on the host
-- Port: `8000` (both inside and outside the container are identical due to host networking)
+- Port `8000` exposed by the app service
+- Platform-specific Ollama reachability:
+	- Linux: the `docker-compose.linux.yml` override uses `network_mode: host` so the container can reach host Ollama at `localhost:11434`
+	- Other setups: the base compose file uses bridge networking plus host aliases such as `host.docker.internal`
 
 **Start:**
 ```bash

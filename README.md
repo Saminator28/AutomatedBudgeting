@@ -16,6 +16,7 @@ If you've ever looked at your bank statement and thought *"where did all my mone
 - Charts tracking your spending month over month
 - An AI chatbot that answers questions like "how much did I spend on dining last month?"
 - The ability to upload statements, edit transactions, and re-categorize anything
+- A Settings area where you can manage categories, keywords, rules, and budget settings without editing code files
 
 **Who is it for?** Anyone who downloads PDF statements from their bank and wants a clear picture of their finances without paying for a budgeting app or handing their data to a third party.
 
@@ -140,21 +141,25 @@ curl -fsSL https://ollama.com/install.sh | sh
 
 ---
 
-### Step 3 — Download an AI Model
+### Step 3 — Download the AI Model Your App Is Configured To Use
 
-With Ollama installed, open a **Terminal** (macOS/Linux) or **Command Prompt / PowerShell** (Windows) and run:
+The model name is stored in `config/llm_models.json`.
+
+With Ollama installed, open `config/llm_models.json`, look at the `"primary_model"` value, then pull that exact model from a **Terminal** (macOS/Linux) or **Command Prompt / PowerShell** (Windows).
+
+At the moment, the default primary model in this repo is:
 
 ```
-ollama pull qwen2.5:14b
+ollama pull gemma4:31b
 ```
 
-This downloads the AI model used to understand transaction descriptions. It's about 9 GB, so it may take a few minutes depending on your connection. You only need to do this once.
+This downloads the AI model used to clean merchant names, help categorize transactions, and support chat features. You only need to do this once per model.
 
-> **Lower-spec computers:** If your computer has less than 16 GB of RAM, use this lighter model instead:
+> **Lower-spec computers:** If the default model is too heavy for your machine, choose a smaller model first by editing `config/llm_models.json`, then pull that model. For example:
 > ```
 > ollama pull qwen2.5:7b
 > ```
-> Then open `config/llm_models.json` in the project folder and change `"primary_model"` to `"qwen2.5:7b"`.
+> Then set `"primary_model"` to `"qwen2.5:7b"` in `config/llm_models.json` before starting the app.
 
 ---
 
@@ -288,7 +293,7 @@ Use the **month selector** in the top bar to switch between months.
 
 ### Transactions Tab
 
-The **Transactions** tab shows every transaction across all months. From here you can:
+The **Transactions** tab shows your transaction list and lets you search, filter, and edit it. From here you can:
 
 - **Search** by merchant name
 - **Filter** by type (expense, income, manual review)
@@ -368,32 +373,23 @@ If a transaction ends up in the wrong category, click it in the Transactions tab
 
 ### Customising Categories
 
-All categories are defined in `config/categories.json`. You can add, rename, or remove categories by editing that file.
+Categories are managed in the app's **Settings** tab and saved in the app database. You do not need to edit a JSON file or restart the app just to add or rename a category.
 
 **Add a top-level category:**
-1. Open `config/categories.json`
-2. Add the new name to the `"categories"` array:
-   ```json
-   "categories": [
-     "Groceries",
-     "Dining",
-     "Your New Category"
-   ]
-   ```
-3. Restart the app (`docker compose up -d`). The new category will appear in dropdowns and charts immediately.
+1. Open the **Settings** tab
+2. Go to the categories section
+3. Add the new category name and save it
+4. The new category will appear in dropdowns and charts immediately
 
 **Add a subcategory (rolls up to a parent in charts):**
-1. Add the subcategory to the `"categories"` array
-2. Add it under its parent in the `"subcategories"` dict:
-   ```json
-   "subcategories": {
-     "Transportation": ["Gas/Fuel", "Auto Maintenance", "Your Subcategory"]
-   }
-   ```
-Subcategories appear individually in transaction lists but are grouped under their parent in pie charts and budget summaries.
+1. Add the subcategory in the **Settings** tab
+2. Assign its parent category there
+3. Save the change
+
+Subcategories appear individually in transaction lists but are grouped under their parent in charts and summaries.
 
 **Remove a category:**
-1. Remove it from the `"categories"` array (and from `"subcategories"` if it's listed there)
+1. Remove it from the categories list in **Settings**
 2. Any existing transactions with that category will keep the old label — re-categorize them from the Transactions tab
 
 > **Tip:** Category names are case-sensitive. `"Groceries"` and `"groceries"` are treated as different categories.
@@ -429,7 +425,9 @@ The first time you process a statement it takes longer because the AI model is l
 
 If it consistently takes more than 5 minutes per statement, consider using a lighter model:
 1. Open `config/llm_models.json` in the project folder
-2. Change `"primary_model"` to `"qwen2.5:7b"` (download with `ollama pull qwen2.5:7b` first)
+2. Change `"primary_model"` to a smaller model such as `"qwen2.5:7b"`
+3. Pull that model with `ollama pull qwen2.5:7b`
+4. Restart the app
 
 </details>
 
@@ -487,17 +485,17 @@ All your data lives in the `src/ui/data/` folder inside the project directory:
 
 ```
 src/ui/data/
+   budget.db            ← database with transactions, categories, keywords, budgets, rules, and settings
+   transfer_labels.json ← saved labels for transfer rows
   statements/
     2025-01/    ← PDFs and processed CSVs for January 2025
     2025-02/    ← February 2025
     ...
-  monthly_reports/
-    expenses_2025-01.csv
-    income_2025-01.csv
-    ...
 ```
 
 **To back up your data:** copy the `src/ui/data/` folder to an external drive or cloud storage.
+
+This backup includes your transactions, uploaded statement files, custom categories, keywords, rules, and budget settings.
 
 **To move to a new computer:** copy the entire project folder, install Docker and Ollama on the new machine, and run `docker compose up --build -d`.
 
@@ -505,7 +503,7 @@ src/ui/data/
 
 ## Further Reading
 
-For deeper technical information, see the [docs/](docs/INDEX.md) folder:
+For deeper technical information, see the [docs/](docs/README.md) folder:
 
 - **[Developer Guide](docs/DEVELOPER_GUIDE.md)** — setting up a development environment
 - **[Architecture Overview](docs/ARCHITECTURE.md)** — how all the pieces fit together

@@ -135,19 +135,19 @@ Matching is done with `str.startswith()` on the uppercased description, so varia
 
 ### 8. Transfer Detection: `filter_transfers()`
 
-Reads `config/transfer_keywords.json`. Any transaction whose description contains a listed keyword is labeled `transfer` and excluded from expense and income totals.
+Reads the `transfer_keywords` DB table. Any transaction whose description contains a listed keyword is labeled `transfer` and excluded from expense and income totals.
 
 Example keywords: `"ACH TRANSFER"`, `"ONLINE TRANSFER"`, `"ZELLE TO"`, `"TRSF"`
 
 ### 9. Payment App Detection
 
-Reads `config/payment_apps.json`. Transactions matching payment apps (Venmo, Zelle, Cash App, PayPal, etc.) are flagged as `needs_review` because the actual merchant identity is in the memo/note, not the description.
+Reads the `payment_app_keywords` DB table. Transactions matching payment apps (Venmo, Zelle, Cash App, PayPal, etc.) are flagged as `needs_review` because the actual merchant identity is in the memo/note, not the description.
 
 These appear in the UI's **Review** queue for manual merchant/category assignment.
 
 ### 10. Income Detection
 
-Reads `config/income_keywords.json`. If the merchant/description matches an income keyword (e.g., employer name, `"DIRECT DEPOSIT"`, `"PAYROLL"`), the transaction is labeled `income` instead of `expense`.
+Reads the `income_keywords` DB table. If the merchant/description matches an income keyword (e.g., employer name, `"DIRECT DEPOSIT"`, `"PAYROLL"`), the transaction is labeled `income` instead of `expense`.
 
 Note: `_BANK_OPS` entries such as `Direct Deposit` are resolved before this stage — they bypass the LLM and arrive at income detection with a clean canonical name already set.
 
