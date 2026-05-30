@@ -343,14 +343,15 @@ class BudgetAdvisor:
             avg = stats['monthly_avg']
             slope_pct = stats['trend_slope']
             direction = stats['trend_direction']
+            cat_name = stats.get('_cat')
+            cat_series = (
+                historical_df[historical_df[cat_col] == cat_name].groupby('month')[amt_col].sum().items()
+                if cat_name else {}
+            )
             total_amounts = [
                 v for _, v in
                 sorted(
-                    (historical_df[historical_df[cat_col] == stats.get('_cat', '')]
-                     .groupby('month')[amt_col]
-                     .sum()
-                     .items()
-                     if '_cat' in stats else {}),
+                    cat_series,
                     key=lambda x: x[0]
                 )
             ]
