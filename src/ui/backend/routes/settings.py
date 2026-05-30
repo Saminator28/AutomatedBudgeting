@@ -119,12 +119,13 @@ def set_whitelist(record_id: int, body: dict = Body(None)):
 
             if whitelisted:
                 # ── Step 1: flip any existing 'transfer' rows back to expense/income ──
+                transfer_tx_dates: dict[str, str] = {}
                 with engine.connect() as conn:
                     transfer_rows = conn.execute(_text(
-                        "SELECT tx_hash, place, amount FROM transactions "
+                        "SELECT tx_hash, report_month, tx_date, place, amount FROM transactions "
                         "WHERE tx_type='transfer' AND user_corrected=0"
                     )).fetchall()
-                    for tx_hash, place, amount in transfer_rows:
+                    for tx_hash, report_month, tx_date, place, amount in transfer_rows:
                         norm = _normalize_merchant_key(place or '')
                         if norm == place_norm or _normalize_whitelist_key(norm) == place_wl_norm:
                             restore_type = stored_tx_type or (
@@ -134,6 +135,8 @@ def set_whitelist(record_id: int, body: dict = Body(None)):
                                 "UPDATE transactions SET tx_type=:t WHERE tx_hash=:h"
                             ), {'t': restore_type, 'h': tx_hash})
                             transactions_updated += 1
+                            if report_month and tx_date and report_month not in transfer_tx_dates:
+                                transfer_tx_dates[str(report_month)] = str(tx_date)
                     conn.commit()
 
                 # ── Step 2: insert rows for months where the transaction was filtered
@@ -159,8 +162,9 @@ def set_whitelist(record_id: int, body: dict = Body(None)):
                             continue
 
                         # Insert the missing transaction with LLM-cleaned name + category
+                        tx_date_for_month = transfer_tx_dates.get(str(month)) or tx_date_raw
                         tx_hash = _make_hash(
-                            month, tx_date_raw, clean_name,
+                            month, tx_date_for_month, clean_name,
                             amount_raw, restore_type, original_stmt,
                         )
                         conn.execute(_text("""
@@ -170,7 +174,7 @@ def set_whitelist(record_id: int, body: dict = Body(None)):
                             VALUES (:h, :m, :t, :d, :p, :a, :cat, 'recurring', :stmt, 0)
                         """), {
                             'h': tx_hash, 'm': month, 't': restore_type,
-                            'd': tx_date_raw, 'p': clean_name, 'a': amount_raw,
+                            'd': tx_date_for_month, 'p': clean_name, 'a': amount_raw,
                             'cat': category, 'stmt': original_stmt,
                         })
                         transactions_updated += 1
@@ -252,4 +256,3 @@ def delete_auto_filter(record_id: int):
 
 
 # Merchant-rules CRUD is handled in keywords.py (registered earlier in main.py).
-

@@ -367,6 +367,43 @@ def seed_categories_if_empty(engine, config_root: Path = _CONFIG_ROOT) -> int:
             return 0
 
         rows_to_insert: list[tuple[str, 'str | None']] | None = None
+        legacy_categories_path = config_root / 'categories.json'
+        if legacy_categories_path.exists():
+            try:
+                payload = json.loads(legacy_categories_path.read_text(encoding='utf-8'))
+                if isinstance(payload, dict):
+                    ordered_names: list[str] = []
+                    parent_by_name: dict[str, str | None] = {}
+
+                    for cat in payload.get('categories', []):
+                        name = str(cat or '').strip()
+                        if not name:
+                            continue
+                        if name not in parent_by_name:
+                            ordered_names.append(name)
+                            parent_by_name[name] = None
+
+                    subcats = payload.get('subcategories', {})
+                    if isinstance(subcats, dict):
+                        for parent, children in subcats.items():
+                            parent_name = str(parent or '').strip()
+                            if parent_name and parent_name not in parent_by_name:
+                                ordered_names.append(parent_name)
+                                parent_by_name[parent_name] = None
+                            if not isinstance(children, list):
+                                continue
+                            for child in children:
+                                child_name = str(child or '').strip()
+                                if not child_name:
+                                    continue
+                                if child_name not in parent_by_name:
+                                    ordered_names.append(child_name)
+                                parent_by_name[child_name] = parent_name or None
+
+                    if ordered_names:
+                        rows_to_insert = [(name, parent_by_name.get(name)) for name in ordered_names]
+            except Exception as exc:
+                logger.warning(f'Could not load legacy categories.json: {exc}')
         if not rows_to_insert:
             rows_to_insert = list(_DEFAULT_CATEGORIES)
 

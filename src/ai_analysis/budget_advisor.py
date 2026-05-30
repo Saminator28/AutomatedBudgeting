@@ -302,10 +302,9 @@ class BudgetAdvisor:
         if avg_monthly_income > 0 and savings_target is None:
             savings_target = avg_monthly_income * _save_frac
             spendable_income = avg_monthly_income - savings_target
-            savings_target_amt = savings_target
-        needs_ceiling  = spendable_income * _need_frac
-        wants_ceiling  = spendable_income * _want_frac
-        savings_target_amt = avg_monthly_income - spendable_income if avg_monthly_income > 0 else 0.0
+        needs_ceiling  = avg_monthly_income * _need_frac if avg_monthly_income > 0 else 0.0
+        wants_ceiling  = avg_monthly_income * _want_frac if avg_monthly_income > 0 else 0.0
+        savings_target_amt = float(savings_target or 0.0) if avg_monthly_income > 0 else 0.0
 
         # ── Classify categories into buckets ─────────────────────────────────
         buckets: Dict[str, str] = {}
@@ -410,6 +409,7 @@ class BudgetAdvisor:
                 reasoning = ai_budgets[category].get('reasoning', '')
                 priority  = ai_budgets[category].get('priority', 'Important')
             else:
+                reasoning = ''
                 # Trend-aware fallback
                 if direction == 'increasing' and slope_pct > 5:
                     suggested = avg * 1.05
@@ -784,4 +784,3 @@ Provide ONLY valid JSON, no other text."""
             'total_variance_percent': ((total_actual - total_budget) / total_budget * 100) if total_budget > 0 else 0,
             'on_track': total_actual <= total_budget
         }
-

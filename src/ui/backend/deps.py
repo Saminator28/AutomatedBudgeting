@@ -84,24 +84,6 @@ def _reload_investment_categories() -> None:
     except Exception as exc:
         logging.warning(f'Could not reload investment categories: {exc}')
 
-def _reload_investment_categories() -> None:
-    """Re-populate _INVESTMENT_CATEGORIES from config_categories rows whose names
-    contain 'invest' (case-insensitive), so renaming the category in Settings
-    does not break the Investments tab."""
-    if not _DB_AVAILABLE:
-        return
-    try:
-        from sqlalchemy import text as _text
-        with get_engine().connect() as conn:
-            rows = conn.execute(_text(
-                "SELECT name FROM config_categories WHERE LOWER(name) LIKE '%invest%'"
-            )).fetchall()
-        if rows:
-            _INVESTMENT_CATEGORIES.clear()
-            _INVESTMENT_CATEGORIES.update(r[0] for r in rows)
-    except Exception as exc:
-        logging.warning(f'Could not reload investment categories: {exc}')
-
 def _reload_investment_keywords() -> None:
     """Re-populate _INVESTMENT_PLATFORM_KEYWORDS from the DB (in-place)."""
     if not _DB_AVAILABLE:

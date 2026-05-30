@@ -775,7 +775,7 @@ def get_committed_costs(lookback_months: int = 3):
         try:
             with engine.connect() as conn:
                 row = conn.execute(_sqlt(
-                    "SELECT avg_monthly_income FROM budget_settings ORDER BY updated_at DESC LIMIT 1"
+                    "SELECT avg_monthly_income_used FROM budget_settings ORDER BY updated_at DESC LIMIT 1"
                 )).fetchone()
                 if row and row[0]:
                     avg_income = float(row[0])
@@ -994,6 +994,32 @@ def get_budget_comparison(month: str):
             merged_goals = {}
 
         if not budget_goals:
+            try:
+                legacy_path = _PROJECT_ROOT / 'config' / 'budgets.json'
+                if legacy_path.exists():
+                    with legacy_path.open('r', encoding='utf-8') as fh:
+                        legacy_goals_raw = json.load(fh)
+                    if isinstance(legacy_goals_raw, dict):
+                        merged_goals = {}
+                        for cat, value in legacy_goals_raw.items():
+                            amount = None
+                            if isinstance(value, (int, float)):
+                                amount = float(value)
+                            elif isinstance(value, dict):
+                                if isinstance(value.get('goal_amount'), (int, float)):
+                                    amount = float(value['goal_amount'])
+                                elif isinstance(value.get('suggested_amount'), (int, float)):
+                                    amount = float(value['suggested_amount'])
+                            if amount is not None:
+                                merged_goals[cat] = amount
+                        budget_goals = {
+                            cat: {'suggested_amount': amt, 'priority': 'Important'}
+                            for cat, amt in merged_goals.items()
+                        }
+            except Exception as file_err:
+                logging.warning(f"Failed to load legacy budget goals file: {file_err}")
+
+        if not budget_goals:
             return JSONResponse(
                 status_code=404,
                 content={"error": "No budget goals found. Set your budget first."}
@@ -1165,9 +1191,17 @@ def get_budget_history(months: int = 6):
             rows = conn.execute(_sqlt("""
                 SELECT report_month, category, goal, actual, variance, variance_pct, coaching_note
                 FROM budget_history
+                WHERE report_month IN (
+                    SELECT report_month
+                    FROM (
+                        SELECT DISTINCT report_month
+                        FROM budget_history
+                        ORDER BY report_month DESC
+                        LIMIT :months
+                    )
+                )
                 ORDER BY report_month DESC, category
-                LIMIT :lim
-            """), {'lim': months * 50}).fetchall()  # rough upper bound
+            """), {'months': months}).fetchall()
 
             # Load parent→children map to avoid double-counting parent+child goals
             try:
