@@ -76,6 +76,7 @@ async def _lifespan(app: FastAPI):
             deps._reload_ignore_keywords()
             deps._reload_payment_app_keywords()
             deps._reload_transfer_keywords()
+            deps._reload_investment_categories()
         except Exception as exc:
             logging.warning(f"⚠️  DB startup check failed (non-fatal): {exc}")
     yield

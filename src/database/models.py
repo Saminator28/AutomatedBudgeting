@@ -15,7 +15,7 @@ Tables:
 
 from sqlalchemy import (
     MetaData, Table, Column,
-    Integer, String, Float, Boolean, Text, Index,
+    Integer, String, Float, Boolean, Text, Index, UniqueConstraint,
 )
 
 metadata = MetaData()
@@ -181,4 +181,75 @@ merchant_rules = Table(
     Column('display_name', String(256)),       # original merchant name shown in UI
     Column('action',       String(16),  nullable=False),  # 'income'|'expense'|'ignore'
     Column('category',     String(128)),       # used when action='expense'
+)
+
+# ── budget_goals ──────────────────────────────────────────────────────────────
+# One row per category.  Single source of truth for what the user wants to
+# spend each month.  Replaces config/budgets.json entirely.
+budget_goals = Table(
+    'budget_goals', metadata,
+    Column('id',             Integer, primary_key=True, autoincrement=True),
+    Column('category',       Text, unique=True, nullable=False, index=True),
+    Column('goal_amount',    Float),           # user's saved goal (null = no goal set)
+    Column('ai_cap',         Float),           # income-anchored 50/30/20 ceiling
+    Column('historical_avg', Float),           # 3-month rolling avg at last AI run
+    Column('bucket',         Text),            # 'Need' | 'Want' | 'Saving'
+    Column('bucket_override', Boolean, default=False),  # true = user set bucket manually
+    Column('locked',         Boolean, default=False),   # true = user pinned; carries amount across months
+    Column('updated_at',     Text),            # ISO timestamp of last save
+)
+
+# ── budget_settings ───────────────────────────────────────────────────────────
+# Global budget settings — always a single row (id=1), updated in-place.
+budget_settings = Table(
+    'budget_settings', metadata,
+    Column('id',                      Integer, primary_key=True, autoincrement=True),
+    Column('savings_target_amount',   Float),
+    Column('savings_target_pct',      Float),
+    Column('strategy',                Text, server_default='50/30/20'),
+    Column('avg_monthly_income_used', Float),
+    Column('updated_at',              Text),
+)
+
+# ── budget_history ────────────────────────────────────────────────────────────
+# One row per (report_month, category).  Populated automatically each time
+# aggregate_monthly.py runs.  Used for the Month Report Card and trend charts.
+budget_history = Table(
+    'budget_history', metadata,
+    Column('id',            Integer, primary_key=True, autoincrement=True),
+    Column('report_month',  Text, nullable=False, index=True),  # YYYY-MM
+    Column('category',      Text, nullable=False),
+    Column('goal',          Float),
+    Column('actual',        Float),
+    Column('variance',      Float),            # actual − goal (negative = under budget ✓)
+    Column('variance_pct',  Float),
+    Column('coaching_note', Text),
+    Column('created_at',    Text),
+    UniqueConstraint('report_month', 'category', name='uq_budget_history_month_cat'),
+)
+
+# ── budget_goals_monthly ──────────────────────────────────────────────────────
+# Per-month budget goal amounts.  Each month the user saves goals, they land
+# here as (month, category) rows.  The global budget_goals table stays as the
+# category-level template (bucket, ai_cap, historical_avg, bucket_override).
+budget_goals_monthly = Table(
+    'budget_goals_monthly', metadata,
+    Column('id',          Integer, primary_key=True, autoincrement=True),
+    Column('month',       Text, nullable=False, index=True),  # YYYY-MM
+    Column('category',    Text, nullable=False, index=True),
+    Column('goal_amount', Float),
+    Column('updated_at',  Text),
+    UniqueConstraint('month', 'category', name='uq_budget_goals_monthly'),
+)
+
+# ── config_categories ─────────────────────────────────────────────────────────
+# Source of truth for user-configurable categories and hierarchy.
+# The Settings > Categories UI reads/writes here.
+# config_categories is the single source of truth for category names and hierarchy.
+config_categories = Table(
+    'config_categories', metadata,
+    Column('id',         Integer, primary_key=True, autoincrement=True),
+    Column('name',       Text,    nullable=False, unique=True),
+    Column('parent',     Text,    nullable=True),   # NULL = top-level category
+    Column('sort_order', Integer, server_default='0'),
 )

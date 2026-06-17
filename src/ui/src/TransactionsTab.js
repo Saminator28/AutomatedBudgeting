@@ -393,7 +393,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
       // never show a dialog or create a merchant rule for those.
       // Only Regular income (label='recurring') can optionally save a merchant rule.
       const investmentCategories = ['Investment', 'Investment Transfer'];
-      const isInvestmentTx = investmentCategories.includes(row.category);
+      const isInvestmentTx = investmentCategories.includes(row.category) || row.label === 'investment_transfer';
       const incomeLabel = isInvestmentTx ? 'investment_transfer' : 'recurring';
       const saveRule = !isInvestmentTx && window.confirm(
         `Save "${row.place}" as a recurring income rule?\n\nChoose OK to always classify this merchant as income, or Cancel to reclassify this transaction only.`
@@ -515,7 +515,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                   style={{ width: '100%', padding: '8px 10px', border: '1px solid #cbd5e1', borderRadius: 7, fontSize: 14, boxSizing: 'border-box', background: '#fff' }}>
                   {form.type === 'income'
                     ? <><option value="recurring">✅ Regular</option><option value="bonus">⭐ Bonus</option></>
-                    : <><option value="recurring">📌 Normal</option><option value="one-time">⚡ One-Time</option></>}
+                    : <><option value="recurring">📌 Normal</option><option value="one-time">⚡ One-Time</option><option value="annual">📅 Annual</option><option value="semi-annual">📅 Semi-Annual</option><option value="investment_transfer">📈 Investment</option></>}
                 </select>
               </div>
             </div>
@@ -576,8 +576,8 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                           <td style={{ ...td, color: tx.category ? '#374151' : '#94a3b8' }}>{tx.category || '—'}</td>
                           <td style={{ ...td, textAlign: 'right', fontWeight: 600 }}>{formatCurrency(tx.amount)}</td>
                           <td style={td}>
-                            <span style={{ background: tx.label === 'bonus' ? '#fffbeb' : tx.label === 'one-time' ? '#fff7ed' : '#f0fdf4', color: tx.label === 'bonus' ? '#b45309' : tx.label === 'one-time' ? '#c2410c' : '#166534', borderRadius: 4, padding: '2px 7px', fontSize: 11, fontWeight: 700 }}>
-                              {tx.label === 'bonus' ? '⭐ Bonus' : tx.label === 'one-time' ? '⚡ One-Time' : tx.type === 'income' ? '✅ Regular' : '📌 Normal'}
+                            <span style={{ background: tx.label === 'bonus' ? '#fffbeb' : tx.label === 'one-time' ? '#fff7ed' : tx.label === 'annual' || tx.label === 'semi-annual' ? '#eff6ff' : tx.label === 'investment_transfer' && tx.type !== 'income' ? '#ecfdf5' : '#f0fdf4', color: tx.label === 'bonus' ? '#b45309' : tx.label === 'one-time' ? '#c2410c' : tx.label === 'annual' ? '#1d4ed8' : tx.label === 'semi-annual' ? '#0369a1' : tx.label === 'investment_transfer' && tx.type !== 'income' ? '#065f46' : '#166534', borderRadius: 4, padding: '2px 7px', fontSize: 11, fontWeight: 700 }}>
+                              {tx.label === 'bonus' ? '⭐ Bonus' : tx.label === 'one-time' ? '⚡ One-Time' : tx.label === 'annual' ? '📅 Annual' : tx.label === 'semi-annual' ? '📅 Semi-Annual' : tx.label === 'investment_transfer' && tx.type !== 'income' ? '📈 Investment' : tx.type === 'income' ? '✅ Regular' : '📌 Normal'}
                             </span>
                           </td>
                           <td style={td}>
@@ -817,6 +817,9 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
                               >
                                 <option value="recurring">📌 Normal</option>
                                 <option value="one-time">⚡ One-Time</option>
+                                <option value="annual">📅 Annual</option>
+                                <option value="semi-annual">📅 Semi-Annual</option>
+                                <option value="investment_transfer">📈 Investment</option>
                               </select>
                             )}
                           </td>

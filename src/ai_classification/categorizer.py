@@ -2,7 +2,7 @@
 Transaction Categorization Module
 
 Uses merchant history and AI to classify transactions into budget categories.
-Category list loaded from config/categories.json for easy customization.
+Category list is loaded from the config_categories database table.
 """
 
 import pandas as pd
@@ -32,23 +32,23 @@ class TransactionCategorizer:
             merchant_history: MerchantHistory instance for learning from past corrections (recommended)
         """
         llm_host = llm_host or _OLLAMA_HOST
-        # Load valid categories and subcategories from categories.json
-        categories_config_path = Path(__file__).parent.parent.parent / 'config' / 'categories.json'
+        # Load valid categories and subcategories from config_categories DB table
         self.subcategories = {}   # parent → [subcategories]
         self.sub_to_parent = {}  # subcategory → parent
-        if categories_config_path.exists():
-            with open(categories_config_path, 'r') as f:
-                config = json.load(f)
-                valid_categories = config.get('categories', [])
-                self.subcategories = config.get('subcategories', {})
-                self.sub_to_parent = {
-                    sub: parent
-                    for parent, subs in self.subcategories.items()
-                    for sub in subs
-                }
-                # Convert list to dict with empty patterns (for compatibility)
-                self.categories = {cat: [] for cat in valid_categories}
-        else:
+        try:
+            from src.database.session import get_engine as _get_cat_engine
+            from sqlalchemy import text as _cat_text
+            with _get_cat_engine().connect() as _conn:
+                _rows = _conn.execute(_cat_text(
+                    'SELECT name, parent FROM config_categories ORDER BY sort_order, name'
+                )).fetchall()
+            valid_categories = [r[0] for r in _rows]
+            for _name, _parent in _rows:
+                if _parent:
+                    self.subcategories.setdefault(_parent, []).append(_name)
+                    self.sub_to_parent[_name] = _parent
+            self.categories = {cat: [] for cat in valid_categories}
+        except Exception:
             self.categories = {}
         
         # Optional patterns for keyword matching (rarely needed with merchant history)
@@ -142,7 +142,8 @@ class TransactionCategorizer:
         than to content.  Checks every line (not just the last few) and
         recognises common answer-prefix patterns.
         """
-        valid_lower = {cat.lower(): cat for cat in self.categories.keys()}
+        valid_lower = {cat.lower(): cat for cat in self.categories.keys()
+                       if cat not in self.subcategories}  # leaf categories only
         prefixes = ('answer:', 'category:', 'the category is:', 'the category:',
                     'so the answer is:', 'so the category is:', 'i would say:',
                     'my answer:', 'final answer:')
@@ -173,16 +174,18 @@ class TransactionCategorizer:
 
     def _get_category_from_model(self, merchant: str, amount: float, model: str) -> Optional[str]:
         """Get category from a specific model."""
-        # Build category list for prompt - use numbered list for clarity
-        categories_numbered = "\n".join([f"{i+1}. {cat}" for i, cat in enumerate(self.categories.keys())])
+        # Only offer LEAF categories to the LLM — parent categories (those that have
+        # subcategories) must never be chosen; the LLM should always pick the specific child.
+        leaf_cats = [cat for cat in self.categories.keys() if cat not in self.subcategories]
+        categories_numbered = "\n".join([f"{i+1}. {cat}" for i, cat in enumerate(leaf_cats)])
 
-        # Dynamically build subcategory disambiguation hints from subcategories
+        # Disambiguation hints: explain what each parent group covers so the
+        # model understands which leaf to pick.
         dynamic_hints = []
         for parent, subs in self.subcategories.items():
             subs_str = ', '.join(f'"{s}"' for s in subs)
             dynamic_hints.append(
-                f'- If it fits "{parent}", prefer the more specific subcategory instead: {subs_str}. '
-                f'Only use "{parent}" if none of those subcategories apply.'
+                f'- For anything that is "{parent}", choose one of its specific subcategories: {subs_str}.'
             )
         subcategory_hints = "\n".join(dynamic_hints)
 
@@ -268,19 +271,20 @@ Your answer:"""
                         result = result[len(prefix):].strip()
                         break
                 
-                # Validate the category is in our list
-                if result in self.categories:
+                # Validate the category is in our list AND is a leaf (not a parent)
+                if result in self.categories and result not in self.subcategories:
                     return result
                 
-                # Try case-insensitive match
+                # Try case-insensitive match — also reject parents
                 for valid_category in self.categories.keys():
-                    if result.lower() == valid_category.lower():
+                    if result.lower() == valid_category.lower() and valid_category not in self.subcategories:
                         return valid_category
                 
-                # Invalid category - try to find closest match
+                # Invalid category - try to find closest leaf match
                 result_lower = result.lower()
                 for valid_category in self.categories.keys():
-                    # Check if the invalid category is contained in a valid one or vice versa
+                    if valid_category in self.subcategories:
+                        continue  # skip parents
                     if result_lower in valid_category.lower() or valid_category.lower() in result_lower:
                         print(f"  [LLM] Mapped invalid '{result}' to '{valid_category}' for {merchant}")
                         return valid_category
@@ -484,13 +488,13 @@ Your answer:"""
             
             if self.use_llm and self.llm_available:
                 print("\n💡 Note: LLM was unable to categorize these items.")
-                print("  Manually categorize these in expenses.csv, then they'll auto-categorize next time!")
+                print("  Edit the category in the 'All Transactions' tab — the system learns from your corrections!")
             else:
                 print("\n💡 To categorize these:")
-                print("  1. Manually categorize in expenses.csv")
-                print("  2. Re-run next month - system learns from your corrections!")
+                print("  Edit the category in the 'All Transactions' tab in the dashboard.")
+                print("  The system learns from your corrections and auto-categorizes matching merchants next time.")
                 if not self.llm_available:
-                    print("  OR: Start Ollama and use --llm for AI-powered categorization")
+                    print("  OR: Run 'make ollama-serve' then re-process for AI-powered categorization")
         else:
             print("\n✓ All transactions successfully categorized!")
         

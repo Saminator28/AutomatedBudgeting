@@ -50,7 +50,7 @@ function App() {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
   }); // Default to previous complete month
   const [subcategories, setSubcategories] = useState({});
-  const [expandedParents, setExpandedParents] = useState(new Set());
+
   const [activeTab, setActiveTab] = useState(() => localStorage.getItem('activeTab') || 'overview');
   const setActiveTabPersisted = (tab) => { localStorage.setItem('activeTab', tab); setActiveTab(tab); };
   const [transfers, setTransfers] = useState([]);
@@ -82,31 +82,81 @@ function App() {
   const [stmtDragOver, setStmtDragOver] = useState(false);
   const [stmtError, setStmtError] = useState('');
   const [availableCategories, setAvailableCategories] = useState([]);
+  const [processedMonths, setProcessedMonths] = useState([]);
   const [investmentKeywords, setInvestmentKeywords] = useState([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [goals, setGoals] = useState(() => {
     try { return JSON.parse(localStorage.getItem('budgetGoals') || '{}'); }
     catch { return {}; }
   });
+  const [savingsTargetPct, setSavingsTargetPct] = useState(null); // from budget_settings
 
+  // Load savings target from DB for the savings rate tile
   useEffect(() => {
+    fetch('http://localhost:8000/api/budget/goals')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d?.settings) {
+          const strat = d.settings.strategy || '50/30/20';
+          const targeted = d.settings.savings_target_pct
+            ?? (strat === '70/20/10' ? 10 : 20);
+          setSavingsTargetPct(targeted);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Extracted so it can be called again after Settings saves new categories
+  const loadCategories = React.useCallback(() => {
     Promise.all([
-      fetch('http://localhost:8000/api/category-subcategories').then(r => r.json()),
-      fetch('http://localhost:8000/api/categories').then(r => r.json()),
+      fetch('http://localhost:8000/api/categories/full').then(r => r.json()),
       fetch('http://localhost:8000/api/available-months').then(r => r.json()),
       fetch('http://localhost:8000/api/investment-keywords').then(r => r.json()),
     ])
-      .then(([hier, cats, months, invKw]) => {
-        setSubcategories(hier || {});
-        setAvailableCategories(Array.isArray(cats) ? cats.map(c => c.category || c).filter(Boolean) : []);
-        if (Array.isArray(months) && months.length > 0) {
-          setSelectedMonth(prev => months.includes(prev) ? prev : months[0]);
+      .then(([full, months, invKw]) => {
+        const cats = Array.isArray(full?.categories) ? full.categories : [];
+        const subs = full?.subcategories || {};
+        setSubcategories(subs);
+        setAvailableCategories(cats);
+
+        // Purge localStorage goals for categories that no longer exist so stale
+        // entries (deleted categories, old names) don't inflate totals.
+        // Also remove parent-level goals (e.g. Housing) when their children
+        // already have specific goals — the overview always uses the child sum.
+        if (cats.length > 0) {
+          const validCats = new Set([...cats, ...Object.values(subs).flat()]);
+          const parentCats = new Set(Object.keys(subs));
+          setGoals(prev => {
+            const filtered = Object.fromEntries(
+              Object.entries(prev).filter(([cat]) => validCats.has(cat))
+            );
+            // Remove parent entries whose children already carry goals
+            const cleaned = Object.fromEntries(
+              Object.entries(filtered).filter(([cat]) => {
+                if (!parentCats.has(cat)) return true;
+                const hasChildGoals = (subs[cat] || []).some(c => filtered[c] != null && filtered[c] > 0);
+                return !hasChildGoals; // drop parent when children have goals
+              })
+            );
+            localStorage.setItem('budgetGoals', JSON.stringify(cleaned));
+            return cleaned;
+          });
+        }
+
+        const monthList = Array.isArray(months) ? months : [];
+        setProcessedMonths(monthList);
+        if (monthList.length > 0) {
+          setSelectedMonth(prev => monthList.includes(prev) ? prev : monthList[0]);
         }
         const invKwList = Array.isArray(invKw?.keywords) ? invKw.keywords : Array.isArray(invKw) ? invKw : [];
         if (invKwList.length > 0) setInvestmentKeywords(invKwList.map(k => k.keyword ?? k));
       })
       .catch(err => console.error('Failed to load config:', err));
   }, []);
+
+  useEffect(() => {
+    loadCategories();
+  }, [loadCategories]);
 
   useEffect(() => {
     setLoading(true);
@@ -199,16 +249,8 @@ function App() {
     return Array.from(groups.values()).sort((a, b) => b.amount - a.amount);
   })();
 
-  const filteredData = selectedCategory
-    ? data.filter((d) => {
-        const parent = parentMap[d.category] || d.category;
-        return d.category === selectedCategory || parent === selectedCategory;
-      })
-    : data;
-
-  // Calculate totals — one-time expenses are tracked separately so they don't skew budget baselines
-  const oneTimeTotal = data.reduce((sum, d) => sum + (d.one_time ? d.amount : 0), 0);
-  const totalExpenses = data.reduce((sum, d) => sum + (d.one_time ? 0 : d.amount), 0);
+  // One-time expenses are excluded from all graphs and totals
+  const totalExpenses = data.reduce((sum, d) => sum + d.amount, 0);
   // Use only recurring income for the budget baseline average
   const totalRecurringIncome = incomeData.reduce((sum, d) => sum + (d.income || 0), 0);
   const totalBonusIncome = incomeData.reduce((sum, d) => sum + (d.bonus || 0), 0);
@@ -248,6 +290,17 @@ function App() {
       bonus: income ? (income.bonus || 0) : 0,
     };
   });
+
+  // Savings rate for selected month — (income − expenses) / income
+  const selectedMonthIncome = (incomeData.find(d => d.month === selectedMonth)?.income || 0);
+  const selectedMonthSavingsRate = selectedMonthIncome > 0
+    ? Math.round((selectedMonthIncome - totalExpenses) / selectedMonthIncome * 100)
+    : null;
+  const savingsRateTarget = savingsTargetPct ?? 20;
+  const savingsRateColor = selectedMonthSavingsRate === null ? '#94a3b8'
+    : selectedMonthSavingsRate >= savingsRateTarget ? '#34d399'
+    : selectedMonthSavingsRate >= savingsRateTarget - 5 ? '#fbbf24'
+    : '#f87171';
 
   if (loading) {
     return (
@@ -293,13 +346,19 @@ function App() {
           <div style={{ display: 'flex', gap: 10 }}>
             {[
               { label: 'Recurring Spend', value: formatCurrency(totalExpenses), color: '#fbbf24' },
-              ...(oneTimeTotal > 0 ? [{ label: '⚡ Unusual', value: formatCurrency(oneTimeTotal), color: '#94a3b8' }] : []),
               { label: 'Avg Monthly Income', value: formatCurrency(avgMonthlyIncome), color: '#34d399' },
-              { label: 'Categories', value: categories.filter(c => c !== '⚡ Unusual Spending').length, color: '#a5b4fc' },
+              { label: 'Categories', value: categories.length, color: '#a5b4fc' },
+              ...(selectedMonthSavingsRate !== null ? [{
+                label: 'Savings Rate',
+                value: `${selectedMonthSavingsRate}%`,
+                sub: `/ ${savingsRateTarget}% target`,
+                color: savingsRateColor,
+              }] : []),
             ].map((s, i) => (
               <div key={i} style={{ background: 'rgba(255,255,255,.12)', backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,.2)', borderRadius: 10, padding: '10px 18px', textAlign: 'center' }}>
                 <div style={{ fontSize: 11, color: 'rgba(255,255,255,.7)', fontWeight: 700, letterSpacing: '.05em', textTransform: 'uppercase', marginBottom: 4 }}>{s.label}</div>
                 <div style={{ fontSize: 20, fontWeight: 800, color: s.color }}>{s.value}</div>
+                {s.sub && <div style={{ fontSize: 10, color: 'rgba(255,255,255,.55)', marginTop: 2 }}>{s.sub}</div>}
               </div>
             ))}
           </div>
@@ -338,7 +397,7 @@ function App() {
       {activeTab === 'transactions' && (
         <TransactionsTab
           formatCurrency={formatCurrency}
-          categories={availableCategories}
+          categories={availableCategories.filter(cat => !(cat in subcategories))}
           selectedMonth={selectedMonth}
           onRefreshData={() => setRefreshKey(k => k + 1)}
         />
@@ -353,6 +412,8 @@ function App() {
             selectedMonth={selectedMonth}
             onMonthChange={setSelectedMonth}
             subcategories={subcategories}
+            availableCategories={availableCategories}
+            processedMonths={processedMonths}
             goals={goals}
             setGoals={setGoals}
             groupedData={groupedData}
@@ -412,6 +473,8 @@ function App() {
           selectedMonth={selectedMonth}
           onMonthChange={setSelectedMonth}
           subcategories={subcategories}
+          availableCategories={availableCategories}
+          processedMonths={processedMonths}
           goals={goals}
           setGoals={setGoals}
           groupedData={groupedData}
@@ -432,28 +495,21 @@ function App() {
                 <YAxis />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                {(() => {
-                  const UNUSUAL = '⚡ Unusual Spending';
-                  const regCats = categories.filter(c => c !== UNUSUAL).slice(0, categories.includes(UNUSUAL) ? 7 : 8);
-                  const visible = [...regCats, ...(categories.includes(UNUSUAL) ? [UNUSUAL] : [])];
-                  return visible.map((cat, idx) => (
-                    <Line
-                      key={cat}
-                      type="monotone"
-                      dataKey={cat}
-                      stroke={cat === UNUSUAL ? '#94a3b8' : COLORS[idx % COLORS.length]}
-                      strokeWidth={2}
-                      strokeDasharray={cat === UNUSUAL ? '6 4' : undefined}
-                      dot={false}
-                    />
-                  ));
-                })()
-                }
+                {categories.slice(0, 8).map((cat, idx) => (
+                  <Line
+                    key={cat}
+                    type="monotone"
+                    dataKey={cat}
+                    stroke={COLORS[idx % COLORS.length]}
+                    strokeWidth={2}
+                    dot={false}
+                  />
+                ))}
               </LineChart>
             </ResponsiveContainer>
-            {categories.filter(c => c !== '⚡ Unusual Spending').length > 8 && (
+            {categories.length > 8 && (
               <p style={{ fontSize: 12, color: '#666', marginTop: 8 }}>
-                * Showing top 8 categories. Total: {categories.filter(c => c !== '⚡ Unusual Spending').length}
+                * Showing top 8 categories. Total: {categories.length}
               </p>
             )}
           </div>
@@ -510,98 +566,6 @@ function App() {
                 </button>
               )}
             </div>
-          </div>
-        </div>
-
-        {/* Expense Table */}
-        <div style={{ ...cardStyle, marginTop: 24 }}>
-          <h3 style={{ marginTop: 0, color: '#0f172a', fontWeight: 700, fontSize: 16 }}>
-            📋 Expense Details - {formatMonth(selectedMonth)}
-            {selectedCategory && <span style={{ color: '#0088FE', fontWeight: 'normal' }}> (Filtered by: {selectedCategory})</span>}
-          </h3>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-              <thead>
-                <tr style={{ backgroundColor: '#f8f9fa' }}>
-                  <th style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'left' }}>Category</th>
-                  <th style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right' }}>Amount</th>
-                  <th style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right' }}>% of Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {selectedCategory ? (
-                  // Filtered view: flat rows matching selected category
-                  filteredData.sort((a, b) => b.amount - a.amount).map((row, idx) => (
-                    <tr
-                      key={row.category}
-                      style={{ backgroundColor: idx % 2 ? '#f8f9fa' : '#fff', cursor: 'pointer' }}
-                      onClick={() => setSelectedCategory(row.category === selectedCategory ? null : row.category)}
-                    >
-                      <td style={{ border: '1px solid #dee2e6', padding: 12 }}>
-                        <span style={{ display: 'inline-block', width: 12, height: 12, backgroundColor: COLORS[groupedData.findIndex(g => g.category === (parentMap[row.category] || row.category)) % COLORS.length], marginRight: 8, borderRadius: 2 }}></span>
-                        {parentMap[row.category] && <span style={{ color: '#64748b', fontSize: 12, marginRight: 6 }}>↳</span>}
-                        {row.category}
-                      </td>
-                      <td style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right', fontWeight: 'bold' }}>{formatCurrency(row.amount)}</td>
-                      <td style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right' }}>{((row.amount / totalExpenses) * 100).toFixed(1)}%</td>
-                    </tr>
-                  ))
-                ) : (
-                  // Grouped view: parent rows expandable to show subcategories
-                  groupedData.map((group, idx) => {
-                    const hasSubs = group.subcategories.length > 0;
-                    const isExpanded = expandedParents.has(group.category);
-                    const colorIdx = idx % COLORS.length;
-                    const toggleParent = () => {
-                      if (!hasSubs) return;
-                      setExpandedParents(prev => {
-                        const next = new Set(prev);
-                        next.has(group.category) ? next.delete(group.category) : next.add(group.category);
-                        return next;
-                      });
-                    };
-                    return (
-                      <React.Fragment key={group.category}>
-                        <tr
-                          style={{ backgroundColor: idx % 2 ? '#f8f9fa' : '#fff', cursor: hasSubs ? 'pointer' : 'default' }}
-                          onClick={hasSubs ? toggleParent : () => setSelectedCategory(group.category)}
-                        >
-                          <td style={{ border: '1px solid #dee2e6', padding: 12 }}>
-                            <span style={{ display: 'inline-block', width: 12, height: 12, backgroundColor: COLORS[colorIdx], marginRight: 8, borderRadius: 2 }}></span>
-                            {hasSubs && <span style={{ marginRight: 6, fontSize: 10, color: '#64748b' }}>{isExpanded ? '▼' : '▶'}</span>}
-                            {group.category}
-                            {hasSubs && <span style={{ marginLeft: 8, fontSize: 11, color: '#94a3b8' }}>({group.subcategories.length} subcategories)</span>}
-                          </td>
-                          <td style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right', fontWeight: 'bold' }}>{formatCurrency(group.amount)}</td>
-                          <td style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right' }}>{((group.amount / totalExpenses) * 100).toFixed(1)}%</td>
-                        </tr>
-                        {hasSubs && isExpanded && group.subcategories.sort((a, b) => b.amount - a.amount).map((sub) => (
-                          <tr
-                            key={sub.category}
-                            style={{ backgroundColor: '#eef2ff', cursor: 'pointer' }}
-                            onClick={() => setSelectedCategory(sub.category)}
-                          >
-                            <td style={{ border: '1px solid #dee2e6', padding: '8px 12px 8px 36px', color: '#4f46e5' }}>
-                              <span style={{ marginRight: 6 }}>↳</span>
-                              {sub.category}
-                            </td>
-                            <td style={{ border: '1px solid #dee2e6', padding: '8px 12px', textAlign: 'right', fontWeight: 500 }}>{formatCurrency(sub.amount)}</td>
-                            <td style={{ border: '1px solid #dee2e6', padding: '8px 12px', textAlign: 'right', color: '#64748b' }}>{((sub.amount / totalExpenses) * 100).toFixed(1)}%</td>
-                          </tr>
-                        ))}
-                      </React.Fragment>
-                    );
-                  })
-                )}
-                <tr style={{ backgroundColor: '#e9ecef', fontWeight: 'bold' }}>
-                  <td style={{ border: '1px solid #dee2e6', padding: 12 }}>TOTAL</td>
-                  <td style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right' }}>
-                    {formatCurrency(filteredData.reduce((sum, d) => sum + d.amount, 0))}
-                  </td>
-                  <td style={{ border: '1px solid #dee2e6', padding: 12, textAlign: 'right' }}>100%</td>
-                </tr>
-              </tbody>
-            </table>
           </div>
         </div>
 
@@ -1038,7 +1002,7 @@ function App() {
       })()}
 
       {/* ── Settings Tab ── */}
-      {activeTab === 'settings' && <SettingsTab />}
+      {activeTab === 'settings' && <SettingsTab onCategoriesUpdated={loadCategories} />}
 
     </div>
   );

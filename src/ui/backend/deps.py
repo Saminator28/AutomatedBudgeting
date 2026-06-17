@@ -66,6 +66,24 @@ _INVESTMENT_CATEGORIES = {'Investment', 'Investment Transfer'}
 
 # ── Keyword reload functions ──────────────────────────────────────────────────
 
+def _reload_investment_categories() -> None:
+    """Re-populate _INVESTMENT_CATEGORIES from config_categories rows whose names
+    contain 'invest' (case-insensitive), so renaming the category in Settings
+    does not break the Investments tab."""
+    if not _DB_AVAILABLE:
+        return
+    try:
+        from sqlalchemy import text as _text
+        with get_engine().connect() as conn:
+            rows = conn.execute(_text(
+                "SELECT name FROM config_categories WHERE LOWER(name) LIKE '%invest%'"
+            )).fetchall()
+        if rows:
+            _INVESTMENT_CATEGORIES.clear()
+            _INVESTMENT_CATEGORIES.update(r[0] for r in rows)
+    except Exception as exc:
+        logging.warning(f'Could not reload investment categories: {exc}')
+
 def _reload_investment_keywords() -> None:
     """Re-populate _INVESTMENT_PLATFORM_KEYWORDS from the DB (in-place)."""
     if not _DB_AVAILABLE:
@@ -287,7 +305,7 @@ def _rebuild_transfers_for_month(month: str) -> None:
             _eng = get_engine()
             with _eng.connect() as conn:
                 exp_rows = conn.execute(_text(
-                    "SELECT tx_date, place, amount, statement, category FROM transactions "
+                    "SELECT tx_date, place, amount, statement, category, label FROM transactions "
                     "WHERE tx_type='expense' "
                     "AND INSTR(tx_date, '/') > 0 "
                     "AND ("
@@ -295,8 +313,8 @@ def _rebuild_transfers_for_month(month: str) -> None:
                     "printf('%02d', CAST(SUBSTR(tx_date, 1, INSTR(tx_date,'/')-1) AS INTEGER))"
                     ")=:m"
                 ), {'m': month}).fetchall()
-                inv_expenses = [r for r in exp_rows if str(r[4] or '').strip() in _INVESTMENT_CATEGORIES]
-                non_inv = [r for r in exp_rows if str(r[4] or '').strip() not in _INVESTMENT_CATEGORIES]
+                inv_expenses = [r for r in exp_rows if str(r[4] or '').strip() in _INVESTMENT_CATEGORIES or str(r[5] or '').strip() == 'investment_transfer']
+                non_inv = [r for r in exp_rows if str(r[4] or '').strip() not in _INVESTMENT_CATEGORIES and str(r[5] or '').strip() != 'investment_transfer']
                 for r in non_inv:
                     try:
                         non_investment_keys.add((str(r[0]).strip(), round(float(r[2] or 0), 2)))

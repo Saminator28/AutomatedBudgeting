@@ -383,7 +383,7 @@ class StatementParser:
 
         return card_score > bank_score
     
-    def detect_bank_name(self, text: str) -> str:
+    def detect_bank_name(self, text: str, filename_hint: str = '') -> str:
         """Identify the issuing institution using the LLM with a DB-backed cache.
 
         The institution_cache table is keyed by a stable header fingerprint so the
@@ -435,10 +435,18 @@ class StatementParser:
         if name:
             return name
 
-        # Minimal fallback
-        text_upper = text.upper()
-        if any(n in text_upper for n in ['VISA', 'MASTERCARD', 'AMEX', 'DISCOVER', 'CREDIT CARD']):
-            return 'Card Issuer'
+        # Try to derive a name from the filename before using generic fallbacks
+        if filename_hint:
+            import re as _re
+            clean = _re.sub(r'[_\-]?\d{4}[_\-]?\d{0,2}.*$', '', filename_hint)
+            clean = _re.sub(
+                r'[_\-](checking|savings|credit|card|statement|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec).*$',
+                '', clean, flags=_re.IGNORECASE
+            )
+            name_from_file = clean.replace('_', ' ').replace('-', ' ').strip().title()
+            if name_from_file and len(name_from_file) > 2:
+                return name_from_file
+
         return 'Unknown Institution'
     
     def _fix_date_parsing_errors(self, date_str: str) -> str:
@@ -1138,7 +1146,10 @@ class StatementParser:
         ``self._keyword_filtered_transfers`` so *process_monthly.py* can log them
         to auto_deleted_transactions after the call returns.
         """
-        from src.database.db_utils import _normalize_merchant_key as _nmk  # lazy import to avoid circular dep
+        from src.database.db_utils import (  # lazy import to avoid circular dep
+            _normalize_merchant_key as _nmk,
+            _normalize_whitelist_key as _nwk,
+        )
         _wl = whitelisted_places or set()
 
         real_transactions = []
@@ -1153,9 +1164,11 @@ class StatementParser:
 
             # Honour whitelist — if the normalized place is whitelisted, never treat
             # it as a transfer regardless of keyword match.
+            # Also check the date/time-stripped key so a whitelist entry from one month
+            # protects the same recurring transaction in subsequent months.
             if is_transfer and _wl:
                 norm = _nmk(trans.get('Place_Original', trans.get('Place', '')))
-                if norm in _wl:
+                if norm in _wl or _nwk(norm) in _wl:
                     is_transfer = False
             
             # Debug logging for transfers
@@ -1172,11 +1185,12 @@ class StatementParser:
     
     def classify_transactions(self, transactions: List[Dict], is_bank_account: bool) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
         """
-        Classify transactions into income, expenses, and manual_review.
-        
-        For bank accounts: Uses Credits/Debits columns, or balance comparison as fallback
-        For credit cards: Uses Credits/Debits columns
-        Payment apps: Sent to manual_review for user classification
+        Classify transactions into income, expenses, and a small set of
+        suspicious-balance rows.
+
+        Payment apps: classified as expenses by default.
+        Suspicious-balance rows: routed to the auxiliary list so process_monthly
+        can treat them as uncategorized expenses for the user to correct via the UI.
         """
         income = []
         expenses = []
@@ -1272,7 +1286,7 @@ class StatementParser:
             print(f"  Validation issues: {', '.join(validation['issues'])}")
         
         # Detect bank and account type
-        bank_name = self.detect_bank_name(text)
+        bank_name = self.detect_bank_name(text, filename_hint=pdf_path.stem)
         is_bank_account = not self.is_credit_card(text)
         
         if debug:
@@ -1297,7 +1311,7 @@ class StatementParser:
         # Classify transactions
         income, expenses, manual_review, investment_transfers = self.classify_transactions(transactions, is_bank_account)
         if debug:
-            print(f"  {len(income)} income, {len(expenses)} expenses, {len(manual_review)} manual review, {len(investment_transfers)} transfers")
+            print(f"  {len(income)} income, {len(expenses)} expenses, {len(manual_review)} suspicious-balance, {len(investment_transfers)} transfers")
         
         # Convert to DataFrames
         income_df = pd.DataFrame(income) if income else pd.DataFrame()

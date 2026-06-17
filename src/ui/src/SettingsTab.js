@@ -21,7 +21,7 @@ const REASON_COLORS = {
 
 const REASON_ORDER = ['manual_delete', 'transfer_keyword', 'cross_account', 'bank_transfer'];
 
-export default function SettingsTab() {
+export default function SettingsTab({ onCategoriesUpdated }) {
   const [activeSubTab, setActiveSubTab] = useState('auto-filters');
 
   return (
@@ -32,6 +32,7 @@ export default function SettingsTab() {
           { key: 'auto-filters', label: '🚫 Auto-Filter Manager' },
           { key: 'merchant-rules', label: '📋 Merchant Rules' },
           { key: 'keywords', label: '🔑 Keywords' },
+          { key: 'categories', label: '🏷️ Categories' },
         ].map(t => (
           <button key={t.key} onClick={() => setActiveSubTab(t.key)} style={{
             padding: '7px 18px', borderRadius: 8, border: 'none', cursor: 'pointer',
@@ -46,6 +47,7 @@ export default function SettingsTab() {
       {activeSubTab === 'auto-filters' && <AutoFilterPanel />}
       {activeSubTab === 'merchant-rules' && <MerchantRulesPanel />}
       {activeSubTab === 'keywords' && <KeywordsPanel />}
+      {activeSubTab === 'categories' && <CategoriesPanel onSaved={onCategoriesUpdated} />}
     </div>
   );
 }
@@ -776,4 +778,306 @@ function KeywordsPanel() {
     </div>
   );
 }
+/* ── Categories Panel ───────────────────────────────────────────────────── */
+function CategoriesPanel({ onSaved }) {
+  const [categories, setCategories] = useState([]);
+  const [subcategories, setSubcategories] = useState({});   // parent → [children]
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+  const [newCat, setNewCat] = useState('');
+  // For subcategory assignment: which parent is being edited
+  const [editingSubFor, setEditingSubFor] = useState(null);
+  // For drag-and-drop reordering
+  const [draggedCat, setDraggedCat] = useState(null);
+  const [dragOverCat, setDragOverCat] = useState(null);
 
+  const load = () => {
+    setLoading(true);
+    fetch(`${API}/api/categories/full`)
+      .then(r => r.json())
+      .then(d => {
+        setCategories(d.categories || []);
+        setSubcategories(d.subcategories || {});
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const addCategory = () => {
+    const name = newCat.trim();
+    if (!name || categories.includes(name)) return;
+    setCategories(prev => [...prev, name]);
+    setNewCat('');
+  };
+
+  const removeCategory = (cat) => {
+    setCategories(prev => prev.filter(c => c !== cat));
+    // Remove from subcategories as parent or child
+    setSubcategories(prev => {
+      const next = { ...prev };
+      delete next[cat];
+      for (const [parent, children] of Object.entries(next)) {
+        next[parent] = children.filter(c => c !== cat);
+        if (next[parent].length === 0) delete next[parent];
+      }
+      return next;
+    });
+  };
+
+  const moveCategory = (cat, direction) => {
+    setCategories(prev => {
+      const idx = prev.indexOf(cat);
+      if (idx === -1) return prev;
+      const next = [...prev];
+      const target = direction === 'up' ? idx - 1 : idx + 1;
+      if (target < 0 || target >= next.length) return prev;
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
+  };
+
+  const reorderByHierarchy = (cats, subs) => {
+    const childSet = new Set(Object.values(subs).flat());
+    const result = [];
+    for (const cat of cats) {
+      if (childSet.has(cat)) continue;
+      result.push(cat);
+      if (subs[cat]) {
+        for (const child of subs[cat]) {
+          if (cats.includes(child)) result.push(child);
+        }
+      }
+    }
+    for (const cat of cats) {
+      if (!result.includes(cat)) result.push(cat);
+    }
+    return result;
+  };
+
+  const handleDrop = (targetCat) => {
+    if (!draggedCat || draggedCat === targetCat) return;
+    setCategories(prev => {
+      const next = [...prev];
+      const fromIdx = next.indexOf(draggedCat);
+      if (fromIdx === -1) return prev;
+      next.splice(fromIdx, 1);
+      const toIdx = next.indexOf(targetCat);
+      if (toIdx === -1) return prev;
+      next.splice(toIdx, 0, draggedCat);
+      return reorderByHierarchy(next, subcategories);
+    });
+    setDraggedCat(null);
+    setDragOverCat(null);
+  };
+
+  const toggleSubcategory = (parent, child) => {
+    const next = { ...subcategories };
+    // First remove child from any existing parent
+    for (const [p, children] of Object.entries(next)) {
+      if (children.includes(child) && p !== parent) {
+        next[p] = children.filter(c => c !== child);
+        if (next[p].length === 0) delete next[p];
+      }
+    }
+    // Toggle under target parent
+    const existing = next[parent] || [];
+    if (existing.includes(child)) {
+      const filtered = existing.filter(c => c !== child);
+      if (filtered.length === 0) delete next[parent];
+      else next[parent] = filtered;
+    } else {
+      next[parent] = [...existing, child];
+    }
+    setSubcategories(next);
+    setCategories(prev => reorderByHierarchy(prev, next));
+  };
+
+  // Build reverse map: child → parent
+  const childToParent = {};
+  for (const [parent, children] of Object.entries(subcategories)) {
+    for (const child of children) childToParent[child] = parent;
+  }
+
+  const save = async () => {
+    setSaving(true);
+    setSaveMsg('');
+    try {
+      const res = await fetch(`${API}/api/categories`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categories, subcategories }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        setSaveMsg('❌ ' + (err.error || 'Save failed'));
+      } else {
+        setSaveMsg('✅ Saved! Changes will apply to new transactions from this point forward.');
+        if (onSaved) onSaved();
+      }
+    } catch (e) {
+      setSaveMsg('❌ ' + String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return <div style={{ padding: 40, textAlign: 'center', color: '#64748b' }}>Loading…</div>;
+
+  return (
+    <div>
+      {/* Info banner */}
+      <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '12px 16px', marginBottom: 20, fontSize: 13, color: '#1e40af' }}>
+        <strong>💡 How this works:</strong> Changes saved here are stored in the database.
+        New transactions will be classified using the updated list. <strong>Historical months are not affected</strong> —
+        transactions already in the database keep their existing categories.
+        The dashboard dropdowns and budget goal table update immediately after saving.
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+        {/* ── Left: Category list ── */}
+        <div>
+          <h4 style={{ margin: '0 0 12px', fontSize: 14, color: '#334155' }}>📋 Categories ({categories.length})</h4>
+          <div style={{ marginBottom: 10, display: 'flex', gap: 8 }}>
+            <input
+              value={newCat}
+              onChange={e => setNewCat(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && addCategory()}
+              placeholder="Add new category…"
+              style={{ flex: 1, padding: '7px 10px', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 13 }}
+            />
+            <button
+              onClick={addCategory}
+              disabled={!newCat.trim() || categories.includes(newCat.trim())}
+              style={{ padding: '7px 14px', background: '#4f46e5', color: 'white', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: !newCat.trim() || categories.includes(newCat.trim()) ? 0.5 : 1 }}
+            >+ Add</button>
+          </div>
+          <div style={{ maxHeight: 460, overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: 8 }}>
+            {categories.map((cat, idx) => {
+              const isParent = cat in subcategories;
+              const isChild = cat in childToParent;
+              return (
+                <div
+                  key={cat}
+                  draggable={!isChild}
+                  onDragStart={!isChild ? () => setDraggedCat(cat) : undefined}
+                  onDragOver={e => { e.preventDefault(); setDragOverCat(cat); }}
+                  onDrop={e => { e.preventDefault(); handleDrop(cat); }}
+                  onDragEnd={() => { setDraggedCat(null); setDragOverCat(null); }}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
+                    borderBottom: idx < categories.length - 1 ? '1px solid #f0f4f8' : 'none',
+                    background: dragOverCat === cat && draggedCat !== cat ? '#e0e7ff' : (isParent ? '#f8faff' : isChild ? '#f8fff8' : 'white'),
+                    opacity: draggedCat === cat ? 0.5 : 1,
+                    transition: 'background 0.1s',
+                  }}
+                >
+                  {isChild ? (
+                    <span style={{ width: 20, display: 'inline-block' }} />
+                  ) : (
+                    <span
+                      title="Drag to reorder"
+                      style={{ color: '#cbd5e1', fontSize: 18, lineHeight: 1, padding: '0 2px', cursor: draggedCat === cat ? 'grabbing' : 'grab', userSelect: 'none' }}
+                    >⠿</span>
+                  )}
+                  <span style={{ flex: 1, fontSize: 13, fontWeight: isParent ? 700 : 400, color: isChild ? '#475569' : '#0f172a' }}>
+                    {isChild && <span style={{ color: '#94a3b8', marginRight: 6 }}>↳</span>}
+                    {cat}
+                    {isParent && <span style={{ fontSize: 10, color: '#6366f1', marginLeft: 6 }}>parent ({subcategories[cat].length})</span>}
+                    {isChild && <span style={{ fontSize: 10, color: '#22c55e', marginLeft: 6 }}>↑ {childToParent[cat]}</span>}
+                  </span>
+                  <button
+                    onClick={() => setEditingSubFor(editingSubFor === cat ? null : cat)}
+                    title="Manage subcategory relationships"
+                    style={{ padding: '3px 8px', background: editingSubFor === cat ? '#4f46e5' : '#f1f5f9', color: editingSubFor === cat ? 'white' : '#475569', border: '1px solid #e2e8f0', borderRadius: 5, fontSize: 11, cursor: 'pointer' }}
+                  >⋮ Sub</button>
+                  <button
+                    onClick={() => removeCategory(cat)}
+                    title={`Remove "${cat}" from categories`}
+                    style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 16, lineHeight: 1, padding: '0 4px' }}
+                  >✕</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ── Right: Subcategory hierarchy + editing ── */}
+        <div>
+          <h4 style={{ margin: '0 0 12px', fontSize: 14, color: '#334155' }}>🌿 Subcategory Hierarchy</h4>
+          {editingSubFor ? (
+            <div style={{ border: '1px solid #c7d2fe', borderRadius: 8, padding: 14, background: '#f5f3ff' }}>
+              <div style={{ fontWeight: 700, fontSize: 13, color: '#4f46e5', marginBottom: 10 }}>
+                Set parent for: <strong>{editingSubFor}</strong>
+              </div>
+              <div style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>
+                Click a category to assign it as the parent. Click the current parent to remove the relationship.
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {categories.filter(c => c !== editingSubFor && !(c in childToParent)).map(c => {
+                  const isCurrentParent = childToParent[editingSubFor] === c;
+                  const wouldBeChild = editingSubFor in subcategories && subcategories[editingSubFor].length > 0;
+                  if (wouldBeChild) return null; // parents can't become children
+                  return (
+                    <button
+                      key={c}
+                      onClick={() => toggleSubcategory(c, editingSubFor)}
+                      style={{
+                        padding: '4px 10px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
+                        background: isCurrentParent ? '#4f46e5' : '#f1f5f9',
+                        color: isCurrentParent ? 'white' : '#334155',
+                        border: `1px solid ${isCurrentParent ? '#4f46e5' : '#e2e8f0'}`,
+                        fontWeight: isCurrentParent ? 700 : 400,
+                      }}
+                    >{isCurrentParent ? '✓ ' : ''}{c}</button>
+                  );
+                })}
+              </div>
+              {editingSubFor in subcategories && subcategories[editingSubFor].length > 0 && (
+                <div style={{ marginTop: 8, fontSize: 12, color: '#dc2626' }}>⚠️ This category has its own children — remove them first before making it a child.</div>
+              )}
+              <button onClick={() => setEditingSubFor(null)} style={{ marginTop: 10, padding: '4px 10px', background: '#f1f5f9', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 12, cursor: 'pointer' }}>Done</button>
+            </div>
+          ) : (
+            <div style={{ border: '1px solid #e2e8f0', borderRadius: 8, overflow: 'hidden' }}>
+              {Object.keys(subcategories).length === 0 ? (
+                <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+                  No subcategory relationships defined.<br />
+                  <span style={{ fontSize: 12 }}>Click "⋮ Sub" next to a category to assign it under a parent.</span>
+                </div>
+              ) : (
+                Object.entries(subcategories).map(([parent, children], i) => (
+                  <div key={parent} style={{ padding: '10px 14px', borderBottom: i < Object.keys(subcategories).length - 1 ? '1px solid #f0f4f8' : 'none', background: 'white' }}>
+                    <div style={{ fontWeight: 700, fontSize: 13, color: '#334155', marginBottom: 4 }}>📁 {parent}</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, paddingLeft: 12 }}>
+                      {children.map(child => (
+                        <span key={child} style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 12, padding: '2px 10px', fontSize: 12, color: '#1e40af' }}>↳ {child}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {/* Save button */}
+          <div style={{ marginTop: 20 }}>
+            <button
+              onClick={save}
+              disabled={saving}
+              style={{ padding: '9px 20px', background: '#4f46e5', color: 'white', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 700, cursor: saving ? 'default' : 'pointer', opacity: saving ? 0.7 : 1 }}
+            >{saving ? '⏳ Saving…' : '💾 Save Categories'}</button>
+            {saveMsg && <span style={{ marginLeft: 12, fontSize: 12, color: saveMsg.startsWith('✅') ? '#16a34a' : '#dc2626' }}>{saveMsg}</span>}
+          </div>
+
+          {/* Warning */}
+          <div style={{ marginTop: 14, background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, padding: '8px 12px', fontSize: 12, color: '#92400e' }}>
+            ⚠️ Removing a category does not delete historical transactions that used it. Those transactions will retain their existing category label in the database.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

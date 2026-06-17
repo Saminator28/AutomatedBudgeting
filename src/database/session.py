@@ -37,6 +37,14 @@ def init_db(db_path: Path = _DB_PATH):
     from sqlalchemy import text
     engine = get_engine(db_path)
     metadata.create_all(engine)
+
+    # ── Seed default categories if config_categories table is empty ───────────
+    try:
+        from src.database.db_utils import seed_categories_if_empty
+        seed_categories_if_empty(engine)
+    except Exception:
+        pass  # non-fatal; categories can be seeded later via the UI
+
     # ── Lightweight column migrations ─────────────────────────────────────────
     # These ALTER TABLE statements are idempotent — they fail silently if the
     # column already exists (SQLite raises OperationalError for duplicate column).
@@ -55,6 +63,8 @@ def init_db(db_path: Path = _DB_PATH):
         # source_statement: tracks which statement folder each transaction came from
         # so reprocessing month M cleans ALL its rows regardless of report_month.
         "ALTER TABLE transactions ADD COLUMN source_statement TEXT",
+        # locked: user-pinned goal — carries the same amount into every new month
+        "ALTER TABLE budget_goals ADD COLUMN locked BOOLEAN DEFAULT 0",
         # Backfill: approximate existing rows as coming from their current report_month.
         # Cross-month rows will be corrected on the next reprocess of the source statement.
         "UPDATE transactions SET source_statement = report_month WHERE source_statement IS NULL",
