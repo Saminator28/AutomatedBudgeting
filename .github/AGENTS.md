@@ -44,3 +44,8 @@ Reusable prompts are available under `.github/prompts/` for common workflows suc
 - For documentation changes:
   - Remove stale references instead of layering new text around them.
   - Prefer wording that matches the current runtime path: DB-backed settings, actual route names, actual frontend files, and current compose behavior.
+- For code quality (any Python or React change):
+  - Run `ruff check src/ scripts/` after any Python edit; fix reported issues before marking the task done.
+  - Run `cd src/ui && npm run lint` after any React or JavaScript edit.
+  - Run `bash -n <script>` after editing any shell script.
+  - The `.github/workflows/lint.yml` CI job runs both checks automatically on every push and pull request.
