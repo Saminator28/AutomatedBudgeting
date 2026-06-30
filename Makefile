@@ -1,6 +1,22 @@
 # Automated Budgeting Tool - Docker Commands
 
-.PHONY: help build up down logs shell clean process dashboard test
+COMPOSE := $(shell if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; elif command -v docker-compose >/dev/null 2>&1; then echo docker-compose; fi)
+UNAME_S := $(shell uname -s)
+COMPOSE_FILES := -f docker-compose.yml
+
+ifeq ($(UNAME_S),Linux)
+COMPOSE_FILES += -f docker-compose.linux.yml
+endif
+
+.PHONY: help build up down logs shell clean process aggregate dashboard test models status check-compose
+
+check-compose:
+ifeq ($(COMPOSE),)
+	@echo "❌ Docker Compose not found."
+	@echo "   Install Docker Compose plugin (preferred) or legacy docker-compose."
+	@echo "   Then rerun your command."
+	@exit 1
+endif
 
 help:
 	@echo "Automated Budgeting Tool - Docker Commands"
@@ -23,52 +39,52 @@ help:
 	@echo "  make clean       - Remove containers and volumes"
 	@echo "  make test        - Run tests"
 
-build:
+build: check-compose
 	@echo "🔨 Building Docker images..."
-	docker-compose build
+	$(COMPOSE) $(COMPOSE_FILES) build
 
-up:
+up: check-compose
 	@echo "🚀 Starting services..."
-	docker-compose up -d
+	$(COMPOSE) $(COMPOSE_FILES) up -d
 	@echo "✅ Services started!"
 	@echo "   Dashboard: http://localhost:8000"
 	@echo "   Ollama API: http://localhost:11434"
 
-down:
+down: check-compose
 	@echo "🛑 Stopping services..."
-	docker-compose down
+	$(COMPOSE) $(COMPOSE_FILES) down
 
-logs:
-	docker-compose logs -f app
+logs: check-compose
+	$(COMPOSE) $(COMPOSE_FILES) logs -f app
 
-shell:
-	docker-compose exec app /bin/bash
+shell: check-compose
+	$(COMPOSE) $(COMPOSE_FILES) exec app /bin/bash
 
-clean:
+clean: check-compose
 	@echo "🧹 Cleaning up..."
-	docker-compose down -v
+	$(COMPOSE) $(COMPOSE_FILES) down -v
 	docker system prune -f
 
-process:
+process: check-compose
 ifndef MONTH
 	@echo "❌ Error: MONTH not specified"
 	@echo "Usage: make process MONTH=2025-03"
 else
 	@echo "📊 Processing statements for $(MONTH)..."
-	docker-compose exec app python3 scripts/process_monthly.py --month $(MONTH)
+	$(COMPOSE) $(COMPOSE_FILES) exec app python3 scripts/process_monthly.py --month $(MONTH)
 endif
 
-aggregate:
+aggregate: check-compose
 	@echo "📈 Aggregating monthly reports..."
-	docker-compose exec app python3 scripts/aggregate_monthly.py
+	$(COMPOSE) $(COMPOSE_FILES) exec app python3 scripts/aggregate_monthly.py
 
 dashboard:
 	@echo "🌐 Opening dashboard..."
 	@which xdg-open > /dev/null && xdg-open http://localhost:8000 || open http://localhost:8000
 
-test:
+test: check-compose
 	@echo "🧪 Running tests..."
-	docker-compose exec app python3 -m pytest tests/
+	$(COMPOSE) $(COMPOSE_FILES) exec app python3 -m pytest tests/
 
 # Pull Ollama models (on host machine, not in Docker)
 models:
@@ -79,6 +95,6 @@ models:
 	@echo "✅ Models ready!"
 
 # Check status
-status:
+status: check-compose
 	@echo "📊 Service Status:"
-	@docker-compose ps
+	@$(COMPOSE) $(COMPOSE_FILES) ps

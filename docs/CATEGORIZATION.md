@@ -10,39 +10,16 @@
 After a transaction's merchant name has been cleaned by the LLM pipeline, the categorizer assigns it to a spending category (e.g., `Groceries`, `Dining`, `Transportation`).
 
 The categorizer uses a two-stage approach:
-1. **Pattern matching** — fast keyword/regex rules from `config/`
+1. **Pattern matching** — fast keyword and learned-merchant checks backed by the DB
 2. **LLM classification** — Ollama-based fallback for ambiguous merchants
 
 ---
 
 ## Category List
 
-Categories are defined in `config/categories.json`:
+Categories are stored in the `config_categories` SQLite table and surfaced through the Settings UI and category endpoints.
 
-```json
-[
-  "Groceries",
-  "Dining",
-  "Transportation",
-  "Fuel",
-  "Utilities",
-  "Housing",
-  "Healthcare",
-  "Entertainment",
-  "Shopping",
-  "Travel",
-  "Education",
-  "Personal Care",
-  "Insurance",
-  "Subscriptions",
-  "Investments",
-  "Income",
-  "Transfer",
-  "Other"
-]
-```
-
-To add or rename a category, edit this file. The dashboard's pie chart and budget limits are all derived from this list.
+That means category changes are live: the dashboard, import pipeline, and export logic all read the same DB-backed category list.
 
 ---
 
@@ -92,7 +69,7 @@ Before any keyword checks, transactions flagged `_suspicious_balance = True` by 
 
 ## Stage 1: Income Detection
 
-`config/income_keywords.json` contains keywords that, if found in the merchant name or description, flag the transaction as income:
+The `income_keywords` DB table contains keywords that, if found in the merchant name or description, flag the transaction as income:
 
 ```json
 {
@@ -111,7 +88,7 @@ Add your employer's name or any income sources here to ensure they are never cou
 
 ## Stage 2: Transfer Detection
 
-`config/transfer_keywords.json` lists patterns for inter-account transfers:
+The `transfer_keywords` DB table lists patterns for inter-account transfers:
 
 ```json
 {
@@ -131,7 +108,7 @@ Matching transactions get `label: "transfer"` and are excluded from expense tota
 
 ## Stage 3: Payment App Flagging
 
-`config/payment_apps.json` lists payment apps where the real spending detail is hidden:
+The `payment_app_keywords` DB table lists payment apps where the real spending detail is hidden:
 
 ```json
 {
@@ -208,11 +185,11 @@ This is the primary mechanism by which the system improves over time: the more c
 
 | File | Controls |
 |------|----------|
-| `config/categories.json` | Flat list of valid category names + `subcategories` dict for parent→child subcategory rollup |
-| `config/income_keywords.json` | Income detection keywords |
-| `config/payment_apps.json` | Payment apps to flag for review |
-| `config/transfer_keywords.json` | Transfer detection keywords |
-| `config/ignore_transactions.json` | Transactions to completely exclude |
+| `config_categories` table | Valid category names and parent/child hierarchy |
+| `income_keywords` table | Income detection keywords |
+| `payment_app_keywords` table | Payment apps to flag for review |
+| `transfer_keywords` table | Transfer detection keywords |
+| `ignore_keywords` table | Transactions to completely exclude |
 
 ---
 
@@ -220,18 +197,13 @@ This is the primary mechanism by which the system improves over time: the more c
 
 ### Top-level category
 
-1. Add the name to the `categories` array in `config/categories.json`
+1. Add the category in the Settings UI, which writes to `config_categories`
 2. Reprocess your statements, or manually re-categorize existing transactions in the UI
 
 ### Subcategory (rolls up to a parent in charts)
 
-1. Add the subcategory name to the `categories` array in `config/categories.json`
-2. Add it to the `subcategories` dict under its parent category:
-   ```json
-   "subcategories": {
-     "Transportation": ["Gas/Fuel", "Auto Maintenance", "Your New Subcategory"]
-   }
-   ```
+1. Add the subcategory in the Settings UI
+2. Set its parent category there so the `config_categories.parent` relationship is stored in the DB
 3. The dashboard automatically rolls subcategories up to their parent in pie charts and trend lines
 
 ---

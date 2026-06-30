@@ -23,12 +23,7 @@ For end-user setup, see the main [README](../README.md).
 
 ```
 AutomatedBudgeting/
-├── config/                     # All user-editable config files
-│   ├── categories.json         # Category list for classification
-│   ├── income_keywords.json    # Keywords that flag income
-│   ├── payment_apps.json       # Venmo/Zelle/etc. detection
-│   ├── transfer_keywords.json  # Inter-account transfer detection
-│   ├── ignore_transactions.json # Transactions to always skip
+├── config/                     # Checked-in runtime configuration
 │   └── llm_models.json         # Ollama model selection
 ├── scripts/                    # CLI scripts and utilities
 │   ├── process_monthly.py      # Main CLI entry point — processes PDFs and writes to DB
@@ -102,8 +97,8 @@ On macOS curl is pre-installed. On Windows use the [Ollama Windows installer](ht
 ### 5. Start Ollama and pull the model
 
 ```bash
-ollama serve          # if not already running as a service
-ollama pull qwen3.5:9b   # or whichever model is set in config/llm_models.json
+ollama serve                 # if not already running as a service
+ollama pull qwen3.5:35b      # or whichever model is set in config/llm_models.json
 ```
 
 Check `config/llm_models.json` for the current `primary_model` setting. Browse available models at [https://ollama.com/search](https://ollama.com/search). Larger models (e.g. `qwen2.5:32b`) produce cleaner merchant names but require more RAM. Update `config/llm_models.json` after pulling a different model.
@@ -176,39 +171,25 @@ Controls which Ollama model(s) are used.
 
 Set `secondary_model` to a non-empty model name to enable ensemble merchant cleaning. Set to `""` to use only the primary model.
 
-### `config/categories.json`
-The list of categories used for classification. Add, remove, or rename categories here.
+### Live DB-backed settings
+Categories, keyword lists, merchant rules, auto-filters, and budget settings are stored in SQLite tables, not in checked-in JSON files.
 
-```json
-[
-  "Groceries",
-  "Dining",
-  "Transportation",
-  "Utilities",
-  ...
-]
-```
+Main tables:
+- `config_categories` — category names and parent/child hierarchy
+- `investment_keywords`, `income_keywords`, `ignore_keywords`, `payment_app_keywords`, `transfer_keywords` — editable keyword lists
+- `merchant_rules` — merchant-level force-income, force-expense, or ignore overrides
+- `budget_goals`, `budget_settings`, `budget_history`, `budget_goals_monthly` — saved budget state and history
 
-### `config/income_keywords.json`
-Keywords found in merchant/description fields that indicate income (not an expense). Edit to match your employer's name or side-income sources.
-
-### `config/payment_apps.json`
-Lists payment app names (Venmo, Zelle, Cash App, PayPal, etc.). Transactions matching these are flagged for manual review because the real merchant is usually in the note/memo.
-
-### `config/transfer_keywords.json`
-Keywords that indicate an inter-account transfer (e.g., "ACH TRANSFER", "ONLINE TRANSFER TO"). These are excluded from expense totals.
-
-### `config/ignore_transactions.json`
-Specific transaction strings to completely ignore (e.g., internal account fees that aren't real expenses).
+The FastAPI startup path seeds these tables when needed, and the Settings UI edits them live without rebuilding the container.
 
 ---
 
 ## Adding a New Category
 
-1. Open `config/categories.json`
-2. Add the new category name to the array
-3. Open `config/category_patterns.json`
-4. Add keyword patterns that map merchant names to the new category
+1. Open the Settings tab in the dashboard.
+2. Add or rename categories there; this writes to the `config_categories` table.
+3. Re-categorize existing transactions if needed, or reprocess statements so new imports use the updated category list.
+4. If you are changing startup defaults for brand-new databases, update the category seed logic in `src/database/db_utils.py`.
 
 ---
 

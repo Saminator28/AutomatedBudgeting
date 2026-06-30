@@ -5,15 +5,29 @@ echo "🚀 Starting Automated Budgeting Tool"
 
 # Wait for Ollama to be ready (on host machine) - with timeout
 echo "⏳ Checking for Ollama service..."
-OLLAMA_URL="${OLLAMA_HOST:-http://localhost:11434}"
+OLLAMA_URL="${OLLAMA_HOST:-http://host.docker.internal:11434}"
 MAX_ATTEMPTS=10
 ATTEMPT=0
 
+# Try common host aliases/gateways used by Docker across platforms.
+OLLAMA_CANDIDATES=(
+    "${OLLAMA_URL}"
+    "http://host.docker.internal:11434"
+    "http://gateway.docker.internal:11434"
+    "http://172.17.0.1:11434"
+    "http://localhost:11434"
+)
+
 while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-    if curl -s -f "${OLLAMA_URL}/api/tags" > /dev/null 2>&1; then
-        echo "✅ Ollama is ready at ${OLLAMA_URL}"
-        break
-    fi
+    for CANDIDATE_URL in "${OLLAMA_CANDIDATES[@]}"; do
+        if curl -s -f "${CANDIDATE_URL}/api/tags" > /dev/null 2>&1; then
+            OLLAMA_URL="${CANDIDATE_URL}"
+            # Ensure child Python processes use the same reachable URL.
+            export OLLAMA_HOST="${OLLAMA_URL}"
+            echo "✅ Ollama is ready at ${OLLAMA_URL}"
+            break 2
+        fi
+    done
     ATTEMPT=$((ATTEMPT + 1))
     if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
         echo "   Ollama not ready yet (attempt $ATTEMPT/$MAX_ATTEMPTS), waiting..."
@@ -22,8 +36,10 @@ while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
 done
 
 if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-    echo "⚠️  Warning: Could not connect to Ollama at ${OLLAMA_URL}"
+    echo "⚠️  Warning: Could not connect to Ollama from container."
+    echo "   Tried: ${OLLAMA_CANDIDATES[*]}"
     echo "   Make sure Ollama is running on host: ollama serve"
+    echo "   On Linux, if Ollama is bound to 127.0.0.1 only, run: OLLAMA_HOST=0.0.0.0:11434 ollama serve"
     echo "   The application will start anyway, but AI features may not work."
     echo ""
 else

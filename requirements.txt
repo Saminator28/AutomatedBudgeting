@@ -39,6 +39,9 @@ python-multipart
 # Database
 sqlalchemy>=2.0
 
+# Code Quality
+ruff>=0.4.0
+
 # Utilities
 python-dotenv>=1.0.0
 

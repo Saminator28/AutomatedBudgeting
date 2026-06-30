@@ -23,6 +23,7 @@ The primary table. One row per transaction.
 | `label` | TEXT | Sub-label: `recurring`, `one-time`, `bonus`, or `reimbursement` |
 | `statement` | TEXT | Source statement filename |
 | `user_corrected` | INTEGER | `1` if a user manually corrected this row; `0` otherwise |
+| `source_statement` | TEXT | Source statement month folder that originally produced the row |
 
 #### `tx_hash` derivation
 
@@ -72,17 +73,31 @@ Per-merchant learned data. Updated whenever the LLM cleans a new raw merchant st
 
 All keyword lists that were previously stored as JSON config files are now stored in the DB so they can be edited live from the UI without a container restart.
 
-| Table | Replaces | Purpose |
-|-------|----------|---------|
-| `investment_keywords` | `config/investment_platforms.json` | Detect investment-platform transactions |
-| `income_keywords` | `config/income_keywords.json` | Detect incoming credits (payroll, deposits) |
-| `ignore_keywords` | `config/ignore_transactions.json` | Silently drop matching transactions |
-| `payment_app_keywords` | `config/payment_apps.json` | Flag peer-to-peer payment app transactions for manual review |
-| `transfer_keywords` | `config/transfer_keywords.json` | Exclude inter-account transfers from totals |
+| Table | Historical seed source | Purpose |
+|-------|------------------------|---------|
+| `investment_keywords` | legacy JSON defaults | Detect investment-platform transactions |
+| `income_keywords` | legacy JSON defaults | Detect incoming credits (payroll, deposits) |
+| `ignore_keywords` | legacy JSON defaults | Silently drop matching transactions |
+| `payment_app_keywords` | legacy JSON defaults | Flag peer-to-peer payment app transactions for manual review |
+| `transfer_keywords` | legacy JSON defaults | Exclude inter-account transfers from totals |
 
 Each table has `id` (INTEGER PK) and `keyword` (TEXT UNIQUE).
 
 On first startup, the application is responsible for ensuring these tables are populated with an initial keyword set (if desired). The exact seeding mechanism is implementation-defined and may change over time; consult the current application configuration or release notes for details. New installations can also be initialized manually via the UI or SQL migrations.
+
+### Additional operational tables
+
+The current schema also includes several application tables that older summaries often omit:
+
+| Table | Purpose |
+|-------|---------|
+| `auto_deleted_transactions` | Tracks rows automatically filtered during processing and their whitelist state |
+| `merchant_rules` | Merchant-level force-income, force-expense, or ignore overrides |
+| `budget_goals` | Category template-level budget settings |
+| `budget_settings` | Global budget strategy and savings target state |
+| `budget_history` | Historical budget-vs-actual snapshots and coaching notes |
+| `budget_goals_monthly` | Saved per-month budget goals |
+| `config_categories` | Live category list and parent/child hierarchy |
 
 ---
 
@@ -134,7 +149,7 @@ Setting `user_corrected = 1` ensures the next re-import of the same statement pr
 
 ## Read Flows
 
-All API read endpoints use the `_query_df(tx_type, months=None)` helper in `main.py`:
+All API read endpoints use the `_query_df(...)` helper in `src/ui/backend/deps.py`:
 
 ```python
 def _query_df(tx_type: str, months: list[str] | None = None) -> pd.DataFrame:
@@ -170,7 +185,7 @@ This means you can safely re-import a statement PDF to pick up newly parsed rows
 
 ## Transfer Detection
 
-After every statement import for a month, `_rebuild_transfers_for_month(month)` in `main.py`:
+After every statement import for a month, `_rebuild_transfers_for_month(month)` in `src/ui/backend/deps.py`:
 
 1. Reads raw transfer rows from `statements/*/transfers.csv` for the month.
 2. Reads investment expense rows from `transactions` (category = `Investment` or `Investment Transfer`) → `direction = Out`.
@@ -190,5 +205,5 @@ If you need to wipe and restart: delete `src/ui/data/budget.db` and restart the 
 ## Schema Changes
 
 No migration tool (e.g. Alembic) is in place. For schema changes, either:
-- Add `ALTER TABLE` statements to `session.py:init_db()`, or
+- Add additive `ALTER TABLE` statements to `session.py:init_db()`, or
 - Delete `budget.db` and re-import all statements (data is always reproducible from the source PDFs).

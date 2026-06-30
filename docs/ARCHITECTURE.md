@@ -150,12 +150,14 @@ All transactions, merchant metadata, keyword lists, and transfer records are sto
 Host OS
  ├─ Browser        → http://localhost:8000
  ├─ Ollama         → http://localhost:11434  (host service)
- └─ Docker container (network_mode: host)
-      └─ FastAPI   → binds 0.0.0.0:8000
-           └─ sends LLM requests to localhost:11434 (same host)
+ └─ Docker container
+     └─ FastAPI   → binds 0.0.0.0:8000
+         └─ sends LLM requests to the configured OLLAMA_HOST
 ```
 
-Using `network_mode: host` in Docker means the container shares the host's network stack. This is required so that the container can reach Ollama running on the host without extra configuration.
+Current networking is platform-specific:
+- On Linux, the `docker-compose.linux.yml` override uses `network_mode: host`, so the container can reach Ollama at `http://localhost:11434` even when Ollama only listens on loopback.
+- On other setups, the base compose file uses bridge networking and host aliases such as `host.docker.internal`.
 
 ### Local Dev Mode (no Docker)
 Same ports, no container. Both FastAPI (port 8000) and React dev server (port 3000) run directly on the host. React dev server proxies `/api/` calls to port 8000.
