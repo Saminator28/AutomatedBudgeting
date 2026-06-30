@@ -1291,15 +1291,78 @@ async def check_chat_availability():
         return {"available": False, "model_name": None}
 
 
+# ── Chat session management ────────────────────────────────────────────────────
+
+@router.get("/api/chat/sessions")
+async def list_chat_sessions():
+    """
+    Return all saved chat sessions ordered newest-first.
+    Each item: session_id, title, created_at, updated_at, message_count.
+    """
+    try:
+        from src.ai_analysis.chatbot_assistant import list_sessions
+        return {"sessions": list_sessions()}
+    except Exception as e:
+        logging.exception("Failed to list chat sessions")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.get("/api/chat/sessions/{session_id}")
+async def get_chat_session(session_id: str):
+    """Return the full message history and metadata for a single session."""
+    try:
+        from src.ai_analysis.chatbot_assistant import load_session
+        row = load_session(session_id)
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "Session not found"})
+        return row
+    except Exception as e:
+        logging.exception("Failed to get chat session")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.delete("/api/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session from the DB and evict it from the in-memory cache."""
+    try:
+        from src.ai_analysis.chatbot_assistant import delete_session
+        ok = delete_session(session_id)
+        if not ok:
+            return JSONResponse(status_code=404, content={"error": "Session not found or delete failed"})
+        return {"deleted": True, "session_id": session_id}
+    except Exception as e:
+        logging.exception("Failed to delete chat session")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @router.post("/api/chat")
 async def chat_with_assistant(request: dict = Body(...)):
-    """Interactive AI chatbot for financial analysis and expense management."""
-    try:
-        from src.ai_analysis.chatbot_assistant import ChatbotAssistant
+    """
+    Interactive AI chatbot for financial analysis and expense management.
 
-        month = request.get('month')
-        message = request.get('message')
-        conversation_history = request.get('conversation_history', [])
+    Accepts an optional `session_id` field.  When provided the server reuses
+    the existing ChatbotAssistant instance (with its live ConversationState)
+    and conversation history stored in the DB.  When omitted a new session is
+    created and the `session_id` is returned in the response so the client can
+    pass it on subsequent requests.
+
+    The `conversation_history` field is still accepted for backward compatibility
+    (legacy clients that manage history client-side) but is ignored when a valid
+    `session_id` resolves a server-side session.
+    """
+    try:
+        from src.ai_analysis.chatbot_assistant import (
+            get_or_create_assistant,
+            load_session,
+            save_session,
+            SESSION_SUMMARY_THRESHOLD,
+        )
+
+        month              = request.get('month')
+        message            = request.get('message')
+        session_id_req     = request.get('session_id')
+        # Legacy fallback: client-managed history (ignored when session resolves)
+        legacy_history     = request.get('conversation_history', [])
 
         if not message:
             return JSONResponse(status_code=400, content={"error": "Missing required field: message"})
@@ -1331,11 +1394,62 @@ async def chat_with_assistant(request: dict = Body(...)):
         else:
             logging.info("📊 Chat using rule-based fallback (no model configured)")
 
-        chatbot = ChatbotAssistant(model_name=model_name)
-        result = chatbot.process_message(month, message, conversation_history)
+        # ── Resolve session ───────────────────────────────────────────────────
+        session_id, chatbot = get_or_create_assistant(session_id_req, model_name)
+
+        # Load stored history for this session (preferred over legacy_history)
+        session_row = load_session(session_id)
+        if session_row and session_row.get("messages"):
+            conversation_history = session_row["messages"]
+            session_summary      = session_row.get("summary")
+        else:
+            conversation_history = legacy_history
+            session_summary      = None
+
+        # ── Process message ───────────────────────────────────────────────────
+        result = chatbot.process_message(
+            month, message, conversation_history,
+            session_summary=session_summary,
+        )
+
+        # ── Persist updated session ───────────────────────────────────────────
+        updated_history = result.get("conversation_history", conversation_history)
+        title = session_row.get("title", "") if session_row else ""
+        if not title and updated_history:
+            # Auto-generate title from first user message
+            first_user = next(
+                (m["content"] for m in updated_history if m.get("role") == "user"), ""
+            )
+            title = first_user[:60] + ("…" if len(first_user) > 60 else "")
+
+        # Trigger Hermes memory summarisation when the session gets long
+        new_summary = session_summary
+        assistant_turns = sum(
+            1 for m in updated_history if m.get("role") == "assistant"
+        )
+        if assistant_turns >= SESSION_SUMMARY_THRESHOLD and chatbot.memory_model:
+            logging.info(
+                f"🧠 Session {session_id[:8]}… reached {assistant_turns} turns — "
+                "requesting Hermes memory summary"
+            )
+            new_summary = chatbot._summarize_session(updated_history, existing_summary=session_summary)
+
+        save_session(
+            session_id,
+            title,
+            updated_history,
+            chatbot.conv_state.to_dict(),
+            summary=new_summary,
+            created_at=session_row.get("created_at") if session_row else None,
+        )
 
         expenses_count = len(result.get('expenses') or []) if result.get('expenses') is not None else 0
-        logging.info(f"💬 Chat processed: {message[:50]}... → {expenses_count} expenses returned")
+        logging.info(
+            f"💬 Chat [{session_id[:8]}…] processed: {message[:50]}… → {expenses_count} expenses returned"
+        )
+
+        # Inject session_id into the response so new clients can persist it
+        result["session_id"] = session_id
 
         return JSONResponse(
             content=result,

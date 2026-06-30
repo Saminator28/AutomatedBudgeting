@@ -17,18 +17,32 @@ Architecture: Two-Model Pipeline
      the verified pandas data and conversation history then produces a
      thoughtful, conversational financial response including budget
      suggestions, savings plans, and goal adjustments.
+
+Session Persistence:
+  Each conversation is stored in the `chat_sessions` DB table so the
+  ConversationState (active period, category, goals …) survives between HTTP
+  requests.  The module-level _SESSION_CACHE keeps live ChatbotAssistant
+  instances in memory so hot sessions don't pay a DB round-trip on every turn.
+  When the server restarts the session is reconstructed from the DB on first
+  access.
+
+  The optional `memory_model` (e.g. a Hermes model) in llm_models.json can
+  summarize older turns when a session grows beyond SESSION_SUMMARY_THRESHOLD
+  messages, keeping the finance advisor's context window healthy for very long
+  conversations.
 """
 
 import os
-import pandas as pd
+import uuid
 import json
 import logging
 import re
 import requests
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+import pandas as pd
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 _OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
@@ -39,6 +53,17 @@ MONTH_TO_NUM = {
     'may': '05', 'june': '06', 'july': '07', 'august': '08',
     'september': '09', 'october': '10', 'november': '11', 'december': '12'
 }
+
+# ---------------------------------------------------------------------------
+# Session cache — live ChatbotAssistant instances keyed by session_id.
+# Avoids recreating the object (and reloading model config) on every request.
+# ---------------------------------------------------------------------------
+
+_SESSION_CACHE: Dict[str, "ChatbotAssistant"] = {}
+
+# Number of assistant turns after which the memory_model is asked to
+# summarise older turns into a compact context block.
+SESSION_SUMMARY_THRESHOLD = 20
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +159,214 @@ class ConversationState:
             parts.append(f"Monthly savings target: ${self.monthly_savings_target:,.0f}")
         return "; ".join(parts) if parts else "No active context"
 
+    def to_dict(self) -> Dict:
+        """Serialise state to a plain dict suitable for JSON storage."""
+        return {
+            "active_period":          self.active_period,
+            "active_months_window":   self.active_months_window,
+            "active_category":        self.active_category,
+            "active_merchant":        self.active_merchant,
+            "savings_goals":          self.savings_goals,
+            "budget_targets":         self.budget_targets,
+            "monthly_savings_target": self.monthly_savings_target,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ConversationState":
+        """Reconstruct a ConversationState from a previously serialised dict."""
+        state = cls()
+        state.active_period          = data.get("active_period")
+        state.active_months_window   = data.get("active_months_window")
+        state.active_category        = data.get("active_category")
+        state.active_merchant        = data.get("active_merchant")
+        state.savings_goals          = data.get("savings_goals") or []
+        state.budget_targets         = data.get("budget_targets") or {}
+        state.monthly_savings_target = data.get("monthly_savings_target")
+        return state
+
+
+# ---------------------------------------------------------------------------
+# Session DB helpers
+# ---------------------------------------------------------------------------
+
+def _get_db_engine():
+    """Return the shared SQLAlchemy engine, or None if unavailable."""
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from src.database.session import get_engine
+        return get_engine()
+    except Exception as exc:
+        logger.warning(f"Session DB unavailable: {exc}")
+        return None
+
+
+def load_session(session_id: str) -> Optional[Dict]:
+    """
+    Load a chat session row from the DB.
+    Returns a dict with keys: session_id, title, created_at, updated_at,
+    messages (list), conv_state (dict), summary (str|None).
+    Returns None if the session does not exist.
+    """
+    engine = _get_db_engine()
+    if engine is None:
+        return None
+    try:
+        from sqlalchemy import text as _t
+        with engine.connect() as conn:
+            row = conn.execute(
+                _t("SELECT session_id, title, created_at, updated_at, messages, conv_state, summary "
+                   "FROM chat_sessions WHERE session_id=:sid"),
+                {"sid": session_id},
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "session_id": row[0],
+            "title":      row[1],
+            "created_at": row[2],
+            "updated_at": row[3],
+            "messages":   json.loads(row[4] or "[]"),
+            "conv_state": json.loads(row[5] or "{}"),
+            "summary":    row[6],
+        }
+    except Exception as exc:
+        logger.warning(f"Could not load session {session_id}: {exc}")
+        return None
+
+
+def save_session(
+    session_id: str,
+    title: str,
+    messages: List[Dict],
+    conv_state: Dict,
+    summary: Optional[str] = None,
+    created_at: Optional[str] = None,
+) -> bool:
+    """
+    Upsert a chat session row in the DB.
+    Returns True on success, False on failure.
+    """
+    engine = _get_db_engine()
+    if engine is None:
+        return False
+    now = datetime.utcnow().isoformat()
+    try:
+        from sqlalchemy import text as _t
+        with engine.connect() as conn:
+            conn.execute(_t("""
+                INSERT INTO chat_sessions
+                    (session_id, title, created_at, updated_at, messages, conv_state, summary)
+                VALUES (:sid, :title, :cat, :uat, :msgs, :cs, :sum)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    title      = excluded.title,
+                    updated_at = excluded.updated_at,
+                    messages   = excluded.messages,
+                    conv_state = excluded.conv_state,
+                    summary    = excluded.summary
+            """), {
+                "sid":   session_id,
+                "title": title,
+                "cat":   created_at or now,
+                "uat":   now,
+                "msgs":  json.dumps(messages),
+                "cs":    json.dumps(conv_state),
+                "sum":   summary,
+            })
+            conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning(f"Could not save session {session_id}: {exc}")
+        return False
+
+
+def list_sessions() -> List[Dict]:
+    """
+    Return a list of all chat sessions ordered newest-first.
+    Each item contains: session_id, title, created_at, updated_at, message_count.
+    """
+    engine = _get_db_engine()
+    if engine is None:
+        return []
+    try:
+        from sqlalchemy import text as _t
+        with engine.connect() as conn:
+            rows = conn.execute(_t(
+                "SELECT session_id, title, created_at, updated_at, messages "
+                "FROM chat_sessions ORDER BY updated_at DESC"
+            )).fetchall()
+        result = []
+        for row in rows:
+            msgs = json.loads(row[4] or "[]")
+            result.append({
+                "session_id":    row[0],
+                "title":         row[1],
+                "created_at":    row[2],
+                "updated_at":    row[3],
+                "message_count": len(msgs),
+            })
+        return result
+    except Exception as exc:
+        logger.warning(f"Could not list sessions: {exc}")
+        return []
+
+
+def delete_session(session_id: str) -> bool:
+    """Delete a chat session from the DB and evict it from the in-memory cache."""
+    _SESSION_CACHE.pop(session_id, None)
+    engine = _get_db_engine()
+    if engine is None:
+        return False
+    try:
+        from sqlalchemy import text as _t
+        with engine.connect() as conn:
+            conn.execute(_t("DELETE FROM chat_sessions WHERE session_id=:sid"),
+                         {"sid": session_id})
+            conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning(f"Could not delete session {session_id}: {exc}")
+        return False
+
+
+def get_or_create_assistant(
+    session_id: Optional[str],
+    model_name: Optional[str],
+) -> Tuple[str, "ChatbotAssistant"]:
+    """
+    Return (session_id, ChatbotAssistant) for the given session.
+
+    - If session_id is None a new session UUID is minted.
+    - If the session is already in _SESSION_CACHE the cached instance is
+      returned so its ConversationState is fully intact.
+    - Otherwise the session is loaded from the DB and the ConversationState
+      is restored from the stored conv_state JSON.
+    - If the DB row doesn't exist yet (brand-new session) a fresh
+      ChatbotAssistant is created and the session is pre-written to the DB.
+    """
+    if not session_id:
+        session_id = uuid.uuid4().hex
+
+    if session_id in _SESSION_CACHE:
+        return session_id, _SESSION_CACHE[session_id]
+
+    # Build assistant (this reads llm_models.json once)
+    assistant = ChatbotAssistant(model_name=model_name)
+
+    # Restore conversation state from DB if the session exists
+    row = load_session(session_id)
+    if row:
+        assistant.conv_state = ConversationState.from_dict(row["conv_state"])
+        logger.info(f"🔄 Restored session {session_id[:8]}… "
+                    f"({len(row['messages'])} messages, state: {assistant.conv_state.summary()})")
+    else:
+        # Pre-create the row so the session_id is immediately visible in the list
+        save_session(session_id, "", [], assistant.conv_state.to_dict())
+        logger.info(f"🆕 Created new chat session {session_id[:8]}…")
+
+    _SESSION_CACHE[session_id] = assistant
+    return session_id, assistant
+
 
 class ChatbotAssistant:
     """AI-powered financial chatbot with expense management capabilities"""
@@ -174,34 +407,43 @@ class ChatbotAssistant:
                 self.intent_model = cfg.get("primary_model", self.model_name)
                 # Finance model: prefer explicit key, fall back to what was passed in
                 self.finance_model = cfg.get("financial_analysis_model") or self.model_name
+                # Memory model (optional Hermes model for session summarisation)
+                self.memory_model: Optional[str] = cfg.get("memory_model") or None
             else:
                 self.intent_model = self.model_name
                 self.finance_model = self.model_name
+                self.memory_model = None
         except Exception as e:
             logger.warning(f"Could not load llm_models.json: {e}")
             self.intent_model = self.model_name
             self.finance_model = self.model_name
+            self.memory_model = None
     
     def process_message(
-        self, 
-        month: Optional[str], 
-        message: str, 
-        conversation_history: Optional[List[Dict]] = None
+        self,
+        month: Optional[str],
+        message: str,
+        conversation_history: Optional[List[Dict]] = None,
+        session_summary: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Process a user message and generate a response
-        
+        Process a user message and generate a response.
+
         Args:
             month: Optional specific month filter (YYYY-MM), if None loads all months
             message: User's message
-            conversation_history: Previous conversation messages
-            
+            conversation_history: Previous conversation messages (from DB session or
+                legacy client-managed history)
+            session_summary: Optional Hermes-generated memory summary for long sessions.
+                When provided it is passed to the finance advisor so older turns are
+                not lost even when conversation_history is trimmed to the recent window.
+
         Returns:
-            Dict with response, actions_taken, updated_expenses, etc.
+            Dict with response, actions_taken, updated_expenses, conversation_history.
         """
         if conversation_history is None:
             conversation_history = []
-        
+
         # Load expense data - all months or specific month
         if month:
             expenses_df = self._load_expenses(month)
@@ -209,43 +451,46 @@ class ChatbotAssistant:
         else:
             expenses_df = self._load_all_expenses()
             month_context = "all available months"
-        
+
         if expenses_df is None or expenses_df.empty:
             return {
-                "response": f"I don't have any expense data available yet. Please process monthly statements first.",
+                "response": "I don't have any expense data available yet. Please process monthly statements first.",
                 "actions_taken": [],
                 "conversation_history": conversation_history + [
                     {"role": "user", "content": message},
                     {"role": "assistant", "content": "No expense data available"}
                 ]
             }
-        
+
         # Prepare expense summary for context
         expense_context = self._prepare_expense_context(expenses_df)
-        
+
         # Build the AI prompt with conversation history
         system_prompt = self._build_system_prompt(month_context, expense_context)
-        
+
         # Add conversation history to context
         messages = [{"role": "system", "content": system_prompt}]
         for msg in conversation_history[-6:]:  # Keep last 6 messages for context
             messages.append(msg)
         messages.append({"role": "user", "content": message})
-        
+
         # Get AI response
         if self.ai_available:
             try:
-                response_data = self._generate_ai_response(messages, expenses_df, month_context)
+                response_data = self._generate_ai_response(
+                    messages, expenses_df, month_context,
+                    session_summary=session_summary,
+                )
             except Exception as e:
                 logger.error(f"❌ AI response generation failed: {e}")
                 response_data = self._generate_fallback_response(message, expenses_df, month_context)
         else:
             response_data = self._generate_fallback_response(message, expenses_df, month_context)
-        
+
         # Update conversation history
         conversation_history.append({"role": "user", "content": message})
         conversation_history.append({"role": "assistant", "content": response_data["response"]})
-        
+
         return {
             **response_data,
             "conversation_history": conversation_history
@@ -405,26 +650,29 @@ For everything else, answer naturally with specific details from the data."""
         self,
         messages: List[Dict],
         expenses_df: pd.DataFrame,
-        month: str
+        month: str,
+        session_summary: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Two-model pipeline:
           1. Intent Model  → parse user message + conversation state → JSON intent
           2. Pandas        → execute intent against real data (zero errors)
           3. Finance Model → compose conversational answer with advice
+
+        session_summary: optional Hermes-generated condensed context for long sessions.
         """
         try:
             user_message = messages[-1]['content']
             conversation_history = messages[:-1]  # everything except current message
 
-            # ── 0. Rebuild conv_state from prior messages so follow-ups work ──
-            #    Use the cheap regex fallback (no LLM call) over each prior user
-            #    message to restore period/category/window context that was set
-            #    in earlier turns of this conversation.
-            for msg in conversation_history:
-                if msg.get('role') == 'user':
-                    prior_intent = self._regex_intent_fallback(msg['content'])
-                    self.conv_state.update_from_intent(prior_intent)
+            # ── 0. conv_state is already populated when a persistent session is used.
+            #    For stateless callers (no session_id) we still rebuild it from the
+            #    regex fallback over prior turns as before.
+            if not self.conv_state.active_period and not self.conv_state.active_category:
+                for msg in conversation_history:
+                    if msg.get('role') == 'user':
+                        prior_intent = self._regex_intent_fallback(msg['content'])
+                        self.conv_state.update_from_intent(prior_intent)
 
             # ── 1. Parse intent with the reasoning model ────────────────────
             intent = self._parse_intent(user_message, conversation_history)
@@ -475,13 +723,16 @@ For everything else, answer naturally with specific details from the data."""
                 f.write(f"USER: {user_message}\n")
                 f.write(f"INTENT: {json.dumps(intent, indent=2)}\n")
                 f.write(f"CONV STATE: {self.conv_state.summary()}\n\n")
+                if session_summary:
+                    f.write(f"SESSION SUMMARY (Hermes):\n{session_summary}\n\n")
                 f.write("PANDAS DATA:\n")
                 f.write(pandas_data)
                 f.write(f"\n\nTransactions analyzed: {len(filtered_expenses)}\n")
 
             # ── 6. Call finance advisor model ────────────────────────────────
             response_text = self._call_finance_advisor(
-                user_message, pandas_data, conversation_history, intent, month
+                user_message, pandas_data, conversation_history, intent, month,
+                session_summary=session_summary,
             )
 
             # Handle update requests (mark expense / add note)
@@ -1025,18 +1276,93 @@ Rules:
 
     # ── Finance Advisor Call ──────────────────────────────────────────────────
 
+    def _summarize_session(
+        self,
+        conversation_history: List[Dict],
+        existing_summary: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Use the memory_model (e.g. a Hermes model) to condense older turns
+        into a compact summary paragraph.  Returns the summary string, or
+        None if no memory model is configured or the call fails.
+
+        The summary is stored in the chat_sessions.summary column so the
+        finance advisor can receive it as a context block instead of the
+        full message log when the session is very long.
+        """
+        if not self.memory_model:
+            return None
+
+        # Build the conversation text to summarise
+        lines = []
+        if existing_summary:
+            lines.append(f"[Previous summary]: {existing_summary}\n")
+        for msg in conversation_history:
+            role = msg.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            prefix = "User" if role == "user" else "Assistant"
+            lines.append(f"{prefix}: {msg['content'][:400]}")
+
+        conv_text = "\n".join(lines)
+        if not conv_text.strip():
+            return None
+
+        prompt = (
+            "You are a memory manager for a personal-finance chatbot.  "
+            "Summarise the following conversation into a single compact paragraph "
+            "that captures: the financial questions asked, the key data points "
+            "discussed, any goals or budgets mentioned, and the time periods "
+            "referenced.  The summary will be injected into future prompts so the "
+            "assistant does not lose context.  Be concise — 3–5 sentences maximum.\n\n"
+            f"Conversation:\n{conv_text}\n\nSummary:"
+        )
+        try:
+            resp = requests.post(
+                f'{_OLLAMA_HOST}/api/chat',
+                json={
+                    "model":   self.memory_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream":  False,
+                    "think":   False,
+                    "options": {"temperature": 0.3, "num_predict": 300},
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            summary = (resp.json().get("message", {}).get("content") or "").strip()
+            summary = re.sub(r"<think>.*?</think>", "", summary, flags=re.DOTALL).strip()
+            if summary:
+                logger.info(f"🧠 Memory model summarised session ({len(summary)} chars)")
+            return summary or None
+        except Exception as exc:
+            logger.warning(f"Memory model summarisation failed: {exc}")
+            return None
+
     def _call_finance_advisor(
         self,
         user_message: str,
         pandas_data: str,
         conversation_history: List[Dict],
         intent: Dict,
-        month: str
+        month: str,
+        session_summary: Optional[str] = None,
     ) -> str:
         """
         Call the finance advisor model with verified pandas data and the full
         conversation history so it can give contextually accurate advice.
+
+        session_summary: Hermes-generated condensed context for long sessions.
+        When provided it is prepended to the system prompt so older turns are
+        not lost even when conversation_history is trimmed to the recent window.
         """
+        summary_section = ""
+        if session_summary:
+            summary_section = (
+                f"\n**Session Memory (condensed history from memory model):**\n"
+                f"{session_summary}\n"
+            )
+
         system_prompt = f"""You are a concise, professional personal finance advisor.
 
 The user has asked: {user_message}
@@ -1047,7 +1373,7 @@ Here is the VERIFIED financial data (calculated by Python pandas — 100% accura
 
 **Conversation Context:**
 {self.conv_state.summary()}
-
+{summary_section}
 **Communication Style:**
 - Be direct and professional — lead with the answer, not the explanation
 - Keep responses short unless deep analysis is explicitly requested

@@ -6,7 +6,7 @@ Category list is loaded from the config_categories database table.
 """
 
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import os
 import re
 import json
@@ -298,8 +298,112 @@ Your answer:"""
         
         return None
     
+    def categorize_batch_with_session(
+        self,
+        merchants_amounts: List[Tuple[str, Optional[float]]],
+    ) -> Dict[str, Optional[str]]:
+        """
+        Categorize a batch of merchants in a **single persistent Ollama chat
+        session** so the model retains context across the entire batch.
+
+        Benefits over calling `_categorize_with_llm` once per merchant:
+        - The model sees what it already assigned earlier in the batch and can
+          apply consistent heuristics (e.g. all coffee-shop names → "Dining").
+        - Eliminates repeated context-loading overhead for large batches.
+        - Reduces ambiguity for similar merchants that appear close together.
+
+        Args:
+            merchants_amounts: list of (merchant_name, amount_or_None) tuples.
+
+        Returns:
+            dict mapping merchant_name → category string (or None on failure).
+            For duplicate merchant names the last result is used.
+        """
+        if not self.llm_available or not merchants_amounts:
+            return {}
+
+        leaf_cats = [cat for cat in self.categories.keys() if cat not in self.subcategories]
+        categories_numbered = "\n".join(f"{i+1}. {cat}" for i, cat in enumerate(leaf_cats))
+
+        # Disambiguation hints (same as _get_category_from_model)
+        dynamic_hints = []
+        for parent, subs in self.subcategories.items():
+            subs_str = ', '.join(f'"{s}"' for s in subs)
+            dynamic_hints.append(
+                f'- For anything that is "{parent}", choose one of its subcategories: {subs_str}.'
+            )
+        subcategory_hints = "\n".join(dynamic_hints)
+
+        system_message = (
+            "You are a transaction categorizer.  I will send you merchant names one at a time.  "
+            "For each one reply with ONLY the category name from the list below — nothing else.\n\n"
+            f"VALID CATEGORIES:\n{categories_numbered}\n\n"
+            "DISAMBIGUATION HINTS:\n"
+            '- "Alcohol/Bar": breweries, bars, pubs, liquor stores.\n'
+            '- "Dining": restaurants, cafes, fast food, coffee shops.\n'
+            '- "Groceries": grocery stores, supermarkets, warehouse clubs.\n'
+            '- "Subscriptions": streaming services, software subscriptions.\n'
+            '- "Shopping": general retail when nothing more specific fits.\n'
+            f"{subcategory_hints}\n\n"
+            "Remember every transaction from this batch so you apply consistent rules across similar merchants."
+        )
+
+        messages: List[Dict] = [{"role": "system", "content": system_message}]
+        results: Dict[str, Optional[str]] = {}
+        valid_lower = {cat.lower(): cat for cat in leaf_cats}
+
+        for merchant, amount in merchants_amounts:
+            amount_ctx = f" (${amount:.2f})" if amount is not None else ""
+            user_text = f"{merchant}{amount_ctx}"
+            messages.append({"role": "user", "content": user_text})
+
+            try:
+                resp = requests.post(
+                    f'{self.llm_host}/api/chat',
+                    json={
+                        "model":   self.llm_model,
+                        "messages": messages,
+                        "stream":  False,
+                        "think":   False,
+                        "options": {"temperature": 0.1, "num_predict": 64},
+                    },
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                raw = (resp.json().get("message", {}).get("content") or "").strip()
+                # Keep first line only
+                raw = raw.split("\n")[0].strip().strip('"').strip("'")
+
+                # Validate against leaf categories
+                category: Optional[str] = None
+                if raw in leaf_cats:
+                    category = raw
+                elif raw.lower() in valid_lower:
+                    category = valid_lower[raw.lower()]
+                else:
+                    # Partial match
+                    for v in leaf_cats:
+                        if raw.lower() in v.lower() or v.lower() in raw.lower():
+                            category = v
+                            break
+
+                results[merchant] = category
+                # Feed the model's answer back so subsequent turns see it
+                messages.append({"role": "assistant", "content": category or raw})
+
+            except Exception as exc:
+                print(f"  [Batch LLM] Error for '{merchant}': {exc}")
+                results[merchant] = None
+                # Keep messages consistent: add a placeholder so the session stays coherent
+                messages.append({"role": "assistant", "content": "Other"})
+
+        categorized = sum(1 for v in results.values() if v)
+        print(f"  [Batch LLM] Session complete: {categorized}/{len(merchants_amounts)} categorized "
+              f"({len(messages) - 1} turns in session)")
+        return results
+
     def categorize_transaction(
-        self, 
+        self,
         description: str,
         amount: float = None
     ) -> str:

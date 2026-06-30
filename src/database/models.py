@@ -253,3 +253,27 @@ config_categories = Table(
     Column('parent',     Text,    nullable=True),   # NULL = top-level category
     Column('sort_order', Integer, server_default='0'),
 )
+
+# ── chat_sessions ──────────────────────────────────────────────────────────────
+# Persistent chatbot conversation sessions.
+# Each session stores the full message history and the serialized ConversationState
+# so the chatbot never has to restart from scratch between requests.
+#
+# messages:   JSON array of {"role": "user"|"assistant", "content": "..."}
+# conv_state: JSON object serialized from ConversationState dataclass fields
+#             (active_period, active_category, active_merchant, savings_goals,
+#              budget_targets, monthly_savings_target, active_months_window)
+# title:      Auto-generated from the first user message (first 60 chars).
+# summary:    Optional Hermes-generated memory summary that condenses older turns
+#             when the session exceeds the context window.  When present, the
+#             finance advisor receives the summary instead of the full history.
+chat_sessions = Table(
+    'chat_sessions', metadata,
+    Column('session_id',  String(36), primary_key=True),   # UUID-4 hex string
+    Column('title',       Text),
+    Column('created_at',  Text, nullable=False),            # ISO timestamp
+    Column('updated_at',  Text, nullable=False),            # ISO timestamp
+    Column('messages',    Text, nullable=False, server_default='[]'),   # JSON
+    Column('conv_state',  Text, nullable=False, server_default='{}'),   # JSON
+    Column('summary',     Text),                            # Hermes memory summary (nullable)
+)
