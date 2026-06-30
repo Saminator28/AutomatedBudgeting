@@ -1,10 +1,10 @@
 # Schema Map
 
 ## Schema Owners
-- Table definitions live in [src/database/models.py](/home/desktop/Documents/AutomatedBudgeting/src/database/models.py).
-- Engine creation and startup migration logic live in [src/database/session.py](/home/desktop/Documents/AutomatedBudgeting/src/database/session.py).
-- Most write-side behavior, seed logic, and backfills live in [src/database/db_utils.py](/home/desktop/Documents/AutomatedBudgeting/src/database/db_utils.py).
-- Backend consumers are concentrated in [src/ui/backend/deps.py](/home/desktop/Documents/AutomatedBudgeting/src/ui/backend/deps.py) plus route modules under [src/ui/backend/routes](/home/desktop/Documents/AutomatedBudgeting/src/ui/backend/routes).
+- Table definitions live in [src/database/models.py](/src/database/models.py).
+- Engine creation and startup migration logic live in [src/database/session.py](/src/database/session.py).
+- Most write-side behavior, seed logic, and backfills live in [src/database/db_utils.py](/src/database/db_utils.py).
+- Backend consumers are concentrated in [src/ui/backend/deps.py](/src/ui/backend/deps.py) plus route modules under [src/ui/backend/routes](/src/ui/backend/routes).
 
 ## Core Tables
 - `transactions`: primary ledger for expenses, income, and transfer-tagged rows.
@@ -19,14 +19,14 @@
 
 ## High-Value Relationships
 - `config_categories` drives category lists surfaced by the API and used by the UI.
-- Keyword tables are reloaded into shared in-memory lists by helpers in [src/ui/backend/deps.py](/home/desktop/Documents/AutomatedBudgeting/src/ui/backend/deps.py).
+- Keyword tables are reloaded into shared in-memory lists by helpers in [src/ui/backend/deps.py](/src/ui/backend/deps.py).
 - `transactions` writes often trigger transfer rebuilds into `transfers`.
 - `auto_deleted_transactions` and `merchant_rules` affect whether rows remain visible as expenses/income or are filtered/restored.
-- Budget routes in [src/ui/backend/routes/analytics.py](/home/desktop/Documents/AutomatedBudgeting/src/ui/backend/routes/analytics.py) depend on the budget tables being present and shaped as current code expects.
+- Budget routes in [src/ui/backend/routes/analytics.py](/src/ui/backend/routes/analytics.py) depend on the budget tables being present and shaped as current code expects.
 
 ## Practical Ownership By Concern
-- Hashing and dedupe: [src/database/db_utils.py](/home/desktop/Documents/AutomatedBudgeting/src/database/db_utils.py)
-- Startup table creation and additive migrations: [src/database/session.py](/home/desktop/Documents/AutomatedBudgeting/src/database/session.py)
-- Category list and hierarchy edits: [src/database/models.py](/home/desktop/Documents/AutomatedBudgeting/src/database/models.py), [src/ui/backend/routes/expenses.py](/home/desktop/Documents/AutomatedBudgeting/src/ui/backend/routes/expenses.py), [src/ui/src/SettingsTab.js](/home/desktop/Documents/AutomatedBudgeting/src/ui/src/SettingsTab.js)
-- Auto-filter/whitelist flows: [src/ui/backend/routes/settings.py](/home/desktop/Documents/AutomatedBudgeting/src/ui/backend/routes/settings.py)
-- Merchant override rules: [src/ui/backend/routes/keywords.py](/home/desktop/Documents/AutomatedBudgeting/src/ui/backend/routes/keywords.py)
+- Hashing and dedupe: [src/database/db_utils.py](/src/database/db_utils.py)
+- Startup table creation and additive migrations: [src/database/session.py](/src/database/session.py)
+- Category list and hierarchy edits: [src/database/models.py](/src/database/models.py), [src/ui/backend/routes/expenses.py](/src/ui/backend/routes/expenses.py), [src/ui/src/SettingsTab.js](/src/ui/src/SettingsTab.js)
+- Auto-filter/whitelist flows: [src/ui/backend/routes/settings.py](/src/ui/backend/routes/settings.py)
+- Merchant override rules: [src/ui/backend/routes/keywords.py](/src/ui/backend/routes/keywords.py)

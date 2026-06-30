@@ -1,6 +1,6 @@
 # Automated Budgeting Tool - Docker Commands
 
-COMPOSE := $(shell if command -v docker-compose >/dev/null 2>&1; then echo docker-compose; elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; fi)
+COMPOSE := $(shell if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; elif command -v docker-compose >/dev/null 2>&1; then echo docker-compose; fi)
 UNAME_S := $(shell uname -s)
 COMPOSE_FILES := -f docker-compose.yml
 
@@ -11,7 +11,7 @@ endif
 .PHONY: help build up down logs shell clean process aggregate dashboard test models status check-compose
 
 check-compose:
-ifndef COMPOSE
+ifeq ($(COMPOSE),)
 	@echo "❌ Docker Compose not found."
 	@echo "   Install Docker Compose plugin (preferred) or legacy docker-compose."
 	@echo "   Then rerun your command."

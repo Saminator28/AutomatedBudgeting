@@ -150,7 +150,7 @@ With Ollama installed, open `config/llm_models.json`, look at the `"primary_mode
 At the moment, the default primary model in this repo is:
 
 ```
-ollama pull gemma4:31b
+ollama pull qwen3.5:35b
 ```
 
 This downloads the AI model used to clean merchant names, help categorize transactions, and support chat features. You only need to do this once per model.

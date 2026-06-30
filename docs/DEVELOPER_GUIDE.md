@@ -98,7 +98,7 @@ On macOS curl is pre-installed. On Windows use the [Ollama Windows installer](ht
 
 ```bash
 ollama serve                 # if not already running as a service
-ollama pull gemma4:31b       # or whichever model is set in config/llm_models.json
+ollama pull qwen3.5:35b      # or whichever model is set in config/llm_models.json
 ```
 
 Check `config/llm_models.json` for the current `primary_model` setting. Browse available models at [https://ollama.com/search](https://ollama.com/search). Larger models (e.g. `qwen2.5:32b`) produce cleaner merchant names but require more RAM. Update `config/llm_models.json` after pulling a different model.
