@@ -32,11 +32,15 @@
 ### AI Chatbot Assistant
 - RAG-based budget Q&A (`src/ai_analysis/chatbot_assistant.py`)
 - Answers natural-language questions about spending patterns
-- Hierarchical two-model pipeline: intent/reasoning model (primary_model, e.g. qwen) parses user
-  message into structured JSON intent, then a finance advisor model (financial_analysis_model)
-  composes the conversational response using pandas-computed facts — no hallucinated numbers
-- Stateful conversation context (`ConversationState`) carries period, category, and window across
-  follow-up turns without re-querying the intent model
+- **Three-model pipeline**: intent model (primary_model) parses user message → structured JSON;
+  memory model (memory_model, e.g. `hermes3`) maintains genuine multi-turn context via a
+  persistent server-side `ChatbotAssistant` instance (session store in `deps.py`);
+  finance advisor model (financial_analysis_model) composes responses from pandas-verified facts
+- **Server-side session store** (`deps.get_or_create_chat_session`): the assistant instance lives
+  across HTTP requests so `ConversationState` and the message list persist for the session lifetime
+- Batched transaction categorization (8 items/LLM call) in `categorizer.py`
+- Batched merchant name cleaning (6 items/LLM call) in `llm_utils.clean_merchant_batch`
+- Anti-loop measures: `think=False`, stop sequences, `num_predict` cap, `_is_looping` / `_truncate_loop`
 - Regex-based intent fallback when the intent model is unavailable
 - **Persistent chat sessions** — conversation history and `ConversationState` stored in
   `chat_sessions` DB table; server-side session cache (`_SESSION_CACHE`) reuses live

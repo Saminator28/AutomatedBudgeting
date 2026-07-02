@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import uuid
 from pathlib import Path
 
 import requests
@@ -13,6 +14,7 @@ from fastapi.responses import JSONResponse
 from src.ui.backend.deps import (
     _PROJECT_ROOT,
     _query_df,
+    get_or_create_chat_session,
 )
 
 _OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
@@ -1337,48 +1339,37 @@ async def delete_chat_session(session_id: str):
 
 @router.post("/api/chat")
 async def chat_with_assistant(request: dict = Body(...)):
-    """
-    Interactive AI chatbot for financial analysis and expense management.
+    """Interactive AI chatbot for financial analysis and expense management.
 
-    Accepts an optional `session_id` field.  When provided the server reuses
-    the existing ChatbotAssistant instance (with its live ConversationState)
-    and conversation history stored in the DB.  When omitted a new session is
-    created and the `session_id` is returned in the response so the client can
-    pass it on subsequent requests.
-
-    The `conversation_history` field is still accepted for backward compatibility
-    (legacy clients that manage history client-side) but is ignored when a valid
-    `session_id` resolves a server-side session.
+    Accepts an optional ``session_id`` in the request body.  When provided the
+    same ChatbotAssistant instance (with its accumulated ConversationState and
+    message history) is reused across turns, giving the model genuine multi-turn
+    context.  A fresh ``session_id`` (UUID4) is generated and returned whenever
+    one is not supplied so clients can start echoing it back on the next request.
     """
     try:
-        from src.ai_analysis.chatbot_assistant import (
-            get_or_create_assistant,
-            load_session,
-            save_session,
-            SESSION_SUMMARY_THRESHOLD,
-        )
+        from src.ai_analysis.chatbot_assistant import ChatbotAssistant
 
         month              = request.get('month')
         message            = request.get('message')
-        session_id_req     = request.get('session_id')
-        # Legacy fallback: client-managed history (ignored when session resolves)
-        legacy_history     = request.get('conversation_history', [])
+        conversation_history = request.get('conversation_history', [])
+        session_id         = request.get('session_id') or str(uuid.uuid4())
 
         if not message:
             return JSONResponse(status_code=400, content={"error": "Missing required field: message"})
 
         config_path = _PROJECT_ROOT / 'config' / 'llm_models.json'
-        model_name = None
+        model_name  = None
 
         if config_path.exists():
             with open(config_path) as f:
-                config = json.load(f)
+                config    = json.load(f)
                 model_name = config.get('financial_analysis_model', '')
 
         if model_name:
             try:
-                resp = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
-                model_names = [m['name'] for m in resp.json().get('models', [])]
+                resp         = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
+                model_names  = [m['name'] for m in resp.json().get('models', [])]
                 is_available = any(
                     model_name in name or name.startswith(model_name + ':')
                     for name in model_names
@@ -1394,69 +1385,20 @@ async def chat_with_assistant(request: dict = Body(...)):
         else:
             logging.info("📊 Chat using rule-based fallback (no model configured)")
 
-        # ── Resolve session ───────────────────────────────────────────────────
-        session_id, chatbot = get_or_create_assistant(session_id_req, model_name)
+        # Reuse (or create) the server-side assistant for this session
+        chatbot = get_or_create_chat_session(session_id, model_name or "")
 
-        # Load stored history for this session (preferred over legacy_history)
-        session_row = load_session(session_id)
-        if session_row and session_row.get("messages"):
-            conversation_history = session_row["messages"]
-            session_summary      = session_row.get("summary")
-        else:
-            conversation_history = legacy_history
-            session_summary      = None
-
-        # ── Process message ───────────────────────────────────────────────────
-        result = chatbot.process_message(
-            month, message, conversation_history,
-            session_summary=session_summary,
-        )
-
-        # ── Persist updated session ───────────────────────────────────────────
-        updated_history = result.get("conversation_history", conversation_history)
-        title = session_row.get("title", "") if session_row else ""
-        if not title and updated_history:
-            # Auto-generate title from first user message
-            first_user = next(
-                (m["content"] for m in updated_history if m.get("role") == "user"), ""
-            )
-            title = first_user[:60] + ("…" if len(first_user) > 60 else "")
-
-        # Trigger Hermes memory summarisation when the session gets long
-        new_summary = session_summary
-        assistant_turns = sum(
-            1 for m in updated_history if m.get("role") == "assistant"
-        )
-        if assistant_turns >= SESSION_SUMMARY_THRESHOLD and chatbot.memory_model:
-            logging.info(
-                f"🧠 Session {session_id[:8]}… reached {assistant_turns} turns — "
-                "requesting Hermes memory summary"
-            )
-            new_summary = chatbot._summarize_session(updated_history, existing_summary=session_summary)
-
-        save_session(
-            session_id,
-            title,
-            updated_history,
-            chatbot.conv_state.to_dict(),
-            summary=new_summary,
-            created_at=session_row.get("created_at") if session_row else None,
-        )
+        result = chatbot.process_message(month, message, conversation_history)
 
         expenses_count = len(result.get('expenses') or []) if result.get('expenses') is not None else 0
-        logging.info(
-            f"💬 Chat [{session_id[:8]}…] processed: {message[:50]}… → {expenses_count} expenses returned"
-        )
-
-        # Inject session_id into the response so new clients can persist it
-        result["session_id"] = session_id
+        logging.info(f"💬 Chat [{session_id[:8]}…]: {message[:50]}… → {expenses_count} expenses returned")
 
         return JSONResponse(
-            content=result,
+            content={**result, "session_id": session_id},
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
+                "Pragma":        "no-cache",
+                "Expires":       "0",
             }
         )
 

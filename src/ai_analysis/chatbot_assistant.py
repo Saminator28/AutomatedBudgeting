@@ -9,27 +9,24 @@ This module provides an interactive chatbot that can:
 - Mark expenses as one-time purchases / add notes
 - Provide personalized financial insights via a dedicated finance model
 
-Architecture: Two-Model Pipeline
+Architecture: Three-Model Pipeline
   1. Intent Model  (primary_model  in llm_models.json) – parses the user's
      natural-language question into a structured JSON intent so Pandas can
      compute the exact answer (zero hallucination).
-  2. Finance Advisor (financial_analysis_model in llm_models.json) – receives
-     the verified pandas data and conversation history then produces a
-     thoughtful, conversational financial response including budget
-     suggestions, savings plans, and goal adjustments.
+  2. Finance Advisor (financial_analysis_model / memory_model in llm_models.json) –
+     receives the verified pandas data and the accumulated server-side conversation
+     history then produces a thoughtful, conversational response.
+  3. Memory Layer — the ChatbotAssistant instance is kept alive across HTTP
+     requests (via the session store in deps.py) so ConversationState and the
+     message list persist for the lifetime of a chat session.  When memory_model
+     is configured (e.g. 'hermes3') it is used for the conversational turn;
+     otherwise financial_analysis_model is used.
 
-Session Persistence:
-  Each conversation is stored in the `chat_sessions` DB table so the
-  ConversationState (active period, category, goals …) survives between HTTP
-  requests.  The module-level _SESSION_CACHE keeps live ChatbotAssistant
-  instances in memory so hot sessions don't pay a DB round-trip on every turn.
-  When the server restarts the session is reconstructed from the DB on first
-  access.
-
-  The optional `memory_model` (e.g. a Hermes model) in llm_models.json can
-  summarize older turns when a session grows beyond SESSION_SUMMARY_THRESHOLD
-  messages, keeping the finance advisor's context window healthy for very long
-  conversations.
+Anti-loop Measures
+  - think=False on every Ollama call to suppress extended reasoning blocks.
+  - stop sequences prevent the model from hallucinating turn prefixes.
+  - _is_looping() + _truncate_loop() post-process any responses that still
+    fall into a repetition pattern on slower hardware (Ryzen 5/7).
 """
 
 import os
@@ -378,6 +375,9 @@ class ChatbotAssistant:
         model_name: the finance-advisor model passed in from the UI / config.
         The intent-parsing model is loaded from config/llm_models.json
         (primary_model field) so the two models can differ.
+
+        _messages accumulates user/assistant turns across process_message() calls
+        when this instance is kept alive in the session store (deps.get_or_create_chat_session).
         """
         # Finance advisor model (conversational responses + budgeting advice)
         self.model_name = model_name
@@ -386,13 +386,17 @@ class ChatbotAssistant:
         # Per-conversation state (period, category, goals …)
         self.conv_state = ConversationState()
 
+        # Accumulated message history — grows across turns when the instance persists.
+        # Each entry: {"role": "user"|"assistant", "content": str}
+        self._messages: List[Dict] = []
+
         # Load secondary model names from config
         self._load_model_config()
 
         if self.ai_available:
             logger.info(
                 f"✨ ChatbotAssistant | intent={self.intent_model} | "
-                f"finance={self.finance_model}"
+                f"advisor={self.finance_model} | memory={self.memory_model or '(same as advisor)'}"
             )
         else:
             logger.info("📊 Initialized ChatbotAssistant in rule-based mode")
@@ -404,20 +408,20 @@ class ChatbotAssistant:
             if config_path.exists():
                 with open(config_path) as f:
                     cfg = json.load(f)
-                self.intent_model = cfg.get("primary_model", self.model_name)
+                self.intent_model  = cfg.get("primary_model", self.model_name)
                 # Finance model: prefer explicit key, fall back to what was passed in
                 self.finance_model = cfg.get("financial_analysis_model") or self.model_name
-                # Memory model (optional Hermes model for session summarisation)
-                self.memory_model: Optional[str] = cfg.get("memory_model") or None
+                # Memory model: drives multi-turn conversation; falls back to finance_model
+                self.memory_model  = cfg.get("memory_model") or ""
             else:
-                self.intent_model = self.model_name
+                self.intent_model  = self.model_name
                 self.finance_model = self.model_name
-                self.memory_model = None
+                self.memory_model  = ""
         except Exception as e:
             logger.warning(f"Could not load llm_models.json: {e}")
-            self.intent_model = self.model_name
+            self.intent_model  = self.model_name
             self.finance_model = self.model_name
-            self.memory_model = None
+            self.memory_model  = ""
     
     def process_message(
         self,
@@ -429,71 +433,82 @@ class ChatbotAssistant:
         """
         Process a user message and generate a response.
 
+        When this instance is kept alive in the session store, ``_messages``
+        accumulates across calls so the model sees genuine multi-turn context.
+
+        For backward-compatibility, ``conversation_history`` is still accepted
+        and used to seed ``_messages`` on the very first call to a new instance
+        (e.g. when a client does not yet send a session_id but already carries
+        history from a previous connection).
+        
         Args:
             month: Optional specific month filter (YYYY-MM), if None loads all months
             message: User's message
-            conversation_history: Previous conversation messages (from DB session or
-                legacy client-managed history)
-            session_summary: Optional Hermes-generated memory summary for long sessions.
-                When provided it is passed to the finance advisor so older turns are
-                not lost even when conversation_history is trimmed to the recent window.
-
+            conversation_history: Legacy client-side history; only used to seed
+                                  _messages if this instance has no history yet.
+            
         Returns:
-            Dict with response, actions_taken, updated_expenses, conversation_history.
+            Dict with response, actions_taken, updated_expenses, session_id hint, etc.
         """
         if conversation_history is None:
             conversation_history = []
 
+        # Seed _messages from legacy client history on the very first call only
+        if not self._messages and conversation_history:
+            self._messages = [
+                {"role": m["role"], "content": m["content"]}
+                for m in conversation_history
+                if m.get("role") in ("user", "assistant")
+            ]
+
+        # Append current user turn to the instance message store
+        self._messages.append({"role": "user", "content": message})
+
         # Load expense data - all months or specific month
         if month:
-            expenses_df = self._load_expenses(month)
+            expenses_df  = self._load_expenses(month)
             month_context = month
         else:
-            expenses_df = self._load_all_expenses()
+            expenses_df  = self._load_all_expenses()
             month_context = "all available months"
 
         if expenses_df is None or expenses_df.empty:
+            error_msg = (
+                "I don't have any expense data available yet. "
+                "Please process monthly statements first."
+            )
+            self._messages.append({"role": "assistant", "content": error_msg})
             return {
-                "response": "I don't have any expense data available yet. Please process monthly statements first.",
+                "response": error_msg,
                 "actions_taken": [],
-                "conversation_history": conversation_history + [
-                    {"role": "user", "content": message},
-                    {"role": "assistant", "content": "No expense data available"}
-                ]
+                "conversation_history": list(self._messages),
             }
 
         # Prepare expense summary for context
         expense_context = self._prepare_expense_context(expenses_df)
-
-        # Build the AI prompt with conversation history
+        
+        # Build the legacy system-prompt messages for the fallback path
         system_prompt = self._build_system_prompt(month_context, expense_context)
-
-        # Add conversation history to context
-        messages = [{"role": "system", "content": system_prompt}]
-        for msg in conversation_history[-6:]:  # Keep last 6 messages for context
-            messages.append(msg)
-        messages.append({"role": "user", "content": message})
-
+        legacy_messages = [{"role": "system", "content": system_prompt}]
+        for msg in self._messages[-6:]:
+            legacy_messages.append(msg)
+        
         # Get AI response
         if self.ai_available:
             try:
-                response_data = self._generate_ai_response(
-                    messages, expenses_df, month_context,
-                    session_summary=session_summary,
-                )
+                response_data = self._generate_ai_response(message, expenses_df, month_context)
             except Exception as e:
                 logger.error(f"❌ AI response generation failed: {e}")
                 response_data = self._generate_fallback_response(message, expenses_df, month_context)
         else:
             response_data = self._generate_fallback_response(message, expenses_df, month_context)
-
-        # Update conversation history
-        conversation_history.append({"role": "user", "content": message})
-        conversation_history.append({"role": "assistant", "content": response_data["response"]})
+        
+        # Append assistant response to instance history
+        self._messages.append({"role": "assistant", "content": response_data["response"]})
 
         return {
             **response_data,
-            "conversation_history": conversation_history
+            "conversation_history": list(self._messages),
         }
     
     def _load_expenses(self, month: str) -> Optional[pd.DataFrame]:
@@ -646,36 +661,69 @@ UPDATE format (when user says "mark this as one-time" or "add note"):
 
 For everything else, answer naturally with specific details from the data."""
     
+    # ── Anti-loop utilities ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_looping(text: str) -> bool:
+        """Return True if *text* shows a repetition loop.
+
+        A loop is defined as any sentence (> 20 chars) appearing 3 or more times.
+        This catches the common failure mode on mid-range hardware where the model
+        gets stuck repeating the same phrase endlessly.
+        """
+        if len(text) < 200:
+            return False
+        sentences = re.split(r'[.!?\n]', text)
+        seen: Dict[str, int] = {}
+        for s in sentences:
+            key = s.strip()[:60].lower()
+            if len(key) < 20:
+                continue
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] >= 3:
+                return True
+        return False
+
+    @staticmethod
+    def _truncate_loop(text: str) -> str:
+        """Truncate *text* at the point where repetition first starts."""
+        parts = re.split(r'([.!?\n])', text)
+        seen: Dict[str, int] = {}
+        result: list = []
+        i = 0
+        while i < len(parts):
+            chunk = parts[i] + (parts[i + 1] if i + 1 < len(parts) else '')
+            key   = chunk.strip()[:60].lower()
+            if len(key) >= 20:
+                seen[key] = seen.get(key, 0) + 1
+                if seen[key] >= 2:
+                    break
+            result.append(chunk)
+            i += 2
+        return ''.join(result).rstrip() or text[:500]
+
     def _generate_ai_response(
         self,
-        messages: List[Dict],
+        user_message: str,
         expenses_df: pd.DataFrame,
         month: str,
         session_summary: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Two-model pipeline:
-          1. Intent Model  → parse user message + conversation state → JSON intent
-          2. Pandas        → execute intent against real data (zero errors)
-          3. Finance Model → compose conversational answer with advice
+        Three-model pipeline:
+          1. Intent Model  → parse user message + accumulated conv_state → JSON intent
+          2. Pandas        → execute intent against real data (zero hallucination)
+          3. Memory/Finance Model → compose conversational answer using self._messages
 
-        session_summary: optional Hermes-generated condensed context for long sessions.
+        conv_state is maintained across calls by the persistent instance; no need
+        to rebuild it from history on each request.
         """
         try:
-            user_message = messages[-1]['content']
-            conversation_history = messages[:-1]  # everything except current message
-
-            # ── 0. conv_state is already populated when a persistent session is used.
-            #    For stateless callers (no session_id) we still rebuild it from the
-            #    regex fallback over prior turns as before.
-            if not self.conv_state.active_period and not self.conv_state.active_category:
-                for msg in conversation_history:
-                    if msg.get('role') == 'user':
-                        prior_intent = self._regex_intent_fallback(msg['content'])
-                        self.conv_state.update_from_intent(prior_intent)
+            # Prior turns (everything before the current user message)
+            prior_history = self._messages[:-1]
 
             # ── 1. Parse intent with the reasoning model ────────────────────
-            intent = self._parse_intent(user_message, conversation_history)
+            intent = self._parse_intent(user_message, prior_history)
             logger.info(f"🧠 Parsed intent: {intent}")
 
             # ── 2. Update running conversation state ────────────────────────
@@ -701,14 +749,12 @@ For everything else, answer naturally with specific details from the data."""
                     goal_purpose=intent.get("goal_purpose")
                 )
             elif intent_type == "goal_adjustment":
-                # User tweaked a target – recalculate with updated state
                 pandas_data = self._calculate_savings_plan(
                     all_expenses, all_income,
-                    goal_amount=None,  # use existing goals from state
+                    goal_amount=None,
                     goal_purpose=None
                 )
             else:
-                # Standard expense / income / general query
                 pandas_data = self._calculate_facts_with_pandas(
                     filtered_expenses, user_message, filtered_income
                 )
@@ -723,16 +769,14 @@ For everything else, answer naturally with specific details from the data."""
                 f.write(f"USER: {user_message}\n")
                 f.write(f"INTENT: {json.dumps(intent, indent=2)}\n")
                 f.write(f"CONV STATE: {self.conv_state.summary()}\n\n")
-                if session_summary:
-                    f.write(f"SESSION SUMMARY (Hermes):\n{session_summary}\n\n")
+                f.write(f"SESSION TURNS: {len(self._messages)}\n")
                 f.write("PANDAS DATA:\n")
                 f.write(pandas_data)
                 f.write(f"\n\nTransactions analyzed: {len(filtered_expenses)}\n")
 
-            # ── 6. Call finance advisor model ────────────────────────────────
+            # ── 6. Call memory/finance advisor model ─────────────────────────
             response_text = self._call_finance_advisor(
-                user_message, pandas_data, conversation_history, intent, month,
-                session_summary=session_summary,
+                user_message, pandas_data, intent, month
             )
 
             # Handle update requests (mark expense / add note)
@@ -744,12 +788,13 @@ For everything else, answer naturally with specific details from the data."""
                 except json.JSONDecodeError:
                     pass
 
+            active_model = self.memory_model or self.finance_model
             return {
-                "response": response_text.strip(),
-                "expenses": [],
+                "response":      response_text.strip(),
+                "expenses":      [],
                 "actions_taken": [],
-                "ai_generated": True,
-                "model_name": self.finance_model
+                "ai_generated":  True,
+                "model_name":    active_model,
             }
 
         except Exception as e:
@@ -865,7 +910,11 @@ Rules:
                     'messages': [{"role": "user", "content": prompt}],
                     'stream': False,
                     'think': False,
-                    'options': {"temperature": 0.0, "num_predict": 400},
+                    'options': {
+                        "temperature": 0.0,
+                        "num_predict": 400,
+                        "stop": ["\n\n", "```", "<|end|>", "<|im_end|>"],
+                    },
                 },
                 timeout=60,
             )
@@ -1343,25 +1392,29 @@ Rules:
         self,
         user_message: str,
         pandas_data: str,
-        conversation_history: List[Dict],
         intent: Dict,
         month: str,
         session_summary: Optional[str] = None,
     ) -> str:
         """
-        Call the finance advisor model with verified pandas data and the full
-        conversation history so it can give contextually accurate advice.
+        Call the memory/finance advisor model with verified pandas data and the
+        full accumulated server-side conversation history (self._messages).
 
-        session_summary: Hermes-generated condensed context for long sessions.
-        When provided it is prepended to the system prompt so older turns are
-        not lost even when conversation_history is trimmed to the recent window.
+        Uses memory_model when configured so that multi-turn context is maintained
+        natively inside the model's context window.  Falls back to finance_model.
+
+        Anti-loop measures:
+          - think=False suppresses extended reasoning blocks
+          - stop sequences prevent turn-prefix hallucination
+          - num_predict capped at 800 (suitable for Ryzen 5/7)
+          - _is_looping / _truncate_loop post-process any repeated output
         """
+        active_model = self.memory_model or self.finance_model
+
+        # Build session summary section if available
         summary_section = ""
         if session_summary:
-            summary_section = (
-                f"\n**Session Memory (condensed history from memory model):**\n"
-                f"{session_summary}\n"
-            )
+            summary_section = f"\n**Session Summary:**\n{session_summary}\n"
 
         system_prompt = f"""You are a concise, professional personal finance advisor.
 
@@ -1376,22 +1429,21 @@ Here is the VERIFIED financial data (calculated by Python pandas — 100% accura
 {summary_section}
 **Communication Style:**
 - Be direct and professional — lead with the answer, not the explanation
-- Keep responses short unless deep analysis is explicitly requested
-- Do NOT narrate calculations step by step (e.g. avoid "To calculate X, we divide Y by Z")
-- Do NOT restate the question or add filler phrases like "So, on average..." or "Great question!"
-- If advice is warranted, give one or two concise, actionable points — not a lecture
+- Keep responses SHORT (2–4 sentences for simple questions)
+- Do NOT narrate calculations step by step
+- Do NOT restate the question or use filler phrases like "Great question!"
+- Stop after giving the answer — do not loop or repeat
 
 **Your Role:**
 - Answer using ONLY the data shown above — never invent numbers
 - DO NOT multiply totals — they are already complete sums for the stated period
-- For budget suggestions: compare against standard benchmarks (50/30/20 rule), flag what's off, give a specific target amount
-- For fixed costs (rent, insurance, loans): only flag if genuinely extreme
-- For discretionary spending: be direct if over benchmark — state the number and suggest a target
+- For budget suggestions: compare against 50/30/20 rule, flag what's off, give a target
+- For discretionary spending: be direct if over benchmark — state the number and a target
 - For savings/investment: flag clearly if under 20% of income
 - For savings goals: give a clear timeline and one concrete suggestion
 - If the user sets a goal or adjusts a budget, confirm and recalculate concisely
 
-**For UPDATE requests only** (mark as one-time / add note), respond in JSON:
+**For UPDATE requests only**, respond in JSON:
 ```json
 {{
   "action": "update_expense",
@@ -1400,32 +1452,43 @@ Here is the VERIFIED financial data (calculated by Python pandas — 100% accura
   "message": "Confirmation message"
 }}
 ```
-For all other requests, answer in plain conversational text."""
+For all other requests, answer in plain conversational text. Stop once the answer is complete."""
 
-        # Build message list with full conversation history
+        # Build message list from instance history (includes current user message at end)
         messages = [{"role": "system", "content": system_prompt}]
-        for msg in conversation_history[-8:]:   # last 8 messages for context
-            if msg.get("role") in ("user", "assistant"):
-                messages.append({"role": msg["role"], "content": msg["content"]})
-        messages.append({"role": "user", "content": user_message})
+        for msg in self._messages[-10:]:    # cap at 10 messages = 5 turns of context
+            messages.append({"role": msg["role"], "content": msg["content"]})
 
         try:
             _resp = requests.post(
                 f'{_OLLAMA_HOST}/api/chat',
                 json={
-                    'model': self.finance_model,
+                    'model':    active_model,
                     'messages': messages,
-                    'stream': False,
-                    'think': False,
-                    'options': {"temperature": 0.7, "num_predict": 1200},
+                    'stream':   False,
+                    'think':    False,
+                    'options':  {
+                        "temperature": 0.7,
+                        "num_predict": 800,     # conservative for Ryzen 5/7
+                        "stop": [               # prevent turn-prefix hallucination
+                            "\nUser:", "\nHuman:", "User:", "Human:",
+                            "<|end|>", "<|im_end|>",
+                        ],
+                    },
                 },
                 timeout=120,
             )
             _resp.raise_for_status()
             raw = (_resp.json().get('message', {}).get('content') or '').strip()
-            # Strip any residual thinking tags
+            # Strip residual thinking tags (some models emit them despite think=False)
             raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-            logger.info(f"💬 Finance Advisor: {raw[:200]}…")
+
+            # Anti-loop: truncate if the model is repeating itself
+            if self._is_looping(raw):
+                logger.warning("⚠️ Finance advisor response loop detected — truncating")
+                raw = self._truncate_loop(raw)
+
+            logger.info(f"💬 Finance Advisor [{active_model}]: {raw[:200]}…")
             return raw
         except Exception as e:
             logger.error(f"Finance advisor model failed: {e}")

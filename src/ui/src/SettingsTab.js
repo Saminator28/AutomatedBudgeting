@@ -326,7 +326,7 @@ function AutoFilterPanel() {
                           )}
                         </td>
                         <td style={{ padding: '9px 12px', whiteSpace: 'nowrap', color: '#475569' }}>
-                          {r.amount != null ? `$${Number(r.amount).toFixed(2)}` : '—'}
+                          {r.amount !== null ? `$${Number(r.amount).toFixed(2)}` : '—'}
                         </td>
                         <td
                           style={{ padding: '9px 12px', whiteSpace: 'nowrap', color: '#64748b' }}

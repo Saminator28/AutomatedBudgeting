@@ -19,6 +19,7 @@ import re
 import logging
 import json as _json
 import threading
+import time as _time
 import os
 from pathlib import Path
 
@@ -52,6 +53,52 @@ _WRITE_API_KEY   = os.environ.get("AUTOBUDGET_API_KEY", "").strip()
 # ── Background job store ──────────────────────────────────────────────────────
 _jobs: dict      = {}   # job_id → {status, output, errors, started_at}
 _jobs_lock       = threading.Lock()
+
+# ── Chat session store ────────────────────────────────────────────────────────
+# Keeps ChatbotAssistant instances alive across HTTP requests so conv_state and
+# the accumulated message list persist for the lifetime of a conversation.
+_chat_sessions: dict = {}   # session_id → {assistant, model_name, last_active}
+_chat_sessions_lock  = threading.Lock()
+_CHAT_SESSION_TTL    = 7200  # seconds — idle sessions are pruned after 2 hours
+
+
+def get_or_create_chat_session(session_id: str, model_name: str):
+    """Return the cached ChatbotAssistant for *session_id*, creating one if needed.
+
+    Also prunes any sessions that have been idle longer than _CHAT_SESSION_TTL.
+    Thread-safe; callers must not hold _chat_sessions_lock before calling this.
+    """
+    from src.ai_analysis.chatbot_assistant import ChatbotAssistant  # local — avoids circular import
+    now = _time.monotonic()
+    with _chat_sessions_lock:
+        # Prune stale sessions so memory doesn't grow unbounded on a long-running server
+        stale = [
+            sid for sid, entry in _chat_sessions.items()
+            if now - entry['last_active'] > _CHAT_SESSION_TTL
+        ]
+        for sid in stale:
+            del _chat_sessions[sid]
+            logging.info(f'💬 Chat session pruned (idle): {sid}')
+
+        entry = _chat_sessions.get(session_id)
+        if entry is not None:
+            # If the model was changed in Settings, start a fresh assistant for the session
+            if entry['model_name'] != model_name:
+                entry['assistant']  = ChatbotAssistant(model_name=model_name)
+                entry['model_name'] = model_name
+                logging.info(f'💬 Chat session model updated: {session_id} → {model_name}')
+            entry['last_active'] = now
+            return entry['assistant']
+
+        assistant = ChatbotAssistant(model_name=model_name)
+        _chat_sessions[session_id] = {
+            'assistant':   assistant,
+            'model_name':  model_name,
+            'last_active': now,
+        }
+        logging.info(f'💬 New chat session created: {session_id} (model={model_name})')
+        return assistant
+
 
 # ── Keyword lists (mutated in-place so direct imports stay current) ───────────
 _INVESTMENT_PLATFORM_KEYWORDS: list = []

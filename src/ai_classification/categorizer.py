@@ -297,109 +297,106 @@ Your answer:"""
             print(f"  [LLM] Error calling {model} for {merchant}: {type(e).__name__}: {str(e)}")
         
         return None
-    
-    def categorize_batch_with_session(
+
+    def _categorize_batch_with_llm(
         self,
-        merchants_amounts: List[Tuple[str, Optional[float]]],
+        merchants_amounts: List[tuple],
+        batch_size: int = 8,
     ) -> Dict[str, Optional[str]]:
         """
-        Categorize a batch of merchants in a **single persistent Ollama chat
-        session** so the model retains context across the entire batch.
-
-        Benefits over calling `_categorize_with_llm` once per merchant:
-        - The model sees what it already assigned earlier in the batch and can
-          apply consistent heuristics (e.g. all coffee-shop names → "Dining").
-        - Eliminates repeated context-loading overhead for large batches.
-        - Reduces ambiguity for similar merchants that appear close together.
+        Send *batch_size* merchants to the LLM in a single call instead of one
+        call per transaction.  On Ryzen 5/7 hardware a batch of 8 completes in
+        roughly the same wall-clock time as 1–2 individual calls.
 
         Args:
-            merchants_amounts: list of (merchant_name, amount_or_None) tuples.
+            merchants_amounts: list of (merchant_name, amount_or_None) tuples
+            batch_size: max items per LLM call (keep ≤ 10 for slower hardware)
 
         Returns:
-            dict mapping merchant_name → category string (or None on failure).
-            For duplicate merchant names the last result is used.
+            dict mapping merchant_name → category (or None on failure)
         """
         if not self.llm_available or not merchants_amounts:
             return {}
 
         leaf_cats = [cat for cat in self.categories.keys() if cat not in self.subcategories]
-        categories_numbered = "\n".join(f"{i+1}. {cat}" for i, cat in enumerate(leaf_cats))
+        categories_list = "\n".join(f"- {cat}" for cat in leaf_cats)
 
-        # Disambiguation hints (same as _get_category_from_model)
-        dynamic_hints = []
-        for parent, subs in self.subcategories.items():
-            subs_str = ', '.join(f'"{s}"' for s in subs)
-            dynamic_hints.append(
-                f'- For anything that is "{parent}", choose one of its subcategories: {subs_str}.'
-            )
-        subcategory_hints = "\n".join(dynamic_hints)
-
-        system_message = (
-            "You are a transaction categorizer.  I will send you merchant names one at a time.  "
-            "For each one reply with ONLY the category name from the list below — nothing else.\n\n"
-            f"VALID CATEGORIES:\n{categories_numbered}\n\n"
-            "DISAMBIGUATION HINTS:\n"
-            '- "Alcohol/Bar": breweries, bars, pubs, liquor stores.\n'
-            '- "Dining": restaurants, cafes, fast food, coffee shops.\n'
-            '- "Groceries": grocery stores, supermarkets, warehouse clubs.\n'
-            '- "Subscriptions": streaming services, software subscriptions.\n'
-            '- "Shopping": general retail when nothing more specific fits.\n'
-            f"{subcategory_hints}\n\n"
-            "Remember every transaction from this batch so you apply consistent rules across similar merchants."
-        )
-
-        messages: List[Dict] = [{"role": "system", "content": system_message}]
         results: Dict[str, Optional[str]] = {}
-        valid_lower = {cat.lower(): cat for cat in leaf_cats}
 
-        for merchant, amount in merchants_amounts:
-            amount_ctx = f" (${amount:.2f})" if amount is not None else ""
-            user_text = f"{merchant}{amount_ctx}"
-            messages.append({"role": "user", "content": user_text})
+        # Process in chunks of batch_size
+        for chunk_start in range(0, len(merchants_amounts), batch_size):
+            chunk = merchants_amounts[chunk_start: chunk_start + batch_size]
+
+            # Build numbered merchant list
+            merchant_lines = "\n".join(
+                f"{i + 1}. {merchant}"
+                + (f" (${amount:.2f})" if amount else "")
+                for i, (merchant, amount) in enumerate(chunk)
+            )
+
+            prompt = f"""Categorize each merchant into exactly one category from the list.
+Reply with ONLY numbered lines: "N. CategoryName"
+No explanations. No extra text. One line per merchant.
+
+VALID CATEGORIES:
+{categories_list}
+
+MERCHANTS:
+{merchant_lines}
+
+Your response:"""
 
             try:
                 resp = requests.post(
                     f'{self.llm_host}/api/chat',
                     json={
-                        "model":   self.llm_model,
-                        "messages": messages,
-                        "stream":  False,
-                        "think":   False,
-                        "options": {"temperature": 0.1, "num_predict": 64},
+                        'model':    self.llm_model,
+                        'messages': [{'role': 'user', 'content': prompt}],
+                        'stream':   False,
+                        'think':    False,
+                        'options':  {
+                            'temperature': 0.0,
+                            'num_predict': 256,
+                            'stop':        ['<|end|>', '<|im_end|>', '\n\n\n'],
+                        },
                     },
-                    timeout=60,
+                    timeout=120,
                 )
                 resp.raise_for_status()
-                raw = (resp.json().get("message", {}).get("content") or "").strip()
-                # Keep first line only
-                raw = raw.split("\n")[0].strip().strip('"').strip("'")
+                msg     = resp.json().get('message', {})
+                content = (msg.get('content') or '').strip()
+                # Strip any residual thinking tags
+                content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
 
-                # Validate against leaf categories
-                category: Optional[str] = None
-                if raw in leaf_cats:
-                    category = raw
-                elif raw.lower() in valid_lower:
-                    category = valid_lower[raw.lower()]
-                else:
-                    # Partial match
-                    for v in leaf_cats:
-                        if raw.lower() in v.lower() or v.lower() in raw.lower():
-                            category = v
-                            break
-
-                results[merchant] = category
-                # Feed the model's answer back so subsequent turns see it
-                messages.append({"role": "assistant", "content": category or raw})
+                # Parse "N. CategoryName" lines
+                for line in content.split('\n'):
+                    line = line.strip()
+                    m = re.match(r'^(\d+)[.)]\s*(.+)$', line)
+                    if not m:
+                        continue
+                    idx = int(m.group(1)) - 1
+                    if idx < 0 or idx >= len(chunk):
+                        continue
+                    merchant, _ = chunk[idx]
+                    cat_raw     = m.group(2).strip().strip('"').strip("'")
+                    # Validate against leaf categories (case-insensitive)
+                    matched = next(
+                        (c for c in leaf_cats if c.lower() == cat_raw.lower()),
+                        None
+                    )
+                    # Partial match fallback
+                    if not matched:
+                        matched = next(
+                            (c for c in leaf_cats
+                             if cat_raw.lower() in c.lower() or c.lower() in cat_raw.lower()),
+                            None
+                        )
+                    if matched:
+                        results[merchant] = matched
 
             except Exception as exc:
-                print(f"  [Batch LLM] Error for '{merchant}': {exc}")
-                results[merchant] = None
-                # Keep messages consistent: add a placeholder so the session stays coherent
-                messages.append({"role": "assistant", "content": "Other"})
+                print(f"  [LLM batch] chunk starting at {chunk_start} failed: {exc}")
 
-        categorized = sum(1 for v in results.values() if v)
-        print(f"  [Batch LLM] Session complete: {categorized}/{len(merchants_amounts)} categorized "
-              f"({len(messages) - 1} turns in session)")
         return results
 
     def categorize_transaction(
@@ -444,7 +441,7 @@ Your answer:"""
                 return llm_category
         
         return 'Uncategorized'
-    
+
     def categorize_dataframe(
         self,
         df: pd.DataFrame,
@@ -453,7 +450,12 @@ Your answer:"""
     ) -> pd.DataFrame:
         """
         Add category column to a DataFrame of transactions.
-        
+
+        Applies merchant-history and keyword rules first (no LLM cost), then
+        batches any remaining uncategorized rows through the LLM in groups of 8
+        instead of one call per transaction.  Individual LLM fallback is used
+        for any row the batch call cannot resolve.
+
         Args:
             df: DataFrame with transactions
             description_column: Name of column containing merchant names
@@ -464,19 +466,59 @@ Your answer:"""
         """
         if description_column not in df.columns:
             raise ValueError(f"Column '{description_column}' not found in DataFrame")
-        
-        # Categorize with or without amount column
-        if amount_column in df.columns:
-            df['category'] = df.apply(
-                lambda row: self.categorize_transaction(
-                    row[description_column], 
-                    row[amount_column]
-                ), 
-                axis=1
-            )
-        else:
-            df['category'] = df[description_column].apply(self.categorize_transaction)
-        
+
+        has_amount = amount_column in df.columns
+        df = df.copy()
+
+        # ── Pass 1: merchant-history + keyword matching (no LLM) ─────────────
+        def _non_llm(row):
+            merchant = row[description_column]
+            merchant_lower = str(merchant).lower()
+            # Merchant history
+            if self.merchant_history:
+                hist_cat = self.merchant_history.get_category(merchant)
+                if hist_cat and hist_cat not in self.subcategories:
+                    return hist_cat
+            # Keyword patterns
+            for category, patterns in self.categories.items():
+                for pattern in patterns:
+                    if pattern.lower() in merchant_lower:
+                        return category
+            return None  # needs LLM
+
+        df['category'] = df.apply(_non_llm, axis=1)
+
+        # ── Pass 2: batch LLM for uncategorized rows ──────────────────────────
+        if self.llm_available:
+            needs_llm = df['category'].isna()
+            if needs_llm.any():
+                uncategorized_idx = df.index[needs_llm].tolist()
+                merchants_amounts = [
+                    (
+                        df.at[idx, description_column],
+                        float(df.at[idx, amount_column]) if has_amount else None,
+                    )
+                    for idx in uncategorized_idx
+                ]
+                batch_results = self._categorize_batch_with_llm(merchants_amounts)
+
+                still_missing = []
+                for idx in uncategorized_idx:
+                    merchant = df.at[idx, description_column]
+                    if merchant in batch_results and batch_results[merchant]:
+                        df.at[idx, 'category'] = batch_results[merchant]
+                    else:
+                        still_missing.append(idx)
+
+                # ── Pass 3: individual fallback for any batch misses ──────────
+                for idx in still_missing:
+                    merchant = df.at[idx, description_column]
+                    amount   = float(df.at[idx, amount_column]) if has_amount else None
+                    cat      = self._categorize_with_llm(merchant, amount)
+                    if cat:
+                        df.at[idx, 'category'] = cat
+
+        df['category'] = df['category'].fillna('Uncategorized')
         return df
     
     def add_custom_category(

@@ -197,6 +197,10 @@ def validate_and_correct_category(category: str, valid_categories: list, use_llm
     if category.lower() == 'uncategorized':
         return "Uncategorized", True
 
+    # Pass through internal parser-tagged reimbursement marker unchanged
+    if category == 'Return/Reimbursement':
+        return "Return/Reimbursement", True
+
     # Exact match (case-insensitive)
     for valid_cat in valid_categories:
         if category.lower() == valid_cat.lower():

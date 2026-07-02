@@ -577,3 +577,105 @@ def clean_merchant_with_ensemble(
         result_primary, result_secondary, merchant, primary_model, debug=debug
     )
     return best.split('|')[0].strip() if best else merchant
+
+
+def clean_merchant_batch(
+    merchants:   list,
+    model:       str,
+    batch_size:  int  = 6,
+    debug:       bool = False,
+) -> dict:
+    """
+    Clean a list of raw merchant/transaction strings in batches of *batch_size*
+    instead of one HTTP call per merchant.  On Ryzen 5/7 hardware a batch of 6
+    completes in roughly the same wall-clock time as 1–2 individual calls.
+
+    Returns a dict mapping each raw merchant string to its cleaned name (just the
+    name, no confidence/reasoning suffix).  Merchants that the batch call cannot
+    resolve fall back to ``clean_merchant_name_llm`` individually.
+
+    Args:
+        merchants:  list of raw transaction description strings
+        model:      Ollama model name (primary_model)
+        batch_size: items per LLM call; keep ≤ 8 for slower hardware
+        debug:      print verbose output for troubleshooting
+
+    Returns:
+        dict of {raw_merchant: clean_name}
+    """
+    if not merchants:
+        return {}
+
+    results: dict = {}
+
+    for chunk_start in range(0, len(merchants), batch_size):
+        chunk = merchants[chunk_start: chunk_start + batch_size]
+
+        merchant_lines = "\n".join(
+            f"Transaction {i + 1}: {raw}" for i, raw in enumerate(chunk)
+        )
+
+        prompt = f"""Clean each transaction description below into a merchant name.
+For each, reply on one line: "N. CleanName | Confidence | Reasoning"
+Confidence is 1-100. Reasoning is under 15 words.
+No extra text — one line per transaction.
+
+Rules:
+- Remove dates, locations, store numbers, payment processor prefixes (SQ*, TST*, WL*)
+- Fix capitalization and expand common abbreviations (WM → Walmart, etc.)
+- ALWAYS give a name — never leave a line blank.
+
+{merchant_lines}
+
+Your response:"""
+
+        try:
+            response = _ollama_chat(
+                model=model,
+                messages=[{'role': 'user', 'content': prompt}],
+                options={
+                    'temperature': 0.0,
+                    'num_predict': 512,
+                    'stop':        ['<|end|>', '<|im_end|>'],
+                },
+                think=False,
+                timeout=120,
+            )
+            content, thinking = _extract_content(response)
+
+            if not content and thinking:
+                content = _extract_from_thinking(thinking, debug=debug)
+
+            if debug:
+                print(f"  [batch] raw response for chunk {chunk_start}: {content[:300]}")
+
+            for line in (content or '').split('\n'):
+                line = line.strip()
+                # Match "N. Name | conf | reason" or "N) Name | conf | reason"
+                m = re.match(r'^(\d+)[.)]\s*(.+)$', line)
+                if not m:
+                    continue
+                idx = int(m.group(1)) - 1
+                if idx < 0 or idx >= len(chunk):
+                    continue
+                raw_merchant = chunk[idx]
+                parsed = _parse_answer(m.group(2).strip(), debug=debug)
+                if parsed:
+                    results[raw_merchant] = parsed.split('|')[0].strip()
+
+        except Exception as exc:
+            if debug:
+                print(f"  [batch] chunk {chunk_start} failed: {exc}")
+
+    # Fall back to individual calls for anything the batch missed
+    for raw in merchants:
+        if raw not in results:
+            if debug:
+                print(f"  [batch fallback] individual call for: {raw[:60]}")
+            single = clean_merchant_name_llm(raw, model, debug=debug)
+            if single:
+                results[raw] = single.split('|')[0].strip()
+            else:
+                results[raw] = raw  # last resort: keep original
+
+    return results

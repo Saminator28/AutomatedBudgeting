@@ -53,13 +53,14 @@ else
         PRIMARY_MODEL=$(python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('primary_model',''))" 2>/dev/null || true)
         SECONDARY_MODEL=$(python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('secondary_model',''))" 2>/dev/null || true)
         FINANCIAL_MODEL=$(python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('financial_analysis_model',''))" 2>/dev/null || true)
+        MEMORY_MODEL=$(python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('memory_model',''))" 2>/dev/null || true)
     fi
 
     # Check each configured model
     echo "🔍 Checking for configured models..."
     TAGS=$(curl -s "${OLLAMA_URL}/api/tags")
 
-    for MODEL_ENTRY in "${PRIMARY_MODEL}||primary" "${SECONDARY_MODEL}||secondary (ensemble)" "${FINANCIAL_MODEL}||financial analysis"; do
+    for MODEL_ENTRY in "${PRIMARY_MODEL}||primary" "${SECONDARY_MODEL}||secondary (ensemble)" "${FINANCIAL_MODEL}||financial analysis" "${MEMORY_MODEL}||memory (multi-turn chat)"; do
         MODEL="${MODEL_ENTRY%%||*}"
         ROLE="${MODEL_ENTRY##*||}"
         [ -z "$MODEL" ] && continue
