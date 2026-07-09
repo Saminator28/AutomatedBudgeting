@@ -55,9 +55,13 @@ else
         FINANCIAL_MODEL=$(python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('financial_analysis_model',''))" 2>/dev/null || true)
     fi
 
-    # Check each configured model
+    # Check each configured model.  We deliberately do NOT auto-pull — model
+    # installs are large and slow.  Print a clear, actionable message for any
+    # missing model and let the app start regardless; AI features that depend
+    # on the missing model will report the same instruction at call time.
     echo "🔍 Checking for configured models..."
     TAGS=$(curl -s "${OLLAMA_URL}/api/tags")
+    MISSING_MODELS=()
 
     for MODEL_ENTRY in "${PRIMARY_MODEL}||primary" "${SECONDARY_MODEL}||secondary (ensemble)" "${FINANCIAL_MODEL}||financial analysis"; do
         MODEL="${MODEL_ENTRY%%||*}"
@@ -66,19 +70,25 @@ else
         if echo "$TAGS" | grep -F -q "\"${MODEL}\"" || echo "$TAGS" | grep -F -q "\"${MODEL}:"; then
             echo "✅ Model found: ${MODEL} (${ROLE})"
         else
-            echo "📥 Model not found: ${MODEL} (${ROLE}) — pulling now..."
-            echo "   This may take several minutes for large models."
-            LAST_PULL_LINE=$(curl -s -X POST "${OLLAMA_URL}/api/pull" \
-                -H "Content-Type: application/json" \
-                -d "{\"name\": \"${MODEL}\"}" | tail -1)
-            if echo "$LAST_PULL_LINE" | grep -q '"success"'; then
-                echo "✅ Successfully pulled: ${MODEL}"
-            else
-                echo "⚠️  Pull may have failed for ${MODEL}"
-                echo "   If AI features are missing, pull manually on host: ollama pull ${MODEL}"
-            fi
+            echo "❌ Model NOT installed: ${MODEL} (${ROLE})"
+            MISSING_MODELS+=("${MODEL}")
         fi
     done
+
+    if [ ${#MISSING_MODELS[@]} -gt 0 ]; then
+        echo ""
+        echo "⚠️  One or more configured models are missing.  Install them on the host"
+        echo "    machine (where Ollama is running) with:"
+        echo ""
+        for M in "${MISSING_MODELS[@]}"; do
+            echo "        ollama pull ${M}"
+        done
+        echo ""
+        echo "    Then restart the app:  make down && make up"
+        echo "    (The app will start now; AI features depending on missing models"
+        echo "     will remain disabled until the pulls above are complete.)"
+        echo ""
+    fi
 
     if [ -z "$PRIMARY_MODEL" ]; then
         echo "⚠️  Could not read model config from ${CONFIG_FILE}"

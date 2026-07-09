@@ -197,6 +197,10 @@ def validate_and_correct_category(category: str, valid_categories: list, use_llm
     if category.lower() == 'uncategorized':
         return "Uncategorized", True
 
+    # Pass through internal parser-tagged reimbursement marker unchanged
+    if category == 'Return/Reimbursement':
+        return "Return/Reimbursement", True
+
     # Exact match (case-insensitive)
     for valid_cat in valid_categories:
         if category.lower() == valid_cat.lower():
@@ -288,6 +292,7 @@ Best match:"""
                 'messages': [{'role': 'user', 'content': prompt}],
                 'stream': False,
                 'think': False,
+                'keep_alive': '1h',
                 'options': {'temperature': 0.1, 'num_predict': 30},
             },
             timeout=30,
@@ -323,6 +328,15 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
     print(f"\n{'='*70}")
     print(f"Processing Month: {month_name}")
     print(f"{'='*70}")
+
+    # Clear the parser's per-run cleaning cache + priming pool.  Cross-month
+    # merchant memory is `raw_to_clean_cache` / MerchantHistory's job; the
+    # per-run cache must start empty so month N's decisions don't leak into
+    # month N+1 (a merchant name may legitimately re-target a different chain).
+    try:
+        parser.reset_run_cache()
+    except AttributeError:
+        pass  # older parser instance without run cache — safe no-op
 
     # All outputs (CSVs) go alongside PDFs in the same statements directory
     csv_dir = month_dir
@@ -1261,6 +1275,13 @@ def process_month(month_dir: Path, parser: StatementParser, use_llm: bool = Fals
             merchant_column='Place',
             month=month_dir.name
         )
+
+        # Per-run cache observability — categorizer prints its own line inside
+        # categorize_dataframe.  Print the parser's line here so both are together.
+        try:
+            print(f"  {parser.run_cache_stats_line()}")
+        except AttributeError:
+            pass  # older parser instance — safe no-op
 
         # Save combined results
         print(f"\n{'='*70}")

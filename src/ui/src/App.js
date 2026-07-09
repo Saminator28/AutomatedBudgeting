@@ -134,7 +134,7 @@ function App() {
             const cleaned = Object.fromEntries(
               Object.entries(filtered).filter(([cat]) => {
                 if (!parentCats.has(cat)) return true;
-                const hasChildGoals = (subs[cat] || []).some(c => filtered[c] != null && filtered[c] > 0);
+                const hasChildGoals = (subs[cat] || []).some(c => filtered[c] !== null && filtered[c] > 0);
                 return !hasChildGoals; // drop parent when children have goals
               })
             );

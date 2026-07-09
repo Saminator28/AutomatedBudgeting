@@ -59,6 +59,9 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
   const [chatAvailable, setChatAvailable] = useState(false);
+  const [chatSessionId, setChatSessionId] = useState(null);
+  const [chatSessions, setChatSessions] = useState([]);
+  const [showChatHistory, setShowChatHistory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [availableMonths, setAvailableMonths] = useState([]);
@@ -158,6 +161,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
       setTempMonth(selectedMonth);
       loadData(selectedMonth);
       setChatMessages([]); // Clear chat history when month changes
+      setChatSessionId(null); // Start a fresh server-side session for the new month
     } else {
       // Default to previous complete month
       const monthStr = getPrevMonth();
@@ -165,6 +169,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
       setTempMonth(monthStr);
       loadData(monthStr);
       setChatMessages([]); // Clear chat history on initial load
+      setChatSessionId(null);
     }
     
     // Check if chat is available
@@ -173,6 +178,9 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
         const response = await fetch('http://localhost:8000/api/chat/available');
         const data = await response.json();
         setChatAvailable(data.available);
+        // Warm the sessions list so the History dropdown is populated
+        // the first time the user opens the chat tab.
+        if (data.available) loadChatSessions();
       } catch (error) {
         console.error('Failed to check chat availability:', error);
         setChatAvailable(false);
@@ -467,6 +475,75 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
     }
   };
 
+  // ── Chat session management ─────────────────────────────────────────────
+  // Server-side persistence already exists (chat_sessions table + save_session
+  // hook on every POST /api/chat).  These helpers surface the list/load/delete
+  // APIs so the user can resume any past conversation.
+
+  const loadChatSessions = async () => {
+    try {
+      const res  = await fetch('http://localhost:8000/api/chat/sessions');
+      const data = await res.json();
+      setChatSessions(Array.isArray(data.sessions) ? data.sessions : []);
+    } catch (err) {
+      console.error('Failed to load chat sessions:', err);
+      setChatSessions([]);
+    }
+  };
+
+  const resumeChatSession = async (sid) => {
+    try {
+      const res = await fetch(`http://localhost:8000/api/chat/sessions/${sid}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setChatMessages(Array.isArray(data.messages) ? data.messages : []);
+      setChatSessionId(sid);
+      setShowChatHistory(false);
+    } catch (err) {
+      console.error('Failed to resume chat session:', err);
+    }
+  };
+
+  const startNewChat = () => {
+    setChatMessages([]);
+    setChatSessionId(null);
+    setShowChatHistory(false);
+  };
+
+  const deleteChatSessionById = async (sid) => {
+    // Chat history can contain financial context (goals, budget commitments,
+    // corrections).  Deletion is irreversible, so confirm before proceeding.
+    if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
+    try {
+      const res = await fetch(`http://localhost:8000/api/chat/sessions/${sid}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // If we deleted the active session, reset the chat view.
+      if (sid === chatSessionId) {
+        setChatMessages([]);
+        setChatSessionId(null);
+      }
+      await loadChatSessions();
+    } catch (err) {
+      console.error('Failed to delete chat session:', err);
+    }
+  };
+
+  const formatChatTimestamp = (iso) => {
+    if (!iso) return '';
+    // Backend stores UTC via datetime.utcnow().isoformat() — append 'Z' so
+    // the browser interprets it as UTC and renders it in the user's locale.
+    const isoZ = iso.endsWith('Z') ? iso : `${iso}Z`;
+    const d    = new Date(isoZ);
+    if (Number.isNaN(d.getTime())) return iso;
+    const now  = new Date();
+    const diff = (now - d) / 1000; // seconds
+    if (diff < 60)      return 'just now';
+    if (diff < 3600)    return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400)   return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 604800)  return `${Math.floor(diff / 86400)}d ago`;
+    return d.toLocaleDateString();
+  };
+
   const sendChatMessage = async () => {
     if (!chatInput.trim()) return;
     
@@ -488,17 +565,28 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
         cache: 'no-store',
         body: JSON.stringify({
           message: userMessage,
-          conversation_history: chatMessages
+          conversation_history: chatMessages,
+          session_id: chatSessionId || undefined,
         })
       });
       
       const data = await response.json();
+
+      // Persist the server-side session ID so subsequent turns reuse the same
+      // ChatbotAssistant instance (and its accumulated ConversationState).
+      if (data.session_id) {
+        setChatSessionId(data.session_id);
+      }
       
       // Add assistant response to chat
       setChatMessages(data.conversation_history || [
         ...updatedMessages,
         { role: 'assistant', content: data.response, expenses: data.expenses, actions_taken: data.actions_taken }
       ]);
+
+      // Refresh the sessions list so the current chat surfaces with its
+      // updated title, timestamp, and message count.  Fire-and-forget.
+      loadChatSessions();
     } catch (error) {
       console.error('Chat error:', error);
       setChatMessages([
@@ -851,14 +939,14 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                       const _rowSubSum = _rowSubs.reduce((s, sub) => s + (goals[sub] || 0), 0);
                       const _rowDirect = goals[group.category] ?? null;
                       const goalAmt = _rowSubSum > 0 ? _rowSubSum : _rowDirect;
-                      const localVariance = goalAmt != null ? group.amount - goalAmt : null;
-                      const isOver = localVariance != null && localVariance > 0;
+                      const localVariance = goalAmt !== null ? group.amount - goalAmt : null;
+                      const isOver = localVariance !== null && localVariance > 0;
                       const ofTotal = totalExpenses > 0 ? (group.amount / totalExpenses * 100) : 0;
                       const barPct = goalAmt > 0 ? Math.min((group.amount / goalAmt) * 100, 100) : 0;
                       // Show sub-rows for children that have a user-set goal or actual spend
                       const visibleSubs = _rowSubs.filter(sub => {
                         const subActual = group.subcategories?.find(s => s.category === sub)?.amount || 0;
-                        return (goals[sub] != null) || subActual > 0;
+                        return (goals[sub] !== null) || subActual > 0;
                       });
                       return (
                         <React.Fragment key={group.category}>
@@ -867,11 +955,11 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                               {visibleSubs.length > 0 && <span style={{ color: '#94a3b8', marginRight: 4, fontSize: 11 }}>▾</span>}
                               {group.category}
                             </td>
-                            {showGoalCols && <td style={{ padding: '8px 12px', textAlign: 'right', color: '#475569' }}>{goalAmt != null ? `$${goalAmt.toFixed(2)}` : '—'}</td>}
+                            {showGoalCols && <td style={{ padding: '8px 12px', textAlign: 'right', color: '#475569' }}>{goalAmt !== null ? `$${goalAmt.toFixed(2)}` : '—'}</td>}
                             <td style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 600, color: isOver ? '#ef4444' : '#0f172a' }}>${group.amount.toFixed(2)}</td>
                             <td style={{ padding: '8px 12px', textAlign: 'right', color: '#64748b' }}>{ofTotal.toFixed(1)}%</td>
-                            {showGoalCols && <td style={{ padding: '8px 12px', textAlign: 'right', color: isOver ? '#ef4444' : localVariance != null ? '#16a34a' : '#94a3b8' }}>
-                              {localVariance != null ? `${isOver ? '+' : ''}${localVariance.toFixed(2)}` : '—'}
+                            {showGoalCols && <td style={{ padding: '8px 12px', textAlign: 'right', color: isOver ? '#ef4444' : localVariance !== null ? '#16a34a' : '#94a3b8' }}>
+                              {localVariance !== null ? `${isOver ? '+' : ''}${localVariance.toFixed(2)}` : '—'}
                             </td>}
                             {showGoalCols && <td style={{ padding: '8px 12px' }}>
                               {goalAmt ? (
@@ -889,23 +977,23 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                           {visibleSubs.map((sub, si) => {
                             const subGoal = goals[sub] ?? null;
                             const subActual = group.subcategories?.find(s => s.category === sub)?.amount || 0;
-                            const subVariance = subGoal != null ? subActual - subGoal : null;
-                            const subIsOver = subVariance != null && subVariance > 0;
+                            const subVariance = subGoal !== null ? subActual - subGoal : null;
+                            const subIsOver = subVariance !== null && subVariance > 0;
                             const subBarPct = subGoal > 0 ? Math.min((subActual / subGoal) * 100, 100) : 0;
                             const isLastSub = si === visibleSubs.length - 1;
                             return (
                               <tr key={sub} style={{ borderBottom: isLastSub ? '1px solid #e2e8f0' : '1px solid #f4f4f5', background: idx % 2 ? '#eef2f7' : '#f5f7fa' }}>
                                 <td style={{ padding: '5px 12px 5px 26px', color: '#64748b', fontSize: 12 }}>↳ {sub}</td>
                                 {showGoalCols && <td style={{ padding: '5px 12px', textAlign: 'right', color: '#64748b', fontSize: 12 }}>
-                                  {subGoal != null ? `$${subGoal.toFixed(2)}` : '—'}
+                                  {subGoal !== null ? `$${subGoal.toFixed(2)}` : '—'}
                                 </td>}
                                 <td style={{ padding: '5px 12px', textAlign: 'right', fontSize: 12, color: subIsOver ? '#ef4444' : '#374151' }}>${subActual.toFixed(2)}</td>
                                 <td style={{ padding: '5px 12px', textAlign: 'right', color: '#cbd5e1', fontSize: 12 }}>—</td>
-                                {showGoalCols && <td style={{ padding: '5px 12px', textAlign: 'right', color: subIsOver ? '#ef4444' : subVariance != null ? '#16a34a' : '#94a3b8', fontSize: 12 }}>
-                                  {subVariance != null ? `${subIsOver ? '+' : ''}${subVariance.toFixed(2)}` : '—'}
+                                {showGoalCols && <td style={{ padding: '5px 12px', textAlign: 'right', color: subIsOver ? '#ef4444' : subVariance !== null ? '#16a34a' : '#94a3b8', fontSize: 12 }}>
+                                  {subVariance !== null ? `${subIsOver ? '+' : ''}${subVariance.toFixed(2)}` : '—'}
                                 </td>}
                                 {showGoalCols && <td style={{ padding: '5px 12px' }}>
-                                  {subGoal != null ? (
+                                  {subGoal !== null ? (
                                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                                       <div style={{ height: 4, flex: 1, background: '#e2e8f0', borderRadius: 99, overflow: 'hidden' }}>
                                         <div style={{ height: '100%', width: `${subBarPct}%`, background: subIsOver ? '#ef4444' : '#22c55e', borderRadius: 99 }} />
@@ -1011,12 +1099,12 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                     {budgetHistory.slice(0, 6).map(m => {
                       const pct = m.attainment_pct;
-                      const good = pct != null && pct >= 90;
+                      const good = pct !== null && pct >= 90;
                       return (
-                        <div key={m.month} style={{ flex: 1, minWidth: 80, background: good ? '#f0fdf4' : pct != null ? '#fef2f2' : '#f8fafc', border: `1px solid ${good ? '#86efac' : pct != null ? '#fca5a5' : '#e2e8f0'}`, borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
+                        <div key={m.month} style={{ flex: 1, minWidth: 80, background: good ? '#f0fdf4' : pct !== null ? '#fef2f2' : '#f8fafc', border: `1px solid ${good ? '#86efac' : pct !== null ? '#fca5a5' : '#e2e8f0'}`, borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
                           <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{m.month}</div>
-                          <div style={{ fontSize: 18, fontWeight: 800, color: good ? '#16a34a' : pct != null ? '#dc2626' : '#94a3b8' }}>{pct != null ? `${pct}%` : '—'}</div>
-                          <div style={{ fontSize: 10, color: '#64748b' }}>{pct != null ? 'attainment' : 'no data'}</div>
+                          <div style={{ fontSize: 18, fontWeight: 800, color: good ? '#16a34a' : pct !== null ? '#dc2626' : '#94a3b8' }}>{pct !== null ? `${pct}%` : '—'}</div>
+                          <div style={{ fontSize: 10, color: '#64748b' }}>{pct !== null ? 'attainment' : 'no data'}</div>
                         </div>
                       );
                     })}
@@ -1186,7 +1274,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
               <>
               {/* ── Month context bar ── */}
               <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
-                <span style={{ fontWeight: 700, color: '#334155' }}>� Analyzing: {currentMonth}</span>
+                <span style={{ fontWeight: 700, color: '#334155' }}>📊 Analyzing: {currentMonth}</span>
                 <span style={{ color: '#94a3b8' }}>→</span>
                 <span style={{ fontWeight: 700, color: '#4f46e5' }}>
                   📅 Setting goals for:&nbsp;
@@ -1228,7 +1316,10 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                         {goalMonths.map(m => {
                           const hist = budgetHistory.find(h => h.month === m);
                           const attPct = hist?.attainment_pct;
-                          const good = attPct != null && attPct >= 90;
+                          const hasAttainment = attPct !== undefined && attPct !== null;
+                          const hasTotalGoal = hist?.total_goal !== undefined && hist?.total_goal !== null;
+                          const hasTotalActual = hist?.total_actual !== undefined && hist?.total_actual !== null;
+                          const good = hasAttainment && attPct >= 90;
                           const isViewing = viewGoalsMonth === m;
                           const isJustCopied = copySuccessMonth === m;
                           return (
@@ -1236,13 +1327,13 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                             <tr style={{ borderBottom: isViewing ? 'none' : '1px solid #f0f0f0', background: isViewing ? '#f0f9ff' : 'transparent' }}>
                               <td style={{ padding: '8px 12px', fontWeight: 600 }}>{m}</td>
                               <td style={{ padding: '8px 12px', textAlign: 'right', color: '#475569' }}>
-                                {hist?.total_goal != null ? `$${hist.total_goal.toFixed(2)}` : '—'}
+                                {hasTotalGoal ? `$${hist.total_goal.toFixed(2)}` : '—'}
                               </td>
-                              <td style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 600, color: good ? '#16a34a' : attPct != null ? '#dc2626' : '#0f172a' }}>
-                                {hist?.total_actual != null ? `$${hist.total_actual.toFixed(2)}` : '—'}
+                              <td style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 600, color: good ? '#16a34a' : hasAttainment ? '#dc2626' : '#0f172a' }}>
+                                {hasTotalActual ? `$${hist.total_actual.toFixed(2)}` : '—'}
                               </td>
                               <td style={{ padding: '8px 12px', textAlign: 'center' }}>
-                                {attPct != null
+                                {hasAttainment
                                   ? <span style={{ fontWeight: 700, color: good ? '#16a34a' : '#dc2626' }}>{attPct}%</span>
                                   : <span style={{ color: '#cbd5e1' }}>—</span>
                                 }
@@ -1286,7 +1377,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                                     let _vTotal = 0;
                                     for (const [cat, amt] of Object.entries(viewGoalsData)) {
                                       const children = subcategories[cat] || [];
-                                      const hasChildGoals = children.some(c => viewGoalsData[c] != null);
+                                      const hasChildGoals = children.some(c => viewGoalsData[c] !== null);
                                       if (!hasChildGoals) _vTotal += Number(amt);
                                     }
                                     // Group: top-level parents and standalones
@@ -1303,7 +1394,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                                         </div>
                                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '6px 20px' }}>
                                           {_vTopLevel.map(cat => {
-                                            const children = (subcategories[cat] || []).filter(c => viewGoalsData[c] != null);
+                                            const children = (subcategories[cat] || []).filter(c => viewGoalsData[c] !== null);
                                             const hasChildren = children.length > 0;
                                             const parentAmt = viewGoalsData[cat];
                                             const childSum = children.reduce((s, c) => s + Number(viewGoalsData[c]), 0);
@@ -1315,7 +1406,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                                                   </span>
                                                   <span style={{ fontSize: 12, color: '#0f172a', fontWeight: 600, marginLeft: 8 }}>
                                                     ${hasChildren ? childSum.toFixed(2) : Number(parentAmt).toFixed(2)}
-                                                    {hasChildren && parentAmt != null && parentAmt !== childSum &&
+                                                    {hasChildren && parentAmt !== null && parentAmt !== childSum &&
                                                       <span style={{ fontSize: 10, color: '#94a3b8', marginLeft: 4 }}>(set: ${Number(parentAmt).toFixed(2)})</span>
                                                     }
                                                   </span>
@@ -1592,7 +1683,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                     <span style={{ background: '#1e293b', color: '#fff', borderRadius: 6, padding: '2px 9px', fontSize: 13 }}>
                       ${committedCosts.committed_total.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}/mo
                     </span>
-                    {committedCosts.income_pct != null && (
+                    {committedCosts.income_pct !== null && (
                       <span style={{ fontSize: 12, color: '#64748b', fontWeight: 400 }}>
                         · {committedCosts.income_pct}% of income · {committedCosts.items.length} recurring merchants
                       </span>
@@ -1879,7 +1970,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                                     const avg = aiEntry ? aiEntry.historical_avg : null;
                                     const maxVal = Math.max(...bars, 0.01);
                                     if (bars.length < 2) {
-                                      return avg != null ? `$${avg.toFixed(0)}` : <span style={{ color: '#cbd5e1' }}>—</span>;
+                                      return avg !== null ? `$${avg.toFixed(0)}` : <span style={{ color: '#cbd5e1' }}>—</span>;
                                     }
                                     return (
                                       <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end', gap: 2 }}>
@@ -1888,7 +1979,7 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                                             style={{ width: 5, height: `${Math.max(Math.round(v / maxVal * 20), 2)}px`, background: i === bars.length - 1 ? '#4f46e5' : '#cbd5e1', borderRadius: '1px 1px 0 0', transition: 'height .3s' }}
                                           />
                                         ))}
-                                        {avg != null && <span style={{ fontSize: 11, marginLeft: 4, color: '#475569' }}>${avg.toFixed(0)}</span>}
+                                        {avg !== null && <span style={{ fontSize: 11, marginLeft: 4, color: '#475569' }}>${avg.toFixed(0)}</span>}
                                       </div>
                                     );
                                   })()}
@@ -1953,9 +2044,9 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                                               style={{ width: 4, height: `${Math.max(Math.round(v / subMaxVal * 16), 2)}px`, background: i === subBars.length - 1 ? '#818cf8' : '#e0e7ff', borderRadius: '1px 1px 0 0' }}
                                             />
                                           ))}
-                                          {subAiEntry?.historical_avg != null && <span style={{ fontSize: 10, marginLeft: 3, color: '#64748b' }}>${subAiEntry.historical_avg.toFixed(0)}</span>}
+                                          {subAiEntry?.historical_avg !== null && subAiEntry?.historical_avg !== undefined && <span style={{ fontSize: 10, marginLeft: 3, color: '#64748b' }}>${subAiEntry.historical_avg.toFixed(0)}</span>}
                                         </div>
-                                      ) : subAiEntry?.historical_avg != null ? `$${subAiEntry.historical_avg.toFixed(0)}` : <span style={{ color: '#cbd5e1' }}>—</span>}
+                                      ) : (subAiEntry?.historical_avg !== null && subAiEntry?.historical_avg !== undefined) ? `$${subAiEntry.historical_avg.toFixed(0)}` : <span style={{ color: '#cbd5e1' }}>—</span>}
                                     </td>
                                     {/* Sub goal cell */}
                                     {renderGoalCell(sub.category, subGoal, subAiEntry, subIsLocked, 0, true)}
@@ -2213,6 +2304,66 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
 
       {activeTab === 'chat' && (
         <div className="tab-content chat-container">
+          {/* Session toolbar: start a new chat or resume a past one */}
+          <div className="chat-toolbar">
+            <button
+              className="chat-toolbar-btn primary"
+              onClick={startNewChat}
+              title="Start a fresh conversation"
+              disabled={chatLoading}
+            >
+              + New chat
+            </button>
+            <div className="chat-toolbar-right">
+              <button
+                className={`chat-toolbar-btn ${showChatHistory ? 'active' : ''}`}
+                onClick={() => {
+                  const next = !showChatHistory;
+                  setShowChatHistory(next);
+                  if (next) loadChatSessions();
+                }}
+                title="Show past conversations"
+              >
+                History ({chatSessions.length}) {showChatHistory ? '▴' : '▾'}
+              </button>
+            </div>
+            {showChatHistory && (
+              <div className="chat-sessions-dropdown" role="listbox">
+                {chatSessions.length === 0 && (
+                  <div className="chat-sessions-empty">
+                    No past conversations yet. Send a message to start one.
+                  </div>
+                )}
+                {chatSessions.map((s) => (
+                  <div
+                    key={s.session_id}
+                    className={`chat-session-row ${s.session_id === chatSessionId ? 'active' : ''}`}
+                    onClick={() => resumeChatSession(s.session_id)}
+                    role="option"
+                    aria-selected={s.session_id === chatSessionId}
+                  >
+                    <div className="chat-session-main">
+                      <div className="chat-session-title">
+                        {s.title || 'Untitled conversation'}
+                      </div>
+                      <div className="chat-session-meta">
+                        {s.message_count} msg · {formatChatTimestamp(s.updated_at)}
+                      </div>
+                    </div>
+                    <button
+                      className="chat-session-delete"
+                      onClick={(e) => { e.stopPropagation(); deleteChatSessionById(s.session_id); }}
+                      title="Delete this conversation"
+                      aria-label="Delete conversation"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* Welcome screen (no messages yet) */}
           {chatMessages.length === 0 && (
             <div className="chat-welcome">

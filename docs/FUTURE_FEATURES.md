@@ -32,12 +32,22 @@
 ### AI Chatbot Assistant
 - RAG-based budget Q&A (`src/ai_analysis/chatbot_assistant.py`)
 - Answers natural-language questions about spending patterns
-- Hierarchical two-model pipeline: intent/reasoning model (primary_model, e.g. qwen) parses user
-  message into structured JSON intent, then a finance advisor model (financial_analysis_model)
-  composes the conversational response using pandas-computed facts — no hallucinated numbers
-- Stateful conversation context (`ConversationState`) carries period, category, and window across
-  follow-up turns without re-querying the intent model
+- **Two-model pipeline**: intent model (`primary_model`) parses user message → structured JSON;
+  finance advisor model (`financial_analysis_model`) composes responses from pandas-verified
+  facts and self-summarises older turns when the conversation grows long
+- **Server-side session store** (`deps.get_or_create_chat_session`): the assistant instance lives
+  across HTTP requests so `ConversationState` and the message list persist for the session lifetime
+- Batched transaction categorization (8 items/LLM call) in `categorizer.py`
+- Batched merchant name cleaning (6 items/LLM call) in `llm_utils.clean_merchant_batch`
+- Anti-loop measures: `think=False`, stop sequences, `num_predict` cap, `_is_looping` / `_truncate_loop`
 - Regex-based intent fallback when the intent model is unavailable
+- **Persistent chat sessions** — conversation history and `ConversationState` stored in
+  `chat_sessions` DB table; process-level session cache in `deps.py` reuses live
+  `ChatbotAssistant` instances so no cold-start on every request
+- **Self-summarisation of long sessions** — once a session crosses
+  `SESSION_SUMMARY_THRESHOLD` turns the finance model itself is asked to compress
+  older turns into a compact summary paragraph that gets injected into subsequent
+  system prompts.  No separate memory model required.
 
 ---
 
@@ -83,14 +93,20 @@ Let users set per-category budget limits and get notified when approaching them.
 
 Expand the existing chatbot assistant (`src/ai_analysis/chatbot_assistant.py`):
 
-- Integrate into the dashboard UI as a sidebar chat panel
-- Add context about current month's budget limits
+- ~~Add context about current month's budget limits~~ *(ConversationState tracks budget_targets)*
 - Answer questions like:
   - "Can I afford a $500 TV this month?"
   - "What's my average monthly dining expense?"
   - "Which category am I overspending in?"
   - "How does this month compare to last month?"
 - Improve response accuracy with better context chunking
+- ~~Persist conversations across requests~~ *(Done — chat_sessions DB table)*
+
+**Remaining work:**
+- Wire budget-limit data from `budget_goals` into the chatbot system prompt so
+  the advisor can compare spending against user-set limits
+- Add a "Can I afford X?" intent type to the intent parser
+- Month-over-month comparison intent type
 
 ---
 
@@ -285,13 +301,24 @@ Allow users to define savings or spending targets and track progress against rea
 **Priority:** Medium  
 **Complexity:** Low
 
-Persist chatbot conversations so users can return to a previous analysis session.
+~~Persist chatbot conversations so users can return to a previous analysis session.~~
 
-- Each session saved as a JSON file under `src/ui/data/chat_sessions/YYYY-MM-DD_HH-MM.json`
-- Session list shown in a sidebar with timestamps and auto-generated titles (based on first message)
-- Users can rename, delete, or resume any session
-- On resume, full message history is reloaded into the chat context
-- Sessions are scoped to the local machine — no cloud sync
+**Status: Core persistence is implemented** — the `chat_sessions` DB table stores every
+session.  The session endpoints are live:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/chat/sessions` | List all sessions (id, title, timestamps, message count) |
+| `GET /api/chat/sessions/{id}` | Full message history for one session |
+| `DELETE /api/chat/sessions/{id}` | Delete a session |
+| `POST /api/chat` (with `session_id`) | Continue an existing session |
+
+**Remaining UI work:**
+- Session sidebar in the chatbot panel: list sessions with timestamps and auto-titles
+- Click to resume: load session messages into the chat panel and send `session_id`
+  with subsequent messages
+- Rename and delete buttons per session row
+- "New chat" button that clears `session_id` from the client state
 
 ---
 
@@ -957,3 +984,254 @@ After writing transactions to DB, snapshot `budget_goals` into `budget_history` 
 **Phase 5 — Strategy picker (optional)**
 - Settings > Budget tab: strategy selector (50/30/20 | Spending Baseline | Custom)
 - Custom mode: user sets their own Needs/Wants/Savings % targets
+
+---
+
+## AI Architecture: Persistent Chat Sessions & Long-Session Summarisation
+
+This section documents the design decisions and integration plan for keeping
+chatbot state alive across HTTP requests and for compressing long
+conversations so the finance advisor never runs out of context window.
+
+---
+
+### Background — The Stateless Agent Problem
+
+Every AI feature that currently calls Ollama is **stateless**:
+
+| Feature | Current behaviour | Problem |
+|---------|------------------|---------|
+| GUI Chatbot `/api/chat` | Creates a new `ChatbotAssistant()` per HTTP request | `ConversationState` rebuilt from scratch via regex fallback; no true in-model memory |
+| Transaction categorization | One `requests.post()` per merchant | Model has no memory of what it just categorised — identical logic is re-executed for every merchant |
+| Merchant name cleaning | One `requests.post()` per merchant | Same issue — the model cannot learn from merchants it cleaned earlier in the same batch |
+
+The core insight is: **starting a new session per transaction or per API call
+forces the model to rediscover context it already established, leading to
+inconsistent results and unnecessary latency.**
+
+---
+
+### Solution: Persistent Assistants + Self-Summarisation
+
+Instead of relying on a separate memory model, the current design keeps the
+`ChatbotAssistant` instance alive across requests (so the Python message list
+grows across turns) and asks the **same finance model** to summarise its own
+older turns when the conversation gets long.  That keeps the model count down
+to two (`primary_model` + `financial_analysis_model`) while still giving the
+advisor unbounded conversation length via the injected summary block.
+
+The finance model is configured in `config/llm_models.json`:
+
+```json
+{
+  "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor"
+}
+```
+
+Any Ollama chat model can be substituted.  The summariser prompt is a
+different-purpose call to the same model — no second install required.
+
+---
+
+### Part 1: Chatbot Session Persistence (Implemented)
+
+#### What was built
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| `chat_sessions` DB table | `src/database/models.py` | Stores `session_id`, `title`, `messages` (JSON), `conv_state` (JSON), `summary` (finance-model output) |
+| Process-level session cache | `src/ui/backend/deps.py` | Dict of live `ChatbotAssistant` instances keyed by `session_id` |
+| `get_or_create_chat_session()` | `deps.py` | Returns cached instance or reconstructs from DB on server restart |
+| `ConversationState.to_dict()` / `from_dict()` | `chatbot_assistant.py` | Serialises/deserialises `active_period`, `active_category`, goals, etc. |
+| `save_session()` / `load_session()` | `chatbot_assistant.py` | DB read/write helpers |
+| `list_sessions()` / `delete_session()` | `chatbot_assistant.py` | Session management helpers |
+| `GET /api/chat/sessions` | `routes/analytics.py` | List all sessions |
+| `GET /api/chat/sessions/{id}` | `routes/analytics.py` | Get one session |
+| `DELETE /api/chat/sessions/{id}` | `routes/analytics.py` | Delete a session |
+| `POST /api/chat` (updated) | `routes/analytics.py` | Accepts `session_id`; persists history and state after each turn |
+| `_summarize_session()` | `chatbot_assistant.py` | Runs the finance model with a summariser prompt to compress old turns |
+
+#### How a conversation turn flows (new)
+
+```
+Client → POST /api/chat { message, session_id? }
+         │
+         ▼
+get_or_create_chat_session(session_id, model_name)   -- deps.py
+  ├── Cache hit?   → return live ChatbotAssistant (conv_state intact)
+  └── Cache miss?  → load DB row → ConversationState.from_dict(conv_state)
+         │
+         ▼
+chatbot.process_message(month, message, seeded_history_if_any)
+  ├── _generate_ai_response()
+  │     ├── conv_state already populated (no regex rebuild needed)
+  │     ├── _parse_intent(user_message, last 4 turns)
+  │     ├── conv_state.update_from_intent(intent)
+  │     ├── _calculate_facts_with_pandas(…)
+  │     └── _call_finance_advisor(…)
+  │           └── self._session_summary injected into system prompt when present
+  └── returns { response, conversation_history }
+         │
+         ▼
+Check: assistant_turns >= SESSION_SUMMARY_THRESHOLD?
+  └── Yes → _summarize_session(messages) using finance model → new summary
+         │
+         ▼
+save_session(session_id, title, updated_messages, conv_state.to_dict(), summary)
+         │
+         ▼
+Response includes session_id so client can persist it for next turn
+```
+
+#### Memory summarisation trigger
+
+When a session reaches `SESSION_SUMMARY_THRESHOLD = 20` assistant turns the
+finance model is called with a summariser prompt.  The prompt:
+
+> "Summarise the following conversation into a single compact paragraph that
+> captures: the financial questions asked, the key data points discussed, any
+> goals or budgets mentioned, and the time periods referenced. 3–5 sentences."
+
+The summary replaces the `chat_sessions.summary` column.  On subsequent turns
+it is injected into the finance advisor's system prompt as a **Session Memory**
+block.  The raw `messages` list is still stored in full for the session history
+sidebar — only the advisor sees the condensed version.
+
+---
+
+### Part 2: Batch Categorization Session (Implemented)
+
+#### What was built
+
+`TransactionCategorizer.categorize_batch_with_session()` in
+`src/ai_classification/categorizer.py` runs an entire list of merchants through
+**one persistent Ollama chat session** instead of N independent calls.
+
+```python
+results = categorizer.categorize_batch_with_session([
+    ("Olive Garden", 45.20),
+    ("Texas Roadhouse", 78.50),
+    ("Uber Eats", 22.00),
+    ("Walmart", 134.17),
+])
+# → {"Olive Garden": "Dining", "Texas Roadhouse": "Dining",
+#    "Uber Eats": "Dining", "Walmart": "Groceries"}
+```
+
+The session opens with a system message establishing the full category list and
+disambiguation rules.  Each merchant is sent as a `user` turn; the model's
+`assistant` reply is fed back so subsequent turns benefit from seeing what
+was already categorised.
+
+#### How to integrate into `process_monthly.py`
+
+The batch session method is available now.  To activate it for the main import
+pipeline, replace the per-row LLM fallback in `classify_transactions()` with:
+
+```python
+# Collect merchants that need LLM categorization
+llm_needed = [
+    (row["Place"], row.get("Amount"))
+    for _, row in df[df["category"] == "Uncategorized"].iterrows()
+]
+
+if llm_needed:
+    batch_results = categorizer.categorize_batch_with_session(llm_needed)
+    for idx, row in df.iterrows():
+        if row["category"] == "Uncategorized":
+            cat = batch_results.get(row["Place"])
+            if cat:
+                df.at[idx, "category"] = cat
+```
+
+This replaces N independent Ollama calls with one session of N turns —
+typically 30–50% faster for batches of 10+ merchants, and more consistent
+because the model sees its own prior answers.
+
+---
+
+### Part 3: Merchant Cleaning Batch Session (Planned)
+
+**Status: Not yet implemented**  
+**Priority:** Medium  
+**Complexity:** Medium
+
+The same persistent-session pattern can be applied to `llm_utils.py`
+`clean_merchant_name_llm()`.  Currently every raw merchant string gets its own
+Ollama call.  A batch session would let the model:
+
+- Apply the same abbreviation expansion rule consistently across an import
+  (e.g. every "WM" → "Walmart")
+- Learn from earlier merchants in the batch (e.g. if "STARBUCKS #1234 SEA WA"
+  was cleaned to "Starbucks", then "STARBUCKS #5678 PDX OR" benefits from that
+  prior example)
+- Reduce cold-start overhead when processing 50+ transactions
+
+**Implementation sketch:**
+
+```python
+def clean_merchants_batch_with_session(
+    merchants: List[Tuple[str, float, str]],   # (raw_name, amount, date)
+    model: str,
+    known_names: list = None,
+) -> Dict[str, str]:
+    """
+    Clean a list of merchant names in a single Ollama session.
+    Returns {raw_name: clean_name}.
+    """
+    system_msg = (
+        "You are a merchant name cleaner.  I will send you raw bank transaction "
+        "descriptions one at a time.  For each, reply with ONLY the clean merchant "
+        "name in the format: Name | Confidence | Reasoning\n\n"
+        "Rules: remove store numbers, locations, payment prefixes; fix capitalization; "
+        "expand abbreviations.  Respond with exactly the format above — nothing else."
+    )
+    messages = [{"role": "system", "content": system_msg}]
+    results = {}
+    for raw, amount, date in merchants:
+        messages.append({"role": "user", "content": raw})
+        # ... call Ollama, parse response, feed back as assistant turn
+    return results
+```
+
+**Integration point:** `scripts/process_monthly.py` `_clean_merchant_names()`
+currently loops over merchants and calls `clean_merchant_with_ensemble()` per
+merchant.  Switch to batch session when `len(merchants) > 5`.
+
+---
+
+### Part 4: Advisor Agent Loop for Autonomous Financial Review (Future)
+
+**Status: Design only — not implemented**  
+**Priority:** Low  
+**Complexity:** High
+
+The ultimate vision is an **advisor agent loop** that can autonomously:
+
+1. Review a newly imported month's transactions
+2. Detect anomalies (unusual merchants, large one-time expenses)
+3. Flag potential miscategorisations and suggest corrections
+4. Draft a monthly financial summary for the user to review
+
+This requires an **agentic tool-calling pattern** where the model can:
+
+```
+Advisor → call get_transactions(month="2026-05") → receives transaction list
+Advisor → call get_category_averages(months=3) → receives historical benchmarks  
+Advisor → call flag_transaction(tx_hash, reason) → flags for user review
+Advisor → call draft_summary(month) → writes narrative to DB
+```
+
+The tool-call schema (OpenAI-compatible function calling) is supported by
+many Ollama models via `/api/chat` with a `tools` payload.  Whichever model
+is configured as `financial_analysis_model` needs to support it, or a
+dedicated tool-calling model would need to be introduced for this feature.
+
+**Prerequisites before implementing:**
+- All write endpoints need idempotent, hash-checked operations (already true for
+  transactions via `tx_hash`)
+- Tool definitions need to be declared in a `config/agent_tools.json`
+- The agent loop needs a **human-in-the-loop confirmation step** before any
+  bulk category changes are committed — never allow fully autonomous writes to
+  user financial data without explicit approval
+

@@ -351,7 +351,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
       if (!res.ok) throw new Error(data.error || 'Failed');
       // Update local state; match by stable row_idx when available
       setExpenses(prev => prev.map(e => {
-        const match = row.row_idx != null
+        const match = row.row_idx !== null
           ? (e.row_idx === row.row_idx && e.month === row.month)
           : (e.date === row.date && e.place === row.place && e.amount === row.amount && e.month === row.month);
         if (!match) return e;
@@ -360,7 +360,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
           ...(patch.new_place    ? { place:    patch.new_place    } : {}),
           ...(patch.new_category ? { category: patch.new_category } : {}),
           ...(patch.new_label    ? { label:    patch.new_label    } : {}),
-          ...(patch.new_amount != null ? { amount: patch.new_amount } : {}),
+          ...(patch.new_amount !== undefined && patch.new_amount !== null ? { amount: patch.new_amount } : {}),
         };
       }));
     } catch (err) {

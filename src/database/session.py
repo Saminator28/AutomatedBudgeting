@@ -68,6 +68,10 @@ def init_db(db_path: Path = _DB_PATH):
         # Backfill: approximate existing rows as coming from their current report_month.
         # Cross-month rows will be corrected on the next reprocess of the source statement.
         "UPDATE transactions SET source_statement = report_month WHERE source_statement IS NULL",
+        # chat_sessions: Hermes-managed persistent chatbot sessions.
+        # CREATE TABLE IF NOT EXISTS is handled by metadata.create_all() above;
+        # these ALTER statements guard columns added after the initial schema.
+        "ALTER TABLE chat_sessions ADD COLUMN summary TEXT",
     ]
     with engine.connect() as conn:
         for stmt in _migrations:

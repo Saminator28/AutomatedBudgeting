@@ -5,7 +5,7 @@
   "description": "LLM model configuration for the chatbot two-model pipeline and statement categorization",
   "notes": {
     "primary_model": "Merchant name cleaning (pass 1 & arbiter) + chatbot intent parser + transaction categorization.",
-    "secondary_model": "Merchant name cleaning (pass 2 ensemble). Set to empty string to disable ensemble cleaning.",
-    "financial_analysis_model": "Chatbot step 2: conversational financial advice."
+    "secondary_model": "Optional: merchant name cleaning (pass 2 ensemble). Leave empty to disable ensemble cleaning \u2014 not required.",
+    "financial_analysis_model": "Chatbot answers + self-summarization of long conversations. Handles the entire chat pipeline after intent parsing."
   }
 }

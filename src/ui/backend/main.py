@@ -101,12 +101,18 @@ app.add_middleware(
 # ── Write-auth middleware ─────────────────────────────────────────────────────
 @app.middleware("http")
 async def _write_auth_middleware(request: Request, call_next):
-    if (_WRITE_API_KEY
-            and request.method in {'POST', 'PUT', 'PATCH', 'DELETE'}
-            and request.url.path.startswith('/api/')):
-        provided = request.headers.get('x-api-key', '').strip()
-        if provided != _WRITE_API_KEY:
-            return JSONResponse(status_code=401, content={'error': 'Unauthorized'})
+    if _WRITE_API_KEY and request.url.path.startswith('/api/'):
+        # Gate all mutating verbs, plus reads on chat-session endpoints since
+        # those return the full financial Q&A history for a session.
+        needs_auth = (
+            request.method in {'POST', 'PUT', 'PATCH', 'DELETE'}
+            or (request.method == 'GET'
+                and request.url.path.startswith('/api/chat/sessions'))
+        )
+        if needs_auth:
+            provided = request.headers.get('x-api-key', '').strip()
+            if provided != _WRITE_API_KEY:
+                return JSONResponse(status_code=401, content={'error': 'Unauthorized'})
     return await call_next(request)
 
 # ── Routers ───────────────────────────────────────────────────────────────────

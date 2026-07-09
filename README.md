@@ -41,10 +41,13 @@ To verify: disconnect from the internet and the app still works completely.
 
 ## What You Need
 
-- **Docker Desktop** — the only thing you need to install
-- **Ollama** — a free local AI tool (runs AI models on your computer)
-- An AI model downloaded through Ollama (instructions below)
+- **Docker Desktop** — runs the app in a container
+- **Ollama** — runs the AI models locally on your machine
+- **The two configured AI models pulled through Ollama** — `make up` refuses to start until they are installed (see Step 3)
+- **Make** — used to build/run/manage the app with short commands. Pre-installed on macOS and Linux; on Windows it comes with Git for Windows (Git Bash) or can be installed with `choco install make`
 - Your bank statement PDFs
+
+> **No `make` available?** Every `make` command in this README has an equivalent raw `docker compose` command listed alongside it — either will work. The model preflight only runs when you use `make`; if you bypass it, install the models yourself first.
 
 That's it. Docker handles everything else.
 
@@ -141,45 +144,57 @@ curl -fsSL https://ollama.com/install.sh | sh
 
 ---
 
-### Step 3 — Download the AI Model Your App Is Configured To Use
+### Step 3 — Install the AI Models
 
-The model name is stored in `config/llm_models.json`.
+The app uses **two AI models**, both defined in [`config/llm_models.json`](config/llm_models.json):
 
-With Ollama installed, open `config/llm_models.json`, look at the `"primary_model"` value, then pull that exact model from a **Terminal** (macOS/Linux) or **Command Prompt / PowerShell** (Windows).
+| Role | Default model | What it does |
+|---|---|---|
+| `primary_model` | `gemma4:31b` | Cleans merchant names, categorizes transactions, parses chatbot intents |
+| `financial_analysis_model` | `ALIENTELLIGENCE/financialadvisor` | Answers all chatbot questions, summarises long chat sessions |
 
-At the moment, the default primary model in this repo is:
+**Pull both models before starting the app.** From any terminal with Ollama installed:
 
+```bash
+ollama pull gemma4:31b
+ollama pull ALIENTELLIGENCE/financialadvisor
 ```
-ollama pull qwen3.5:35b
-```
 
-This downloads the AI model used to clean merchant names, help categorize transactions, and support chat features. You only need to do this once per model.
+The initial download can take several minutes to an hour depending on your connection.
 
-> **Lower-spec computers:** If the default model is too heavy for your machine, choose a smaller model first by editing `config/llm_models.json`, then pull that model. For example:
+> **`make up` will refuse to start the app** until every model listed in `config/llm_models.json` is installed. If any are missing you'll see a message with the exact `ollama pull ...` commands to run — then rerun `make up`.
+
+> **Check what's installed at any time:**
+> ```bash
+> make check-models
 > ```
-> ollama pull qwen2.5:7b
-> ```
-> Then set `"primary_model"` to `"qwen2.5:7b"` in `config/llm_models.json` before starting the app.
+> Or list all installed models directly with `ollama list`.
+
+> **Lower-spec computers:** If the default primary model is too heavy for your machine, edit [`config/llm_models.json`](config/llm_models.json) first and set `"primary_model"` to a smaller model such as `"qwen2.5:7b"` or `"gemma3:4b"`. Save the file, then pull that model instead of `gemma4:31b`.
 
 ---
 
 ### Step 4 — Download and Start the App
 
+All platforms use the same two commands. Just adjust the `cd` path for where you saved the project.
+
 <details>
 <summary><strong>Windows</strong></summary>
 
 1. Download the project:
-   - If you have Git: open **Command Prompt** and run `git clone https://github.com/your-repo/AutomatedBudgeting.git`
+   - If you have Git: open **Git Bash** (installed with Git for Windows) and run `git clone https://github.com/your-repo/AutomatedBudgeting.git`
    - Otherwise: download the ZIP from GitHub and extract it
-2. Open **Command Prompt** and navigate to the folder:
-   ```
-   cd C:\Users\YourName\Documents\AutomatedBudgeting
+2. Open **Git Bash** and navigate to the folder:
+   ```bash
+   cd /c/Users/YourName/Documents/AutomatedBudgeting
    ```
 3. Build and start the app:
+   ```bash
+   make build
+   make up
    ```
-   docker compose up --build -d
-   ```
-4. Wait about 2–3 minutes for the build to finish (one-time only)
+   No `make`? Use `docker compose build` and `docker compose up -d` instead — you'll skip the model preflight, so make sure both models are installed first.
+4. Wait about 2–3 minutes for the build to finish (one-time only). If `make up` reports a missing model, run the `ollama pull` command it prints and try again.
 
 </details>
 
@@ -193,9 +208,10 @@ This downloads the AI model used to clean merchant names, help categorize transa
    ```
 3. Build and start the app:
    ```bash
-   docker compose up --build -d
+   make build
+   make up
    ```
-4. Wait about 2–3 minutes for the build to finish (one-time only)
+4. Wait about 2–3 minutes for the build to finish (one-time only). If `make up` reports a missing model, run the `ollama pull` command it prints and try again.
 
 </details>
 
@@ -208,9 +224,12 @@ This downloads the AI model used to clean merchant names, help categorize transa
    ```
 2. Build and start the app:
    ```bash
-   docker compose up --build -d
+   make build
+   make up
    ```
-3. Wait about 2–3 minutes for the build to finish (one-time only)
+3. Wait about 2–3 minutes for the build to finish (one-time only). If `make up` reports a missing model, run the `ollama pull` command it prints and try again.
+
+> The Makefile automatically detects Linux and includes `docker-compose.linux.yml`, which switches Docker to host networking so the container can reach your locally running Ollama. If you skip `make` and call `docker compose` directly on Linux, include the override yourself: `docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d`.
 
 </details>
 
@@ -222,44 +241,53 @@ Once the build is done, open your web browser and go to:
 
 **[http://localhost:8000](http://localhost:8000)**
 
+Or let the Makefile open it for you:
+
+```bash
+make dashboard
+```
+
 You should see the Automated Budgeting dashboard. 🎉
+
+> **First-run tip:** `make up` verifies your Ollama models before starting the app, so if the dashboard loads you should already have working AI features. If chatbot or categorization ever fails afterwards, run `make check-models` to confirm nothing was uninstalled.
 
 ---
 
 ## Daily Use
 
+All commands below assume you are in the project folder. On Windows use **Git Bash**, on macOS/Linux use **Terminal**.
+
+### Common Commands
+
+| What you want to do | Command | Raw equivalent |
+|---|---|---|
+| Start the app | `make up` | `docker compose up -d` |
+| Stop the app | `make down` | `docker compose down` |
+| View live logs | `make logs` | `docker compose logs -f app` |
+| Open the dashboard | `make dashboard` | Visit `http://localhost:8000` |
+| Open a shell inside the container | `make shell` | `docker compose exec app /bin/bash` |
+| Check service status | `make status` | `docker compose ps` |
+| Rebuild after code changes | `make build && make up` | `docker compose up --build -d` |
+| Verify Ollama models are installed | `make check-models` | See `scripts/preflight_models.py` |
+| Process a specific month | `make process MONTH=2025-03` | See `scripts/process_monthly.py --help` |
+| Aggregate monthly reports | `make aggregate` | See `scripts/aggregate_monthly.py` |
+| See all available targets | `make help` | — |
+
 ### Starting the App
 
-After the initial setup, starting the app is quick:
-
-**Windows (Command Prompt):**
-```
-cd C:\Users\YourName\Documents\AutomatedBudgeting
-docker compose up -d
-```
-
-**macOS / Linux (Terminal):**
 ```bash
-cd ~/Documents/AutomatedBudgeting
-docker compose up -d
+cd ~/Documents/AutomatedBudgeting   # or your install path
+make up
 ```
 
-Then open [http://localhost:8000](http://localhost:8000).
+Then open [http://localhost:8000](http://localhost:8000) (or run `make dashboard`).
 
-> **Shortcut:** You can bookmark `http://localhost:8000` in your browser. Just remember to start Docker Desktop and run `docker compose up -d` first each time.
-
----
+> **Shortcut:** Bookmark `http://localhost:8000`. Just remember to start Docker Desktop and run `make up` first each time.
 
 ### Stopping the App
 
-**Windows (Command Prompt):**
-```
-docker compose down
-```
-
-**macOS / Linux (Terminal):**
 ```bash
-docker compose down
+make down
 ```
 
 Or just close Docker Desktop — the app will stop automatically.
@@ -402,9 +430,10 @@ Subcategories appear individually in transaction lists but are grouped under the
 <summary><strong>The dashboard won't open / "This site can't be reached"</strong></summary>
 
 1. Make sure Docker Desktop is open and running (look for the whale icon in your taskbar/menu bar)
-2. Open a terminal and run `docker compose up -d` from the project folder
+2. Open a terminal in the project folder and run `make up` (or `docker compose up -d`)
 3. Wait 10–15 seconds and try again
-4. If still not working, run `docker ps` — you should see a container named `automated-budgeting` with status `Up`
+4. If still not working, run `make status` (or `docker ps`) — you should see the app container with status `Up`
+5. Check live logs with `make logs` for any startup errors
 
 </details>
 
@@ -421,13 +450,13 @@ Ollama must be running before you process statements.
 <details>
 <summary><strong>Processing is very slow</strong></summary>
 
-The first time you process a statement it takes longer because the AI model is loading into memory. Subsequent statements in the same session are faster.
+The first time you process a statement it takes longer because the AI model is loading into memory. Subsequent statements in the same session are much faster — the app tells Ollama to keep the model resident for an hour after each call.
 
 If it consistently takes more than 5 minutes per statement, consider using a lighter model:
-1. Open `config/llm_models.json` in the project folder
-2. Change `"primary_model"` to a smaller model such as `"qwen2.5:7b"`
-3. Pull that model with `ollama pull qwen2.5:7b`
-4. Restart the app
+1. Open [`config/llm_models.json`](config/llm_models.json) in the project folder
+2. Change `"primary_model"` to a smaller model such as `"qwen2.5:7b"` or `"gemma3:4b"`
+3. Pull that model: `ollama pull qwen2.5:7b`
+4. Restart the app: `make down && make up`
 
 </details>
 
@@ -445,21 +474,39 @@ Some PDF statements use unusual formatting that the parser struggles with. Try:
 <summary><strong>I updated the project files but the app isn't showing changes</strong></summary>
 
 You need to rebuild the Docker image after updating code:
+```bash
+make build && make up
 ```
-docker compose up --build -d
-```
+
+Raw equivalent: `docker compose up --build -d`.
 
 </details>
 
 <details>
 <summary><strong>Docker compose command not found (older systems)</strong></summary>
 
-Older versions of Docker use `docker-compose` (with a hyphen) instead of `docker compose`:
+Older versions of Docker use `docker-compose` (with a hyphen) instead of `docker compose`. The Makefile detects both automatically and picks whichever is installed — just run `make up`, `make down`, etc. as normal.
+
+If you're calling Docker directly without `make`:
 ```bash
 docker-compose up -d
 docker-compose down
 docker-compose up --build -d
 ```
+
+</details>
+
+<details>
+<summary><strong>`make up` reports a missing model / chatbot answers are missing</strong></summary>
+
+The app deliberately does not auto-download models — it prints the exact `ollama pull` command you need to run and refuses to start until every model in [`config/llm_models.json`](config/llm_models.json) is installed. To resolve:
+
+1. Copy the `ollama pull <model>` command shown in the `make up` output
+2. Run it in a terminal on the machine where Ollama is installed
+3. Wait for the pull to finish (large models can take a while)
+4. Rerun `make up`
+
+You can check installation status any time with `make check-models` or `ollama list`.
 
 </details>
 
@@ -470,12 +517,18 @@ docker-compose up --build -d
 To get the latest version:
 
 ```bash
+# Stop the running app
+make down
+
 # Pull the latest code
 git pull
 
-# Rebuild and restart
-docker compose up --build -d
+# Rebuild the image and start again
+make build
+make up
 ```
+
+Raw equivalent for the last three steps: `docker compose up --build -d`.
 
 ---
 
@@ -497,7 +550,7 @@ src/ui/data/
 
 This backup includes your transactions, uploaded statement files, custom categories, keywords, rules, and budget settings.
 
-**To move to a new computer:** copy the entire project folder, install Docker and Ollama on the new machine, and run `docker compose up --build -d`.
+**To move to a new computer:** copy the entire project folder, install Docker and Ollama on the new machine, then run `make build && make up` from the project folder.
 
 ---
 

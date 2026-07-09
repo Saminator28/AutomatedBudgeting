@@ -6,16 +6,36 @@ Category list is loaded from the config_categories database table.
 """
 
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set, Tuple
 import os
 import re
 import json
 from pathlib import Path
 import requests
+from requests.adapters import HTTPAdapter
 
 _OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
 
-# Ollama is accessed directly via REST API (no SDK dependency)
+# Per-run priming caps — see reset_run_cache() and _build_priming_context()
+_RUN_EXAMPLE_MAX = 30           # hard cap on priming examples per LLM call
+_RUN_EXAMPLE_PER_CATEGORY = 3   # diversity cap — no single category dominates
+
+# Ollama is accessed directly via REST API (no SDK dependency).
+#
+# Shared HTTP session with connection pooling so batch categorization does not
+# open a fresh TCP connection per merchant.  Ollama /api/chat is stateless
+# server-side, so "reusing an agent" is really just reusing the HTTP socket
+# and keeping the model resident (see _KEEP_ALIVE below).
+_HTTP = requests.Session()
+_HTTP.mount('http://',  HTTPAdapter(pool_connections=4, pool_maxsize=8))
+_HTTP.mount('https://', HTTPAdapter(pool_connections=4, pool_maxsize=8))
+
+# Ask Ollama to keep the model in memory for an hour after each call.  Without
+# this, a 31B model unloads after the 5-minute default and every subsequent
+# call pays a ~30-60s reload cost.  This is the correct primitive for "don't
+# reinitialize the model per transaction" — it does NOT share conversation
+# state across transactions (which would break categorization reproducibility).
+_KEEP_ALIVE = '1h'
 
 
 class TransactionCategorizer:
@@ -80,6 +100,104 @@ class TransactionCategorizer:
         
         # Verify model exists (don't fail if unavailable, just warn)
         self.llm_available = self._check_llm_availability()
+
+        # Per-run state — populated during categorize_dataframe / categorize_transaction
+        # and cleared by reset_run_cache().  See _run_cache_lookup / _run_cache_write.
+        self._run_cache: Dict[str, Optional[str]] = {}           # norm_key → category or None
+        self._run_examples: List[Tuple[str, str]] = []           # (clean_name, category) FIFO, priming pool
+        self._run_stats: Dict[str, int] = {
+            'hits': 0,                  # normalized_key found in _run_cache (any outcome)
+            'unresolved_shortcuts': 0,  # subset of hits where cached value is None (loop guard)
+            'llm_calls': 0,             # actual LLM invocations (single + batch chunks)
+            'primed_calls': 0,          # LLM calls that had ≥1 priming example injected
+            'cache_writes': 0,          # entries written to _run_cache this run
+        }
+
+    # ── Per-run cache + priming ─────────────────────────────────────────────
+    #
+    # Purpose: within a single processing run, the LLM must (a) never be called
+    # twice on the same normalized merchant (loop guard, deterministic repeats)
+    # and (b) see its own earlier decisions as few-shot context so it can reason
+    # by analogy — e.g. "Cash Wise → Groceries" earlier in the run nudges "Aldi"
+    # toward Groceries later.  All state dies with the categorizer instance
+    # (which is already created fresh per month by scripts/process_monthly.py).
+    def reset_run_cache(self) -> None:
+        """Clear per-run cache, priming examples, and stats. Call at start of a run."""
+        self._run_cache.clear()
+        self._run_examples.clear()
+        for k in self._run_stats:
+            self._run_stats[k] = 0
+
+    def _run_norm_key(self, clean_name: str) -> str:
+        """Normalized key for run-cache lookups.  Uses MerchantHistory's key so
+        the run cache and cross-month history share the same identity concept."""
+        if self.merchant_history is not None:
+            try:
+                return self.merchant_history._normalize_key(str(clean_name).strip())
+            except Exception:
+                pass
+        # Fallback: simple lowercase alnum-only (matches parser._normalize_raw)
+        return re.sub(r'[^a-z0-9]', '', str(clean_name).lower())
+
+    def _run_cache_lookup(self, clean_name: str) -> Tuple[bool, Optional[str]]:
+        """Return (hit?, category-or-None).  A cached None means the LLM
+        already tried and failed on this merchant this run — do not retry."""
+        key = self._run_norm_key(clean_name)
+        if len(key) < 3:
+            return False, None
+        if key in self._run_cache:
+            self._run_stats['hits'] += 1
+            cached = self._run_cache[key]
+            if cached is None:
+                self._run_stats['unresolved_shortcuts'] += 1
+            return True, cached
+        return False, None
+
+    def _run_cache_write(self, clean_name: str, category: Optional[str]) -> None:
+        """Record an LLM outcome for this run.  category=None means unresolved.
+        Successful decisions also feed the priming example pool (with diversity cap)."""
+        key = self._run_norm_key(clean_name)
+        if len(key) < 3:
+            return
+        if key in self._run_cache:
+            return  # first decision wins — never overwrite (protects consistency)
+        self._run_cache[key] = category
+        self._run_stats['cache_writes'] += 1
+
+        # Only successful, real categorizations feed priming — never Uncategorized/None.
+        if not category or category == 'Uncategorized':
+            return
+        # Diversity: cap at _RUN_EXAMPLE_PER_CATEGORY per category, _RUN_EXAMPLE_MAX total.
+        per_cat_count = sum(1 for _, c in self._run_examples if c == category)
+        if per_cat_count >= _RUN_EXAMPLE_PER_CATEGORY:
+            return
+        self._run_examples.append((str(clean_name).strip(), category))
+        # FIFO eviction if we exceed the global cap
+        while len(self._run_examples) > _RUN_EXAMPLE_MAX:
+            self._run_examples.pop(0)
+
+    def _build_priming_context(self) -> str:
+        """Render this run's already-decided merchants as a compact few-shot
+        block for injection into the categorization prompt.  Empty string if
+        no examples yet (first LLM call of the run)."""
+        if not self._run_examples:
+            return ''
+        lines = [f'  - "{name}" → {cat}' for name, cat in self._run_examples]
+        return (
+            "\n\nAlready categorized this run (for consistency — if a new merchant "
+            "is similar to one below, prefer the same category):\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
+    def run_cache_stats_line(self) -> str:
+        """One-line summary suitable for end-of-run logging."""
+        s = self._run_stats
+        return (
+            f"🗂  Categorizer run cache: {s['cache_writes']} unique merchants  "
+            f"| hits: {s['hits']} (unresolved skips: {s['unresolved_shortcuts']})  "
+            f"| LLM calls: {s['llm_calls']} (primed: {s['primed_calls']})"
+        )
     
     def _load_categories(self, config_path) -> dict:
         """Load category patterns from JSON file."""
@@ -100,13 +218,12 @@ class TransactionCategorizer:
                     print(f"✓ LLM categorization enabled ({self.llm_model})")
                     return True
                 else:
-                    print(f"⚠ Model '{self.llm_model}' not found locally — attempting auto-pull...")
-                    from statement_parser.llm_utils import ensure_model_pulled
-                    pulled = ensure_model_pulled(self.llm_model, self.llm_host)
-                    if pulled:
-                        print(f"✓ LLM categorization enabled ({self.llm_model})")
-                        return True
-                    print(f"❌ Could not pull '{self.llm_model}' — falling back to pattern matching")
+                    # Do NOT auto-pull.  Print the exact command the user must
+                    # run and continue with pattern-only matching so the app
+                    # still starts and non-AI features remain usable.
+                    from statement_parser.llm_utils import warn_model_missing
+                    warn_model_missing(self.llm_model, self.llm_host)
+                    print(f"   Categorization is falling back to pattern matching until '{self.llm_model}' is installed.")
                     return False
         except Exception as e:
             print(f"❌ Cannot connect to Ollama at {self.llm_host}")
@@ -127,12 +244,25 @@ class TransactionCategorizer:
         """
         if not self.llm_available:
             return None
-        
-        result = self._get_category_from_model(merchant, amount, self.llm_model)
-        
+
+        # Loop guard + repeat consistency: never call the LLM twice for the same
+        # normalized merchant in one run.  A cached None means "already tried,
+        # already failed" — short-circuit to None instead of retrying.
+        hit, cached = self._run_cache_lookup(merchant)
+        if hit:
+            return cached
+
+        self._run_stats['llm_calls'] += 1
+        priming = self._build_priming_context()
+        if priming:
+            self._run_stats['primed_calls'] += 1
+
+        result = self._get_category_from_model(merchant, amount, self.llm_model, priming=priming)
+
         if not result:
             print(f"  [LLM] Failed to categorize: {merchant}")
-        
+
+        self._run_cache_write(merchant, result)
         return result
 
     def _extract_category_from_thinking(self, thinking_text: str) -> str:
@@ -172,8 +302,15 @@ class TransactionCategorizer:
 
         return ''
 
-    def _get_category_from_model(self, merchant: str, amount: float, model: str) -> Optional[str]:
-        """Get category from a specific model."""
+    def _get_category_from_model(self, merchant: str, amount: float, model: str, priming: str = '') -> Optional[str]:
+        """Get category from a specific model.
+
+        Args:
+            merchant: cleaned merchant name
+            amount: optional transaction amount
+            model: Ollama model name
+            priming: optional pre-rendered few-shot block from _build_priming_context()
+        """
         # Only offer LEAF categories to the LLM — parent categories (those that have
         # subcategories) must never be chosen; the LLM should always pick the specific child.
         leaf_cats = [cat for cat in self.categories.keys() if cat not in self.subcategories]
@@ -216,7 +353,7 @@ Examples of INCORRECT responses (DO NOT USE):
 - "Food & Dining" (wrong - use "Dining")
 - "Health & Wellness" (wrong - use "Healthcare")
 - "Electronics" (wrong - use "Shopping")
-- "Software" (wrong - use "Subscriptions")
+- "Software" (wrong - use "Subscriptions"){priming}
 
 RESPOND WITH ONLY THE CATEGORY NAME FROM THE LIST ABOVE.
 No explanations, no variations, just copy-paste the exact category.
@@ -226,16 +363,21 @@ Your answer:"""
         try:
             result = ''
 
-            resp = requests.post(
+            resp = _HTTP.post(
                 f'{self.llm_host}/api/chat',
                 json={
                     'model': model,
                     'messages': [{'role': 'user', 'content': prompt}],
                     'stream': False,
                     'think': False,
+                    'keep_alive': _KEEP_ALIVE,
                     'options': {
                         'temperature': 0.1,
-                        'num_predict': 1024,
+                        # Category names are 1–3 tokens.  1024 was previously
+                        # allocated here, letting weaker models ramble for a
+                        # full response before the validator rejected it.
+                        'num_predict': 30,
+                        'stop': ['\n\n', '```', '<|end|>', '<|im_end|>'],
                     },
                 },
                 timeout=120,
@@ -297,9 +439,145 @@ Your answer:"""
             print(f"  [LLM] Error calling {model} for {merchant}: {type(e).__name__}: {str(e)}")
         
         return None
-    
+
+    def _categorize_batch_with_llm(
+        self,
+        merchants_amounts: List[tuple],
+        batch_size: int = 8,
+    ) -> Dict[str, Optional[str]]:
+        """
+        Send *batch_size* merchants to the LLM in a single call instead of one
+        call per transaction.  On Ryzen 5/7 hardware a batch of 8 completes in
+        roughly the same wall-clock time as 1–2 individual calls.
+
+        Args:
+            merchants_amounts: list of (merchant_name, amount_or_None) tuples
+            batch_size: max items per LLM call (keep ≤ 10 for slower hardware)
+
+        Returns:
+            dict mapping merchant_name → category (or None on failure)
+        """
+        if not self.llm_available or not merchants_amounts:
+            return {}
+
+        leaf_cats = [cat for cat in self.categories.keys() if cat not in self.subcategories]
+        categories_list = "\n".join(f"- {cat}" for cat in leaf_cats)
+
+        results: Dict[str, Optional[str]] = {}
+
+        # ── Pre-filter: honour the per-run cache (loop guard + dedup) ────────
+        # For every input merchant, either serve from the run cache (including
+        # cached-None → already-tried, don't retry) or add it to the LLM queue.
+        # Within the queue, deduplicate by normalized key so the same merchant
+        # doesn't consume two batch slots.
+        queue: List[Tuple[str, Optional[float]]] = []
+        seen_keys: Set[str] = set()
+        for merchant, amount in merchants_amounts:
+            hit, cached = self._run_cache_lookup(merchant)
+            if hit:
+                if cached is not None:
+                    results[merchant] = cached
+                # cached=None → intentionally skip; caller will treat as Uncategorized
+                continue
+            key = self._run_norm_key(merchant)
+            if key in seen_keys:
+                continue  # will be resolved via cache on next lookup after first write
+            seen_keys.add(key)
+            queue.append((merchant, amount))
+
+        if not queue:
+            return results
+
+        # Process in chunks of batch_size
+        for chunk_start in range(0, len(queue), batch_size):
+            chunk = queue[chunk_start: chunk_start + batch_size]
+
+            # Build numbered merchant list
+            merchant_lines = "\n".join(
+                f"{i + 1}. {merchant}"
+                + (f" (${amount:.2f})" if amount else "")
+                for i, (merchant, amount) in enumerate(chunk)
+            )
+
+            # Rebuild priming each chunk so earlier chunks' successes feed later chunks.
+            priming = self._build_priming_context()
+            self._run_stats['llm_calls'] += 1
+            if priming:
+                self._run_stats['primed_calls'] += 1
+
+            prompt = f"""Categorize each merchant into exactly one category from the list.
+Reply with ONLY numbered lines: "N. CategoryName"
+No explanations. No extra text. One line per merchant.
+
+VALID CATEGORIES:
+{categories_list}
+
+MERCHANTS:
+{merchant_lines}{priming}
+
+Your response:"""
+
+            try:
+                resp = _HTTP.post(
+                    f'{self.llm_host}/api/chat',
+                    json={
+                        'model':      self.llm_model,
+                        'messages':   [{'role': 'user', 'content': prompt}],
+                        'stream':     False,
+                        'think':      False,
+                        'keep_alive': _KEEP_ALIVE,
+                        'options':  {
+                            'temperature': 0.0,
+                            'num_predict': 256,
+                            'stop':        ['<|end|>', '<|im_end|>', '\n\n\n'],
+                        },
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                msg     = resp.json().get('message', {})
+                content = (msg.get('content') or '').strip()
+                # Strip any residual thinking tags
+                content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+
+                # Parse "N. CategoryName" lines
+                for line in content.split('\n'):
+                    line = line.strip()
+                    m = re.match(r'^(\d+)[.)]\s*(.+)$', line)
+                    if not m:
+                        continue
+                    idx = int(m.group(1)) - 1
+                    if idx < 0 or idx >= len(chunk):
+                        continue
+                    merchant, _ = chunk[idx]
+                    cat_raw     = m.group(2).strip().strip('"').strip("'")
+                    # Validate against leaf categories (case-insensitive)
+                    matched = next(
+                        (c for c in leaf_cats if c.lower() == cat_raw.lower()),
+                        None
+                    )
+                    # Partial match fallback
+                    if not matched:
+                        matched = next(
+                            (c for c in leaf_cats
+                             if cat_raw.lower() in c.lower() or c.lower() in cat_raw.lower()),
+                            None
+                        )
+                    if matched:
+                        results[merchant] = matched
+
+            except Exception as exc:
+                print(f"  [LLM batch] chunk starting at {chunk_start} failed: {exc}")
+
+            # Write back every merchant in this chunk — success or miss — so the
+            # per-run cache reflects a decision and later calls short-circuit.
+            for merchant, _ in chunk:
+                self._run_cache_write(merchant, results.get(merchant))
+
+        return results
+
     def categorize_transaction(
-        self, 
+        self,
         description: str,
         amount: float = None
     ) -> str:
@@ -332,15 +610,22 @@ Your answer:"""
             for pattern in patterns:
                 if pattern.lower() in description_lower:
                     return category
-        
-        # PRIORITY 3: If uncategorized and LLM is available, try LLM
+
+        # PRIORITY 3: Per-run cache — reuse any LLM decision already made this
+        # run for the same normalized merchant.  This also short-circuits the
+        # loop-guard case (cached None → return Uncategorized without retrying).
+        hit, cached = self._run_cache_lookup(description)
+        if hit:
+            return cached or 'Uncategorized'
+
+        # PRIORITY 4: If uncategorized and LLM is available, try LLM
         if self.llm_available:
             llm_category = self._categorize_with_llm(description, amount)
             if llm_category:
                 return llm_category
-        
+
         return 'Uncategorized'
-    
+
     def categorize_dataframe(
         self,
         df: pd.DataFrame,
@@ -349,7 +634,12 @@ Your answer:"""
     ) -> pd.DataFrame:
         """
         Add category column to a DataFrame of transactions.
-        
+
+        Applies merchant-history and keyword rules first (no LLM cost), then
+        batches any remaining uncategorized rows through the LLM in groups of 8
+        instead of one call per transaction.  Individual LLM fallback is used
+        for any row the batch call cannot resolve.
+
         Args:
             df: DataFrame with transactions
             description_column: Name of column containing merchant names
@@ -360,19 +650,68 @@ Your answer:"""
         """
         if description_column not in df.columns:
             raise ValueError(f"Column '{description_column}' not found in DataFrame")
-        
-        # Categorize with or without amount column
-        if amount_column in df.columns:
-            df['category'] = df.apply(
-                lambda row: self.categorize_transaction(
-                    row[description_column], 
-                    row[amount_column]
-                ), 
-                axis=1
-            )
-        else:
-            df['category'] = df[description_column].apply(self.categorize_transaction)
-        
+
+        has_amount = amount_column in df.columns
+        df = df.copy()
+
+        # Fresh per-run cache — one categorize_dataframe call = one "run".
+        # See reset_run_cache() docstring.
+        self.reset_run_cache()
+
+        # ── Pass 1: merchant-history + keyword matching (no LLM) ─────────────
+        def _non_llm(row):
+            merchant = row[description_column]
+            merchant_lower = str(merchant).lower()
+            # Merchant history
+            if self.merchant_history:
+                hist_cat = self.merchant_history.get_category(merchant)
+                if hist_cat and hist_cat not in self.subcategories:
+                    return hist_cat
+            # Keyword patterns
+            for category, patterns in self.categories.items():
+                for pattern in patterns:
+                    if pattern.lower() in merchant_lower:
+                        return category
+            return None  # needs LLM
+
+        df['category'] = df.apply(_non_llm, axis=1)
+
+        # ── Pass 2: batch LLM for uncategorized rows ──────────────────────────
+        if self.llm_available:
+            needs_llm = df['category'].isna()
+            if needs_llm.any():
+                uncategorized_idx = df.index[needs_llm].tolist()
+                merchants_amounts = [
+                    (
+                        df.at[idx, description_column],
+                        float(df.at[idx, amount_column]) if has_amount else None,
+                    )
+                    for idx in uncategorized_idx
+                ]
+                batch_results = self._categorize_batch_with_llm(merchants_amounts)
+
+                still_missing = []
+                for idx in uncategorized_idx:
+                    merchant = df.at[idx, description_column]
+                    if merchant in batch_results and batch_results[merchant]:
+                        df.at[idx, 'category'] = batch_results[merchant]
+                    else:
+                        still_missing.append(idx)
+
+                # ── Pass 3: individual fallback for any batch misses ──────────
+                for idx in still_missing:
+                    merchant = df.at[idx, description_column]
+                    amount   = float(df.at[idx, amount_column]) if has_amount else None
+                    cat      = self._categorize_with_llm(merchant, amount)
+                    if cat:
+                        df.at[idx, 'category'] = cat
+
+        df['category'] = df['category'].fillna('Uncategorized')
+
+        # End-of-run visibility on cache/priming effectiveness.
+        if self.llm_available:
+            print(f"  {self.run_cache_stats_line()}")
+
         return df
     
     def add_custom_category(

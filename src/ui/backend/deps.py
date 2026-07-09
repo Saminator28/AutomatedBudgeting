@@ -19,6 +19,7 @@ import re
 import logging
 import json as _json
 import threading
+import time as _time
 import os
 from pathlib import Path
 
@@ -52,6 +53,118 @@ _WRITE_API_KEY   = os.environ.get("AUTOBUDGET_API_KEY", "").strip()
 # ── Background job store ──────────────────────────────────────────────────────
 _jobs: dict      = {}   # job_id → {status, output, errors, started_at}
 _jobs_lock       = threading.Lock()
+
+# ── Chat session store ────────────────────────────────────────────────────────
+# Keeps ChatbotAssistant instances alive across HTTP requests so conv_state and
+# the accumulated message list persist for the lifetime of a conversation.
+_chat_sessions: dict = {}   # session_id → {assistant, model_name, last_active}
+_chat_sessions_lock  = threading.Lock()
+_CHAT_SESSION_TTL    = 7200  # seconds — idle sessions are pruned after 2 hours
+
+
+def _hydrate_assistant_from_db(assistant, session_id: str) -> bool:
+    """Populate *assistant* with messages, conv_state, and summary from the DB row.
+
+    Returns True if a row was found and loaded.  Silently returns False when the
+    session does not yet exist so first-turn creation continues normally.
+    """
+    from src.ai_analysis.chatbot_assistant import load_session, ConversationState
+    row = load_session(session_id)
+    if not row:
+        return False
+    # Only accept user/assistant messages with string content — refuse anything
+    # else so a corrupt row can't inject system prompts or non-string payloads.
+    assistant._messages = [
+        {'role': m['role'], 'content': m['content']}
+        for m in (row.get('messages') or [])
+        if isinstance(m, dict)
+        and m.get('role') in ('user', 'assistant')
+        and isinstance(m.get('content'), str)
+    ]
+    assistant.conv_state = ConversationState.from_dict(row.get('conv_state') or {})
+    summary = row.get('summary')
+    if isinstance(summary, str) and summary.strip():
+        assistant._session_summary = summary
+    return True
+
+
+def get_or_create_chat_session(session_id: str, model_name: str):
+    """Return the cached ChatbotAssistant for *session_id*, creating one if needed.
+
+    On cache miss the assistant is hydrated from the ``chat_sessions`` DB row
+    (if any) so history survives server restarts.  If Settings changes the
+    model on an active session, a fresh assistant is built and re-hydrated
+    from the DB so accumulated context isn't dropped.
+
+    Also prunes any sessions that have been idle longer than _CHAT_SESSION_TTL.
+    Thread-safe; callers must not hold _chat_sessions_lock before calling this.
+    """
+    from src.ai_analysis.chatbot_assistant import ChatbotAssistant  # local — avoids circular import
+    now = _time.monotonic()
+    with _chat_sessions_lock:
+        # Prune stale sessions so memory doesn't grow unbounded on a long-running server
+        stale = [
+            sid for sid, entry in _chat_sessions.items()
+            if now - entry['last_active'] > _CHAT_SESSION_TTL
+        ]
+        for sid in stale:
+            del _chat_sessions[sid]
+            logging.info(f'💬 Chat session pruned (idle): {sid}')
+
+        entry = _chat_sessions.get(session_id)
+        if entry is not None:
+            # If the model was changed in Settings, start a fresh assistant for the session
+            # but re-hydrate history from the DB so the user does not lose context.
+            if entry['model_name'] != model_name:
+                new_assistant = ChatbotAssistant(model_name=model_name)
+                _hydrate_assistant_from_db(new_assistant, session_id)
+                entry['assistant']  = new_assistant
+                entry['model_name'] = model_name
+                logging.info(f'💬 Chat session model updated: {session_id} → {model_name}')
+            entry['last_active'] = now
+            return entry['assistant']
+
+        assistant = ChatbotAssistant(model_name=model_name)
+        _hydrate_assistant_from_db(assistant, session_id)
+        _chat_sessions[session_id] = {
+            'assistant':   assistant,
+            'model_name':  model_name,
+            'last_active': now,
+        }
+        logging.info(f'💬 New chat session created: {session_id} (model={model_name})')
+        return assistant
+
+
+def persist_chat_session(session_id: str, assistant) -> None:
+    """Save *assistant*'s messages, conversation state, and summary to the DB.
+
+    Auto-generates a title from the first user message when the row is new.
+    Silently swallows DB errors so a failed persist never breaks the chat turn.
+    """
+    from src.ai_analysis.chatbot_assistant import save_session
+    try:
+        first_user = next(
+            (m['content'] for m in assistant._messages if m.get('role') == 'user'),
+            '',
+        )
+        title = (first_user[:60] + '…') if len(first_user) > 60 else first_user
+        summary = getattr(assistant, '_session_summary', None)
+        save_session(
+            session_id,
+            title,
+            assistant._messages,
+            assistant.conv_state.to_dict(),
+            summary=summary,
+        )
+    except Exception as exc:
+        logging.warning(f'persist_chat_session failed for {session_id[:8]}…: {exc}')
+
+
+def evict_chat_session(session_id: str) -> None:
+    """Remove *session_id* from the in-memory cache (DB row untouched)."""
+    with _chat_sessions_lock:
+        _chat_sessions.pop(session_id, None)
+
 
 # ── Keyword lists (mutated in-place so direct imports stay current) ───────────
 _INVESTMENT_PLATFORM_KEYWORDS: list = []

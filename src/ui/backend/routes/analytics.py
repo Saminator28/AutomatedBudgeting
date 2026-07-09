@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import uuid
 from pathlib import Path
 
 import requests
@@ -13,6 +14,8 @@ from fastapi.responses import JSONResponse
 from src.ui.backend.deps import (
     _PROJECT_ROOT,
     _query_df,
+    get_or_create_chat_session,
+    persist_chat_session,
 )
 
 _OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
@@ -1291,31 +1294,86 @@ async def check_chat_availability():
         return {"available": False, "model_name": None}
 
 
-@router.post("/api/chat")
-async def chat_with_assistant(request: dict = Body(...)):
-    """Interactive AI chatbot for financial analysis and expense management."""
-    try:
-        from src.ai_analysis.chatbot_assistant import ChatbotAssistant
+# ── Chat session management ────────────────────────────────────────────────────
 
-        month = request.get('month')
-        message = request.get('message')
+@router.get("/api/chat/sessions")
+async def list_chat_sessions():
+    """
+    Return all saved chat sessions ordered newest-first.
+    Each item: session_id, title, created_at, updated_at, message_count.
+    """
+    try:
+        from src.ai_analysis.chatbot_assistant import list_sessions
+        return {"sessions": list_sessions()}
+    except Exception as e:
+        logging.exception("Failed to list chat sessions")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.get("/api/chat/sessions/{session_id}")
+async def get_chat_session(session_id: str):
+    """Return the full message history and metadata for a single session."""
+    try:
+        from src.ai_analysis.chatbot_assistant import load_session
+        row = load_session(session_id)
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "Session not found"})
+        return row
+    except Exception as e:
+        logging.exception("Failed to get chat session")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.delete("/api/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session from the DB and evict it from the in-memory cache."""
+    try:
+        from src.ai_analysis.chatbot_assistant import delete_session
+        ok = delete_session(session_id)
+        if not ok:
+            return JSONResponse(status_code=404, content={"error": "Session not found or delete failed"})
+        return {"deleted": True, "session_id": session_id}
+    except Exception as e:
+        logging.exception("Failed to delete chat session")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.post("/api/chat")
+def chat_with_assistant(request: dict = Body(...)):
+    """Interactive AI chatbot for financial analysis and expense management.
+
+    Accepts an optional ``session_id`` in the request body.  When provided the
+    same ChatbotAssistant instance (with its accumulated ConversationState and
+    message history) is reused across turns, giving the model genuine multi-turn
+    context.  A fresh ``session_id`` (UUID4) is generated and returned whenever
+    one is not supplied so clients can start echoing it back on the next request.
+
+    Declared as a plain ``def`` (not ``async def``) so FastAPI runs it in a
+    threadpool.  The Ollama calls inside ``process_message`` use blocking
+    ``requests.post``; running in a threadpool prevents a slow model turn from
+    stalling every other request on the event loop.
+    """
+    try:
+        month                = request.get('month')
+        message              = request.get('message')
         conversation_history = request.get('conversation_history', [])
+        session_id           = request.get('session_id') or str(uuid.uuid4())
 
         if not message:
             return JSONResponse(status_code=400, content={"error": "Missing required field: message"})
 
         config_path = _PROJECT_ROOT / 'config' / 'llm_models.json'
-        model_name = None
+        model_name  = None
 
         if config_path.exists():
             with open(config_path) as f:
-                config = json.load(f)
+                config     = json.load(f)
                 model_name = config.get('financial_analysis_model', '')
 
         if model_name:
             try:
-                resp = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
-                model_names = [m['name'] for m in resp.json().get('models', [])]
+                resp         = requests.get(f'{_OLLAMA_HOST}/api/tags', timeout=3)
+                model_names  = [m['name'] for m in resp.json().get('models', [])]
                 is_available = any(
                     model_name in name or name.startswith(model_name + ':')
                     for name in model_names
@@ -1331,18 +1389,27 @@ async def chat_with_assistant(request: dict = Body(...)):
         else:
             logging.info("📊 Chat using rule-based fallback (no model configured)")
 
-        chatbot = ChatbotAssistant(model_name=model_name)
+        # Reuse (or create) the server-side assistant for this session.  The
+        # helper hydrates messages + conv_state + summary from the DB when the
+        # session already exists on disk.
+        chatbot = get_or_create_chat_session(session_id, model_name or "")
+
         result = chatbot.process_message(month, message, conversation_history)
 
+        # Persist the updated history to the chat_sessions table so the
+        # conversation survives a server restart.  Failures are logged but
+        # never surface to the caller.
+        persist_chat_session(session_id, chatbot)
+
         expenses_count = len(result.get('expenses') or []) if result.get('expenses') is not None else 0
-        logging.info(f"💬 Chat processed: {message[:50]}... → {expenses_count} expenses returned")
+        logging.info(f"💬 Chat [{session_id[:8]}…]: {message[:50]}… → {expenses_count} expenses returned")
 
         return JSONResponse(
-            content=result,
+            content={**result, "session_id": session_id},
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
+                "Pragma":        "no-cache",
+                "Expires":       "0",
             }
         )
 
