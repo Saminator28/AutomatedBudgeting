@@ -60,6 +60,8 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
   const [chatLoading, setChatLoading] = useState(false);
   const [chatAvailable, setChatAvailable] = useState(false);
   const [chatSessionId, setChatSessionId] = useState(null);
+  const [chatSessions, setChatSessions] = useState([]);
+  const [showChatHistory, setShowChatHistory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [availableMonths, setAvailableMonths] = useState([]);
@@ -176,6 +178,9 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
         const response = await fetch('http://localhost:8000/api/chat/available');
         const data = await response.json();
         setChatAvailable(data.available);
+        // Warm the sessions list so the History dropdown is populated
+        // the first time the user opens the chat tab.
+        if (data.available) loadChatSessions();
       } catch (error) {
         console.error('Failed to check chat availability:', error);
         setChatAvailable(false);
@@ -470,6 +475,75 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
     }
   };
 
+  // ── Chat session management ─────────────────────────────────────────────
+  // Server-side persistence already exists (chat_sessions table + save_session
+  // hook on every POST /api/chat).  These helpers surface the list/load/delete
+  // APIs so the user can resume any past conversation.
+
+  const loadChatSessions = async () => {
+    try {
+      const res  = await fetch('http://localhost:8000/api/chat/sessions');
+      const data = await res.json();
+      setChatSessions(Array.isArray(data.sessions) ? data.sessions : []);
+    } catch (err) {
+      console.error('Failed to load chat sessions:', err);
+      setChatSessions([]);
+    }
+  };
+
+  const resumeChatSession = async (sid) => {
+    try {
+      const res = await fetch(`http://localhost:8000/api/chat/sessions/${sid}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setChatMessages(Array.isArray(data.messages) ? data.messages : []);
+      setChatSessionId(sid);
+      setShowChatHistory(false);
+    } catch (err) {
+      console.error('Failed to resume chat session:', err);
+    }
+  };
+
+  const startNewChat = () => {
+    setChatMessages([]);
+    setChatSessionId(null);
+    setShowChatHistory(false);
+  };
+
+  const deleteChatSessionById = async (sid) => {
+    // Chat history can contain financial context (goals, budget commitments,
+    // corrections).  Deletion is irreversible, so confirm before proceeding.
+    if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
+    try {
+      const res = await fetch(`http://localhost:8000/api/chat/sessions/${sid}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // If we deleted the active session, reset the chat view.
+      if (sid === chatSessionId) {
+        setChatMessages([]);
+        setChatSessionId(null);
+      }
+      await loadChatSessions();
+    } catch (err) {
+      console.error('Failed to delete chat session:', err);
+    }
+  };
+
+  const formatChatTimestamp = (iso) => {
+    if (!iso) return '';
+    // Backend stores UTC via datetime.utcnow().isoformat() — append 'Z' so
+    // the browser interprets it as UTC and renders it in the user's locale.
+    const isoZ = iso.endsWith('Z') ? iso : `${iso}Z`;
+    const d    = new Date(isoZ);
+    if (Number.isNaN(d.getTime())) return iso;
+    const now  = new Date();
+    const diff = (now - d) / 1000; // seconds
+    if (diff < 60)      return 'just now';
+    if (diff < 3600)    return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400)   return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 604800)  return `${Math.floor(diff / 86400)}d ago`;
+    return d.toLocaleDateString();
+  };
+
   const sendChatMessage = async () => {
     if (!chatInput.trim()) return;
     
@@ -509,6 +583,10 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
         ...updatedMessages,
         { role: 'assistant', content: data.response, expenses: data.expenses, actions_taken: data.actions_taken }
       ]);
+
+      // Refresh the sessions list so the current chat surfaces with its
+      // updated title, timestamp, and message count.  Fire-and-forget.
+      loadChatSessions();
     } catch (error) {
       console.error('Chat error:', error);
       setChatMessages([
@@ -2223,6 +2301,66 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
 
       {activeTab === 'chat' && (
         <div className="tab-content chat-container">
+          {/* Session toolbar: start a new chat or resume a past one */}
+          <div className="chat-toolbar">
+            <button
+              className="chat-toolbar-btn primary"
+              onClick={startNewChat}
+              title="Start a fresh conversation"
+              disabled={chatLoading}
+            >
+              + New chat
+            </button>
+            <div className="chat-toolbar-right">
+              <button
+                className={`chat-toolbar-btn ${showChatHistory ? 'active' : ''}`}
+                onClick={() => {
+                  const next = !showChatHistory;
+                  setShowChatHistory(next);
+                  if (next) loadChatSessions();
+                }}
+                title="Show past conversations"
+              >
+                History ({chatSessions.length}) {showChatHistory ? '▴' : '▾'}
+              </button>
+            </div>
+            {showChatHistory && (
+              <div className="chat-sessions-dropdown" role="listbox">
+                {chatSessions.length === 0 && (
+                  <div className="chat-sessions-empty">
+                    No past conversations yet. Send a message to start one.
+                  </div>
+                )}
+                {chatSessions.map((s) => (
+                  <div
+                    key={s.session_id}
+                    className={`chat-session-row ${s.session_id === chatSessionId ? 'active' : ''}`}
+                    onClick={() => resumeChatSession(s.session_id)}
+                    role="option"
+                    aria-selected={s.session_id === chatSessionId}
+                  >
+                    <div className="chat-session-main">
+                      <div className="chat-session-title">
+                        {s.title || 'Untitled conversation'}
+                      </div>
+                      <div className="chat-session-meta">
+                        {s.message_count} msg · {formatChatTimestamp(s.updated_at)}
+                      </div>
+                    </div>
+                    <button
+                      className="chat-session-delete"
+                      onClick={(e) => { e.stopPropagation(); deleteChatSessionById(s.session_id); }}
+                      title="Delete this conversation"
+                      aria-label="Delete conversation"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* Welcome screen (no messages yet) */}
           {chatMessages.length === 0 && (
             <div className="chat-welcome">

@@ -18,6 +18,10 @@ from .pdf_extractor import extract_text_from_pdf, validate_transactions
 # Add parent directory for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+# Per-run priming cap — see StatementParser._clean_merchant_name_with_llm.
+# 30 examples ≈ 1.5–2 KB of extra prompt, negligible on local models.
+_RUN_CLEAN_EXAMPLE_MAX = 30
+
 # US + Canadian state/province abbreviations — stripped from description tails before LLM
 _STATE_ABBREVS = frozenset({
     'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
@@ -135,6 +139,20 @@ class StatementParser:
         self.raw_to_clean_cache = {}   # normalize(Place_Original) -> Place
         self.clean_name_fp = {}        # normalize(Place) -> Place (for prefix lookup)
         self._load_user_corrections_from_csvs()  # Load from CSV files
+
+        # ── Per-run cleaning cache + priming ─────────────────────────────────
+        # Populated during a single month's parse; reset by reset_run_cache().
+        # Guarantees: (a) the same normalized raw text is only sent to the LLM
+        # once per run — every subsequent occurrence returns the same clean
+        # name; (b) later transactions in the same run get earlier cleanings
+        # as few-shot examples so casing/abbreviation handling stays uniform.
+        self._run_raw_to_clean: dict = {}          # norm_raw → cleaned (always stores an answer)
+        self._run_clean_examples: list = []        # (raw_snippet, cleaned) FIFO, max _RUN_CLEAN_EXAMPLE_MAX
+        self._run_stats: dict = {
+            'hits': 0,         # norm_raw already cached this run
+            'llm_calls': 0,    # actual _clean_merchant_name_with_llm invocations that went to the LLM
+            'primed_calls': 0, # LLM calls that carried ≥1 priming example
+        }
 
 
     
@@ -740,9 +758,18 @@ class StatementParser:
 
         raw_fp = self._normalize_raw(name)
 
+        # 0. Per-run cache — loop guard + within-run consistency.
+        #    Same normalized raw text seen twice in the same run always returns
+        #    the same cleaned string, even if the LLM previously failed (in which
+        #    case the cached value is the raw name itself).
+        if raw_fp in self._run_raw_to_clean:
+            self._run_stats['hits'] += 1
+            return self._run_raw_to_clean[raw_fp]
+
         # 1. Exact raw-original match — we've cleaned this exact transaction text before.
         cached = self.raw_to_clean_cache.get(raw_fp)
         if cached:
+            self._run_raw_to_clean[raw_fp] = cached  # also seed run cache
             return cached
 
         # 2. Clean-name fingerprint prefix match.
@@ -751,6 +778,7 @@ class StatementParser:
         #    concatenated-word ambiguity without calling the LLM.
         fp_match = self._find_clean_name_by_fp_prefix(raw_fp)
         if fp_match:
+            self._run_raw_to_clean[raw_fp] = fp_match
             return fp_match
 
         # 3. Pre-process before LLM:
@@ -764,12 +792,19 @@ class StatementParser:
         name = self._presplit_merged_tokens(name)
 
         # 4. LLM — pass nearby known names as in-context examples so the model
-        #    produces consistent output for similar-looking raw texts.
+        #    produces consistent output for similar-looking raw texts.  Also
+        #    inject this run's earlier cleanings so decisions stay stylistically
+        #    consistent (casing, abbreviation handling) across the whole batch.
         known_names = self._find_relevant_known_names(raw_fp)
+        recent = list(self._run_clean_examples) or None
 
         # Use ensemble if secondary model is configured
         secondary = self.secondary_model if self.use_multi_model else None
-        
+
+        self._run_stats['llm_calls'] += 1
+        if recent:
+            self._run_stats['primed_calls'] += 1
+
         cleaned = clean_merchant_with_ensemble(
             merchant=name,
             primary_model=self.primary_model,
@@ -777,10 +812,40 @@ class StatementParser:
             amount=amount,
             date=date,
             known_names=known_names or None,
+            recent_cleanings=recent,
             debug=hasattr(self, 'debug') and self.debug
         )
-        
-        return cleaned if cleaned else name
+
+        result = cleaned if cleaned else name
+        # Always cache the outcome — even if LLM returned the raw name — so we
+        # never re-invoke the model on the same normalized input in this run.
+        self._run_raw_to_clean[raw_fp] = result
+        # Only feed the priming pool with real cleanings (not raw fallbacks).
+        if cleaned and cleaned.strip().upper() != name.strip().upper():
+            self._run_clean_examples.append((name[:70], result))
+            # FIFO eviction to bound prompt growth.
+            while len(self._run_clean_examples) > _RUN_CLEAN_EXAMPLE_MAX:
+                self._run_clean_examples.pop(0)
+
+        return result
+
+    # ── Per-run cache management ────────────────────────────────────────────
+    def reset_run_cache(self) -> None:
+        """Clear the per-run cleaning cache, priming pool, and stats.
+        Called by scripts/process_monthly.py at the start of each month."""
+        self._run_raw_to_clean.clear()
+        self._run_clean_examples.clear()
+        for k in self._run_stats:
+            self._run_stats[k] = 0
+
+    def run_cache_stats_line(self) -> str:
+        """One-line summary of per-run cleaning cache activity."""
+        s = self._run_stats
+        return (
+            f"🧹 Parser run cache: {len(self._run_raw_to_clean)} unique raw inputs  "
+            f"| hits (dedup): {s['hits']}  "
+            f"| LLM calls: {s['llm_calls']} (primed: {s['primed_calls']})"
+        )
     
     def parse_transaction_block(self, lines: List[str], start_idx: int, statement_year: int = None) -> Tuple[Optional[Dict], int]:
         """

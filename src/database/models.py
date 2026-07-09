@@ -275,5 +275,5 @@ chat_sessions = Table(
     Column('updated_at',  Text, nullable=False),            # ISO timestamp
     Column('messages',    Text, nullable=False, server_default='[]'),   # JSON
     Column('conv_state',  Text, nullable=False, server_default='{}'),   # JSON
-    Column('summary',     Text),                            # Hermes memory summary (nullable)
+    Column('summary',     Text),                            # Finance-model session summary (nullable)
 )

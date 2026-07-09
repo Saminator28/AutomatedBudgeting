@@ -32,10 +32,9 @@
 ### AI Chatbot Assistant
 - RAG-based budget Q&A (`src/ai_analysis/chatbot_assistant.py`)
 - Answers natural-language questions about spending patterns
-- **Three-model pipeline**: intent model (primary_model) parses user message → structured JSON;
-  memory model (memory_model, e.g. `hermes3`) maintains genuine multi-turn context via a
-  persistent server-side `ChatbotAssistant` instance (session store in `deps.py`);
-  finance advisor model (financial_analysis_model) composes responses from pandas-verified facts
+- **Two-model pipeline**: intent model (`primary_model`) parses user message → structured JSON;
+  finance advisor model (`financial_analysis_model`) composes responses from pandas-verified
+  facts and self-summarises older turns when the conversation grows long
 - **Server-side session store** (`deps.get_or_create_chat_session`): the assistant instance lives
   across HTTP requests so `ConversationState` and the message list persist for the session lifetime
 - Batched transaction categorization (8 items/LLM call) in `categorizer.py`
@@ -43,14 +42,12 @@
 - Anti-loop measures: `think=False`, stop sequences, `num_predict` cap, `_is_looping` / `_truncate_loop`
 - Regex-based intent fallback when the intent model is unavailable
 - **Persistent chat sessions** — conversation history and `ConversationState` stored in
-  `chat_sessions` DB table; server-side session cache (`_SESSION_CACHE`) reuses live
+  `chat_sessions` DB table; process-level session cache in `deps.py` reuses live
   `ChatbotAssistant` instances so no cold-start on every request
-- **Hermes memory model** — optional `memory_model` in `config/llm_models.json`; when set,
-  long sessions are automatically summarised so context survives beyond the finance advisor's
-  context window
-- **Batch categorization session** — `categorizer.py` `categorize_batch_with_session()` runs
-  an entire batch of merchants through a single persistent Ollama session instead of one call
-  per merchant, improving consistency and reducing cold-start overhead
+- **Self-summarisation of long sessions** — once a session crosses
+  `SESSION_SUMMARY_THRESHOLD` turns the finance model itself is asked to compress
+  older turns into a compact summary paragraph that gets injected into subsequent
+  system prompts.  No separate memory model required.
 
 ---
 
@@ -990,11 +987,11 @@ After writing transactions to DB, snapshot `budget_goals` into `budget_history` 
 
 ---
 
-## AI Architecture: Hermes Memory Management & Persistent Sessions
+## AI Architecture: Persistent Chat Sessions & Long-Session Summarisation
 
-This section documents the design decisions and integration plan for using
-a Hermes-family model as the **memory manager** across both the GUI chatbot and
-the transaction categorization/cleaning pipeline.
+This section documents the design decisions and integration plan for keeping
+chatbot state alive across HTTP requests and for compressing long
+conversations so the finance advisor never runs out of context window.
 
 ---
 
@@ -1014,23 +1011,25 @@ inconsistent results and unnecessary latency.**
 
 ---
 
-### Solution: Hermes as the Memory Layer
+### Solution: Persistent Assistants + Self-Summarisation
 
-[Hermes](https://huggingface.co/NousResearch) (NousResearch Hermes-3 and
-variants) is optimised for **agentic loops, tool calling, and structured memory
-management**.  Its system-prompt following and JSON-mode reliability make it a
-natural fit as the memory layer.
+Instead of relying on a separate memory model, the current design keeps the
+`ChatbotAssistant` instance alive across requests (so the Python message list
+grows across turns) and asks the **same finance model** to summarise its own
+older turns when the conversation gets long.  That keeps the model count down
+to two (`primary_model` + `financial_analysis_model`) while still giving the
+advisor unbounded conversation length via the injected summary block.
 
-The memory model is configured in `config/llm_models.json`:
+The finance model is configured in `config/llm_models.json`:
 
 ```json
 {
-  "memory_model": "hermes3"
+  "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor"
 }
 ```
 
-Set to an empty string `""` to disable memory summarisation (the system still
-works — it just trims to a raw 8-turn window instead of a compressed summary).
+Any Ollama chat model can be substituted.  The summariser prompt is a
+different-purpose call to the same model — no second install required.
 
 ---
 
@@ -1040,9 +1039,9 @@ works — it just trims to a raw 8-turn window instead of a compressed summary).
 
 | Component | Location | Description |
 |-----------|----------|-------------|
-| `chat_sessions` DB table | `src/database/models.py` | Stores `session_id`, `title`, `messages` (JSON), `conv_state` (JSON), `summary` (Hermes output) |
-| `_SESSION_CACHE` | `src/ai_analysis/chatbot_assistant.py` | Module-level dict of live `ChatbotAssistant` instances keyed by `session_id` |
-| `get_or_create_assistant()` | `chatbot_assistant.py` | Returns cached instance or reconstructs from DB on server restart |
+| `chat_sessions` DB table | `src/database/models.py` | Stores `session_id`, `title`, `messages` (JSON), `conv_state` (JSON), `summary` (finance-model output) |
+| Process-level session cache | `src/ui/backend/deps.py` | Dict of live `ChatbotAssistant` instances keyed by `session_id` |
+| `get_or_create_chat_session()` | `deps.py` | Returns cached instance or reconstructs from DB on server restart |
 | `ConversationState.to_dict()` / `from_dict()` | `chatbot_assistant.py` | Serialises/deserialises `active_period`, `active_category`, goals, etc. |
 | `save_session()` / `load_session()` | `chatbot_assistant.py` | DB read/write helpers |
 | `list_sessions()` / `delete_session()` | `chatbot_assistant.py` | Session management helpers |
@@ -1050,7 +1049,7 @@ works — it just trims to a raw 8-turn window instead of a compressed summary).
 | `GET /api/chat/sessions/{id}` | `routes/analytics.py` | Get one session |
 | `DELETE /api/chat/sessions/{id}` | `routes/analytics.py` | Delete a session |
 | `POST /api/chat` (updated) | `routes/analytics.py` | Accepts `session_id`; persists history and state after each turn |
-| `_summarize_session()` | `chatbot_assistant.py` | Calls `memory_model` to compress old turns |
+| `_summarize_session()` | `chatbot_assistant.py` | Runs the finance model with a summariser prompt to compress old turns |
 
 #### How a conversation turn flows (new)
 
@@ -1058,27 +1057,24 @@ works — it just trims to a raw 8-turn window instead of a compressed summary).
 Client → POST /api/chat { message, session_id? }
          │
          ▼
-get_or_create_assistant(session_id, model_name)
+get_or_create_chat_session(session_id, model_name)   -- deps.py
   ├── Cache hit?   → return live ChatbotAssistant (conv_state intact)
   └── Cache miss?  → load DB row → ConversationState.from_dict(conv_state)
          │
          ▼
-load_session(session_id) → full messages list from DB
-         │
-         ▼
-chatbot.process_message(month, message, messages, session_summary=summary)
-  ├── _generate_ai_response(session_summary=…)
+chatbot.process_message(month, message, seeded_history_if_any)
+  ├── _generate_ai_response()
   │     ├── conv_state already populated (no regex rebuild needed)
   │     ├── _parse_intent(user_message, last 4 turns)
   │     ├── conv_state.update_from_intent(intent)
   │     ├── _calculate_facts_with_pandas(…)
-  │     └── _call_finance_advisor(…, session_summary=summary)
-  │           └── summary injected into system prompt when present
+  │     └── _call_finance_advisor(…)
+  │           └── self._session_summary injected into system prompt when present
   └── returns { response, conversation_history }
          │
          ▼
-Check: assistant_turns >= SESSION_SUMMARY_THRESHOLD and memory_model set?
-  └── Yes → _summarize_session(messages) → new Hermes summary
+Check: assistant_turns >= SESSION_SUMMARY_THRESHOLD?
+  └── Yes → _summarize_session(messages) using finance model → new summary
          │
          ▼
 save_session(session_id, title, updated_messages, conv_state.to_dict(), summary)
@@ -1090,7 +1086,7 @@ Response includes session_id so client can persist it for next turn
 #### Memory summarisation trigger
 
 When a session reaches `SESSION_SUMMARY_THRESHOLD = 20` assistant turns the
-memory model is called.  The prompt:
+finance model is called with a summariser prompt.  The prompt:
 
 > "Summarise the following conversation into a single compact paragraph that
 > captures: the financial questions asked, the key data points discussed, any
@@ -1204,30 +1200,32 @@ merchant.  Switch to batch session when `len(merchants) > 5`.
 
 ---
 
-### Part 4: Hermes Agent Loop for Autonomous Financial Review (Future)
+### Part 4: Advisor Agent Loop for Autonomous Financial Review (Future)
 
 **Status: Design only — not implemented**  
 **Priority:** Low  
 **Complexity:** High
 
-The ultimate vision is a **Hermes agent loop** that can autonomously:
+The ultimate vision is an **advisor agent loop** that can autonomously:
 
 1. Review a newly imported month's transactions
 2. Detect anomalies (unusual merchants, large one-time expenses)
 3. Flag potential miscategorisations and suggest corrections
 4. Draft a monthly financial summary for the user to review
 
-This requires an **agentic tool-calling pattern** where Hermes can:
+This requires an **agentic tool-calling pattern** where the model can:
 
 ```
-Hermes → call get_transactions(month="2026-05") → receives transaction list
-Hermes → call get_category_averages(months=3) → receives historical benchmarks  
-Hermes → call flag_transaction(tx_hash, reason) → flags for user review
-Hermes → call draft_summary(month) → writes narrative to DB
+Advisor → call get_transactions(month="2026-05") → receives transaction list
+Advisor → call get_category_averages(months=3) → receives historical benchmarks  
+Advisor → call flag_transaction(tx_hash, reason) → flags for user review
+Advisor → call draft_summary(month) → writes narrative to DB
 ```
 
-The tool-call schema (OpenAI-compatible function calling) is already supported
-by Hermes models via Ollama's `/api/chat` with `tools` payload.
+The tool-call schema (OpenAI-compatible function calling) is supported by
+many Ollama models via `/api/chat` with a `tools` payload.  Whichever model
+is configured as `financial_analysis_model` needs to support it, or a
+dedicated tool-calling model would need to be introduced for this feature.
 
 **Prerequisites before implementing:**
 - All write endpoints need idempotent, hash-checked operations (already true for

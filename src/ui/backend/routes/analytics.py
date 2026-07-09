@@ -15,6 +15,7 @@ from src.ui.backend.deps import (
     _PROJECT_ROOT,
     _query_df,
     get_or_create_chat_session,
+    persist_chat_session,
 )
 
 _OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
@@ -1338,7 +1339,7 @@ async def delete_chat_session(session_id: str):
 
 
 @router.post("/api/chat")
-async def chat_with_assistant(request: dict = Body(...)):
+def chat_with_assistant(request: dict = Body(...)):
     """Interactive AI chatbot for financial analysis and expense management.
 
     Accepts an optional ``session_id`` in the request body.  When provided the
@@ -1346,14 +1347,17 @@ async def chat_with_assistant(request: dict = Body(...)):
     message history) is reused across turns, giving the model genuine multi-turn
     context.  A fresh ``session_id`` (UUID4) is generated and returned whenever
     one is not supplied so clients can start echoing it back on the next request.
+
+    Declared as a plain ``def`` (not ``async def``) so FastAPI runs it in a
+    threadpool.  The Ollama calls inside ``process_message`` use blocking
+    ``requests.post``; running in a threadpool prevents a slow model turn from
+    stalling every other request on the event loop.
     """
     try:
-        from src.ai_analysis.chatbot_assistant import ChatbotAssistant
-
-        month              = request.get('month')
-        message            = request.get('message')
+        month                = request.get('month')
+        message              = request.get('message')
         conversation_history = request.get('conversation_history', [])
-        session_id         = request.get('session_id') or str(uuid.uuid4())
+        session_id           = request.get('session_id') or str(uuid.uuid4())
 
         if not message:
             return JSONResponse(status_code=400, content={"error": "Missing required field: message"})
@@ -1363,7 +1367,7 @@ async def chat_with_assistant(request: dict = Body(...)):
 
         if config_path.exists():
             with open(config_path) as f:
-                config    = json.load(f)
+                config     = json.load(f)
                 model_name = config.get('financial_analysis_model', '')
 
         if model_name:
@@ -1385,10 +1389,17 @@ async def chat_with_assistant(request: dict = Body(...)):
         else:
             logging.info("📊 Chat using rule-based fallback (no model configured)")
 
-        # Reuse (or create) the server-side assistant for this session
+        # Reuse (or create) the server-side assistant for this session.  The
+        # helper hydrates messages + conv_state + summary from the DB when the
+        # session already exists on disk.
         chatbot = get_or_create_chat_session(session_id, model_name or "")
 
         result = chatbot.process_message(month, message, conversation_history)
+
+        # Persist the updated history to the chat_sessions table so the
+        # conversation survives a server restart.  Failures are logged but
+        # never surface to the caller.
+        persist_chat_session(session_id, chatbot)
 
         expenses_count = len(result.get('expenses') or []) if result.get('expenses') is not None else 0
         logging.info(f"💬 Chat [{session_id[:8]}…]: {message[:50]}… → {expenses_count} expenses returned")

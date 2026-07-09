@@ -8,7 +8,7 @@ ifeq ($(UNAME_S),Linux)
 COMPOSE_FILES += -f docker-compose.linux.yml
 endif
 
-.PHONY: help build up down logs shell clean process aggregate dashboard test models status check-compose
+.PHONY: help build up down logs shell clean process aggregate dashboard test models status check-compose check-models
 
 check-compose:
 ifeq ($(COMPOSE),)
@@ -18,13 +18,24 @@ ifeq ($(COMPOSE),)
 	@exit 1
 endif
 
+# Preflight check: refuse to start the app if any configured Ollama model
+# is missing on the host.  See scripts/preflight_models.py.
+check-models:
+	@command -v python3 >/dev/null 2>&1 || { \
+		echo "❌ python3 is required for the model preflight check."; \
+		echo "   Install Python 3, or bypass the check with: $(COMPOSE) $(COMPOSE_FILES) up -d"; \
+		exit 1; \
+	}
+	@python3 scripts/preflight_models.py
+
 help:
 	@echo "Automated Budgeting Tool - Docker Commands"
 	@echo ""
 	@echo "Setup:"
-	@echo "  make build       - Build Docker images"
-	@echo "  make up          - Start all services"
-	@echo "  make down        - Stop all services"
+	@echo "  make build         - Build Docker images"
+	@echo "  make up            - Start all services (blocks if Ollama models missing)"
+	@echo "  make down          - Stop all services"
+	@echo "  make check-models  - Verify configured Ollama models are installed (host)"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make logs        - View logs"
@@ -43,7 +54,7 @@ build: check-compose
 	@echo "🔨 Building Docker images..."
 	$(COMPOSE) $(COMPOSE_FILES) build
 
-up: check-compose
+up: check-compose check-models
 	@echo "🚀 Starting services..."
 	$(COMPOSE) $(COMPOSE_FILES) up -d
 	@echo "✅ Services started!"

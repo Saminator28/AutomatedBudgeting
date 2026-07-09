@@ -15,75 +15,53 @@ import sys
 import json
 import time
 import requests
+from requests.adapters import HTTPAdapter
 from typing import Optional
 
 OLLAMA_BASE_URL = (os.environ.get('OLLAMA_BASE_URL')
                    or os.environ.get('OLLAMA_HOST', 'http://localhost:11434'))
 
-# Track which models we've already pulled this session so we only attempt once
-_pulled_models: set = set()
+# Shared HTTP session with connection pooling so batch merchant-name cleaning
+# doesn't open a fresh TCP connection per merchant.
+_HTTP = requests.Session()
+_HTTP.mount('http://',  HTTPAdapter(pool_connections=4, pool_maxsize=8))
+_HTTP.mount('https://', HTTPAdapter(pool_connections=4, pool_maxsize=8))
+
+# Keep the cleaning model resident for an hour so a merchant-cleaning batch
+# never triggers an intermittent model reload mid-run.  Ollama /api/chat is
+# stateless; this is the correct primitive for "don't rebuild the agent per
+# transaction" — it does NOT share prompts across calls (which would poison
+# later cleanings with earlier merchant names).
+_KEEP_ALIVE = '1h'
+
+# Track which models we've already warned about this session so we don't
+# spam the log with the same "missing model" message on every call.
+_warned_models: set = set()
 
 
 # ---------------------------------------------------------------------------
-# Model auto-pull
+# Missing-model reporting
 # ---------------------------------------------------------------------------
 
-def ensure_model_pulled(model: str, base_url: str = None) -> bool:
+def warn_model_missing(model: str, base_url: str = None) -> None:
     """
-    Pull *model* from the Ollama registry if it isn't present locally.
-    Streams download progress to stdout so it is visible in the GUI job log.
-    Returns True if the pull succeeded, False otherwise.
-    Only attempts once per model per process lifetime.
+    Print a one-time, actionable message telling the user how to install a
+    missing Ollama model.  Deliberately does NOT auto-pull — model installs
+    are large and slow, and the user should decide when to run them.
     """
-    global _pulled_models
-    if model in _pulled_models:
-        return False  # already attempted this session
-    _pulled_models.add(model)
+    if model in _warned_models:
+        return
+    _warned_models.add(model)
 
-    if base_url is None:
-        base_url = OLLAMA_BASE_URL
-
-    print(f"\n⬇️  Model '{model}' not found locally — pulling from Ollama registry...")
-    print(f"   This may take several minutes depending on model size.")
-    sys.stdout.flush()
-
-    try:
-        with requests.post(
-            f'{base_url}/api/pull',
-            json={'model': model, 'stream': True},
-            stream=True,
-            timeout=3600,
-        ) as resp:
-            resp.raise_for_status()
-            last_status = ''
-            for raw_line in resp.iter_lines():
-                if not raw_line:
-                    continue
-                try:
-                    data = json.loads(raw_line)
-                except Exception:
-                    continue
-                status = data.get('status', '')
-                total     = data.get('total', 0)
-                completed = data.get('completed', 0)
-                is_progress = total and completed
-                if is_progress:
-                    pct = int(100 * completed / total)
-                    print(f"\r   {status}: {pct}%  ", end='', flush=True)
-                elif status != last_status:
-                    if last_status and total:
-                        print()  # newline after progress bar
-                    print(f"   {status}")
-                    sys.stdout.flush()
-                last_status = status
-            print()  # final newline
-        print(f"✅ Model '{model}' pulled successfully")
-        sys.stdout.flush()
-        return True
-    except Exception as exc:
-        print(f"\n❌ Failed to pull model '{model}': {exc}")
-        sys.stdout.flush()
-        return False
+    _ = base_url  # accepted for API compatibility with earlier callers; not needed
+    print(
+        f"\n❌ Ollama model '{model}' is not installed.\n"
+        f"   AI features that depend on this model will not work until you pull it.\n"
+        f"   Run this in a terminal on the machine where Ollama is installed:\n\n"
+        f"       ollama pull {model}\n\n"
+        f"   Then restart the app (e.g. `make down && make up`).",
+        flush=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -104,18 +82,19 @@ def _ollama_chat(
     This is the correct Ollama API location; putting it in options is silently ignored.
     """
     payload = {
-        'model':    model,
-        'messages': messages,
-        'stream':   False,
-        'think':    think,
-        'options':  options or {},
+        'model':      model,
+        'messages':   messages,
+        'stream':     False,
+        'think':      think,
+        'keep_alive': _KEEP_ALIVE,
+        'options':    options or {},
     }
-    resp = requests.post(f'{OLLAMA_BASE_URL}/api/chat', json=payload, timeout=timeout)
-    # Auto-pull if the model isn't present, then retry once
+    resp = _HTTP.post(f'{OLLAMA_BASE_URL}/api/chat', json=payload, timeout=timeout)
+    # If the model isn't installed, print the manual pull instruction and let
+    # the caller handle the failure — we no longer auto-pull.  Model installs
+    # are large; the user should choose when to run them.
     if resp.status_code == 404 and 'not found' in resp.text.lower():
-        pulled = ensure_model_pulled(model)
-        if pulled:
-            resp = requests.post(f'{OLLAMA_BASE_URL}/api/chat', json=payload, timeout=timeout)
+        warn_model_missing(model)
     resp.raise_for_status()
     return resp.json()
 
@@ -301,18 +280,24 @@ def _parse_answer(raw: str, debug: bool = False) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def clean_merchant_name_llm(
-    merchant:    str,
-    model:       str,
-    amount:      float = None,
-    date:        str   = None,
-    known_names: list  = None,
-    max_retries: int   = 3,
-    debug:       bool  = False,
+    merchant:         str,
+    model:            str,
+    amount:           float = None,
+    date:             str   = None,
+    known_names:      list  = None,
+    recent_cleanings: list  = None,
+    max_retries:      int   = 3,
+    debug:            bool  = False,
 ) -> Optional[str]:
     """
     Extract a clean merchant name from raw transaction text using an Ollama model.
 
     Returns 'CleanName | confidence | reasoning', or None if all retries fail.
+
+    Args:
+        recent_cleanings: optional list of (raw_snippet, cleaned_name) tuples
+            from this same processing run — injected as few-shot examples so
+            the model produces consistent output for similar-looking raw text.
     """
     # Build optional known-merchants section to anchor the LLM on previous spellings
     known_section = ''
@@ -322,6 +307,20 @@ def clean_merchant_name_llm(
 
 Known merchants from this account (use the EXACT spelling shown if the transaction matches):
 {names_list}
+"""
+
+    # Build optional priming block from earlier decisions in this same run.
+    # Purpose: keep casing, punctuation, and store-number stripping consistent
+    # across every transaction processed in the same batch.
+    recent_section = ''
+    if recent_cleanings:
+        recent_lines = '\n'.join(
+            f'  "{raw[:70]}" → "{cleaned}"' for raw, cleaned in recent_cleanings
+        )
+        recent_section = f"""
+
+Recent cleanings from this same run (match the same style — casing, spacing, and abbreviation handling):
+{recent_lines}
 """
 
     prompt = f"""Given any transaction description, your task is to extract only the full company or business name from the text provided. Remove any additional information such as dates, locations (towns/cities/states), transaction reference numbers, and irrelevant details like 'RECUR PURCHASE'. Ensure that the extracted name is free of typos and correctly spelled.
@@ -341,7 +340,7 @@ IMPORTANT:
     50-69:  Educated guess — partial match or ambiguous abbreviation
     1-49:   Low confidence — OCR corruption, unknown abbreviation, or very uncertain
 - Keep the reasoning under 20 words.
-- Respond with ONLY this format and nothing else: Name | Confidence | Reasoning{known_section}
+- Respond with ONLY this format and nothing else: Name | Confidence | Reasoning{known_section}{recent_section}
 Example:
 Transaction: "RECUR RETAILCENTER #3472 [Town Name/State] 12/25"
 Answer: Retail Center | 85 | Removed recurrence tag, location, and store number
@@ -547,27 +546,36 @@ def detect_institution_with_llm(
 
 
 def clean_merchant_with_ensemble(
-    merchant:        str,
-    primary_model:   str,
-    secondary_model: Optional[str],
-    amount:          float = None,
-    date:            str   = None,
-    known_names:     list  = None,
-    debug:           bool  = False,
+    merchant:         str,
+    primary_model:    str,
+    secondary_model:  Optional[str],
+    amount:           float = None,
+    date:             str   = None,
+    known_names:      list  = None,
+    recent_cleanings: list  = None,
+    debug:            bool  = False,
 ) -> str:
     """
     Clean a merchant name using one or two Ollama models.
     Returns just the clean name string.  Falls back to the raw original on total failure.
+
+    Args:
+        recent_cleanings: forwarded to clean_merchant_name_llm — few-shot examples
+            from this same processing run for cross-transaction consistency.
     """
     result_primary = clean_merchant_name_llm(
-        merchant, primary_model, amount, date, known_names=known_names, max_retries=3, debug=debug
+        merchant, primary_model, amount, date,
+        known_names=known_names, recent_cleanings=recent_cleanings,
+        max_retries=3, debug=debug,
     )
 
     if not secondary_model or not result_primary:
         return result_primary.split('|')[0].strip() if result_primary else merchant
 
     result_secondary = clean_merchant_name_llm(
-        merchant, secondary_model, amount, date, known_names=known_names, max_retries=3, debug=debug
+        merchant, secondary_model, amount, date,
+        known_names=known_names, recent_cleanings=recent_cleanings,
+        max_retries=3, debug=debug,
     )
 
     if not result_secondary:

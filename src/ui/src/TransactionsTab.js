@@ -360,7 +360,7 @@ export default function TransactionsTab({ formatCurrency, categories, selectedMo
           ...(patch.new_place    ? { place:    patch.new_place    } : {}),
           ...(patch.new_category ? { category: patch.new_category } : {}),
           ...(patch.new_label    ? { label:    patch.new_label    } : {}),
-          ...(patch.new_amount !== null ? { amount: patch.new_amount } : {}),
+          ...(patch.new_amount !== undefined && patch.new_amount !== null ? { amount: patch.new_amount } : {}),
         };
       }));
     } catch (err) {

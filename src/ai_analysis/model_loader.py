@@ -93,6 +93,7 @@ class FinGPTModelLoader:
                     'messages': [{'role': 'user', 'content': prompt}],
                     'stream': False,
                     'think': False,
+                    'keep_alive': '1h',
                     'options': {'temperature': temperature, 'num_predict': max_tokens},
                 },
                 timeout=120,

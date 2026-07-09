@@ -2,13 +2,10 @@
   "primary_model": "gemma4:31b",
   "secondary_model": "",
   "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor",
-
-  "memory_model": "hermes3",
   "description": "LLM model configuration for the chatbot two-model pipeline and statement categorization",
   "notes": {
     "primary_model": "Merchant name cleaning (pass 1 & arbiter) + chatbot intent parser + transaction categorization.",
-    "secondary_model": "Merchant name cleaning (pass 2 ensemble). Set to empty string to disable ensemble cleaning.",
-    "financial_analysis_model": "Chatbot step 2: conversational financial advice and multi-turn responses.",
-    "memory_model": "Optional persistent multi-turn memory model (e.g. 'hermes3'). When set, handles the conversational layer so context accumulates across turns without re-sending the full history from the client. Falls back to financial_analysis_model if empty."
+    "secondary_model": "Optional: merchant name cleaning (pass 2 ensemble). Leave empty to disable ensemble cleaning \u2014 not required.",
+    "financial_analysis_model": "Chatbot answers + self-summarization of long conversations. Handles the entire chat pipeline after intent parsing."
   }
 }

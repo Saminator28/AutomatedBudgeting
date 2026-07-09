@@ -11,11 +11,10 @@ The chatbot uses a **two-model pipeline** to answer financial questions accurate
 
 | Role | Model (from `config/llm_models.json`) | Purpose |
 |------|---------------------------------------|---------|
-| **Intent Parser** | `primary_model` (e.g. `qwen3.5:9b`) | Converts natural language → structured JSON |
-| **Finance Advisor** | `financial_analysis_model` (e.g. `ALIENTELLIGENCE/financialadvisor`) | Converts verified data → conversational response |
-| **Memory Manager** | `memory_model` (e.g. `hermes3`) | Summarises long sessions so context survives beyond the context window |
+| **Intent Parser** | `primary_model` (e.g. `gemma4:31b`) | Converts natural language → structured JSON |
+| **Finance Advisor** | `financial_analysis_model` (e.g. `ALIENTELLIGENCE/financialadvisor`) | Converts verified data → conversational response; also self-summarises long sessions |
 
-Python + pandas sits between them and performs all actual calculations — neither model touches raw numbers directly.
+Python + pandas sits between them and performs all actual calculations — neither model touches raw numbers directly.  There is no separate memory model: the finance advisor summarises its own older turns via a different prompt on the same model, so the base setup only needs two models installed.
 
 ---
 
@@ -26,24 +25,22 @@ sequenceDiagram
     actor User
     participant UI as React UI
     participant API as FastAPI Backend
-    participant Cache as _SESSION_CACHE
+    participant Cache as chat session cache (deps.py)
     participant DB as chat_sessions (SQLite)
     participant State as ConversationState
     participant Parser as Intent Parser (primary_model)
     participant Pandas as Python / Pandas
     participant Finance as Finance Advisor (financial_analysis_model)
-    participant Memory as Memory Manager (memory_model)
 
     User->>UI: Types message
     UI->>API: POST /api/chat  { message, session_id? }
-    API->>Cache: get_or_create_assistant(session_id)
+    API->>Cache: get_or_create_chat_session(session_id)
     alt Cache hit
         Cache-->>API: Live ChatbotAssistant (ConversationState intact)
     else Cache miss
         DB-->>API: load_session(session_id) → messages + conv_state JSON
         API->>State: ConversationState.from_dict(conv_state)
     end
-    API->>DB: load_session → full message history
     API->>Parser: message + last 4 turns + today's date
     Note over Parser: temp=0.0 · max 400 tokens<br/>Returns JSON: type, period,<br/>category, action, goal_amount ...
     Parser-->>API: Structured intent JSON
@@ -51,16 +48,16 @@ sequenceDiagram
     API->>Pandas: Filter DataFrames + compute facts
     Note over Pandas: _calculate_facts_with_pandas()<br/>_calculate_budget_suggestion()<br/>_calculate_savings_plan()
     Pandas-->>API: Verified data block (no LLM arithmetic)
-    API->>Finance: System prompt + data block + last 8 turns + session_summary?
-    Note over Finance: temp=0.7 · max 1200 tokens<br/>session_summary injected when present
+    API->>Finance: System prompt + data block + last 10 turns + session_summary?
+    Note over Finance: temp=0.7 · max 800 tokens<br/>session_summary injected when present
     Finance-->>API: Conversational response
     alt Update request (mark expense / add note)
-        API->>Pandas: _execute_action() — write CSV
+        API->>Pandas: _execute_action() — write DB
         Pandas-->>API: Confirmation message
     end
     alt Session reached SESSION_SUMMARY_THRESHOLD turns
-        API->>Memory: _summarize_session(messages)
-        Memory-->>API: Compact summary paragraph
+        API->>Finance: _summarize_session(messages)  -- same model, summary prompt
+        Finance-->>API: Compact summary paragraph
     end
     API->>DB: save_session(session_id, title, messages, conv_state, summary)
     API-->>UI: response + actions_taken + model_name + session_id
@@ -132,9 +129,9 @@ Every conversation is stored in `chat_sessions` (SQLite DB):
 | `created_at` / `updated_at` | ISO timestamps |
 | `messages` | Full JSON message log `[{role, content}, ...]` |
 | `conv_state` | Serialised `ConversationState` JSON |
-| `summary` | Hermes-generated compact context (null until session grows long) |
+| `summary` | Finance-model-generated compact context (null until session grows long) |
 
-A module-level `_SESSION_CACHE: Dict[str, ChatbotAssistant]` keeps live instances
+A process-level cache in [`src/ui/backend/deps.py`](/src/ui/backend/deps.py) keeps live `ChatbotAssistant` instances
 in memory so hot sessions never pay a DB round-trip or model config reload.
 
 ### Session endpoints
@@ -148,23 +145,24 @@ in memory so hot sessions never pay a DB round-trip or model config reload.
 
 ---
 
-## Memory Management (Hermes)
+## Long-Session Summarisation
 
-When a session reaches `SESSION_SUMMARY_THRESHOLD = 20` assistant turns the
-`memory_model` (e.g. `hermes3`) is asked to compress older turns:
+When a session reaches `SESSION_SUMMARY_THRESHOLD = 20` assistant turns, the
+`financial_analysis_model` is asked to compress older turns with a summariser
+prompt:
 
 > "Summarise the following conversation into a single compact paragraph that
 > captures the financial questions asked, the key data points discussed, any goals
 > or budgets mentioned, and the time periods referenced. 3–5 sentences."
 
 The summary is stored in `chat_sessions.summary`.  On subsequent turns it is
-injected into the finance advisor's system prompt as a **Session Memory** block,
+injected into the finance advisor's system prompt as a **Session Summary** block,
 so the advisor retains full context even when the raw message window is trimmed
-to 8 turns.
+to the last 10 messages.  After the first summary, the model re-summarises every
+`SESSION_SUMMARY_REFRESH_INTERVAL = 10` turns so the compressed context stays fresh.
 
-To enable: set `"memory_model": "hermes3"` (or any compatible Ollama model) in
-`config/llm_models.json`.  Leave empty to disable (the advisor uses only the raw
-8-turn window).
+Because the same model does both answers and summaries, only two model installs
+are required for the whole chatbot (primary + finance advisor).
 
 ---
 
@@ -188,8 +186,7 @@ All models are set in `config/llm_models.json`:
 {
   "primary_model": "gemma4:31b",
   "secondary_model": "",
-  "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor",
-  "memory_model": "hermes3"
+  "financial_analysis_model": "ALIENTELLIGENCE/financialadvisor"
 }
 ```
 
@@ -205,7 +202,7 @@ Every chatbot turn writes a debug file to `logs/llm_prompt_debug.txt` inside the
 USER:        how much did i spend on dining last month?
 INTENT:      { "type": "expense_query", "period": "2026-02", "category": "Dining", ... }
 CONV STATE:  period=2026-02  category=Dining  merchant=None
-SESSION SUMMARY (Hermes):   [present when memory model has run]
+SESSION SUMMARY:   [present once conversation crosses SESSION_SUMMARY_THRESHOLD turns]
 PANDAS DATA:
   Period: 2026-02
   Transactions analyzed: 23
