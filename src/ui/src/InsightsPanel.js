@@ -1316,7 +1316,10 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                         {goalMonths.map(m => {
                           const hist = budgetHistory.find(h => h.month === m);
                           const attPct = hist?.attainment_pct;
-                          const good = attPct !== null && attPct >= 90;
+                          const hasAttainment = attPct !== undefined && attPct !== null;
+                          const hasTotalGoal = hist?.total_goal !== undefined && hist?.total_goal !== null;
+                          const hasTotalActual = hist?.total_actual !== undefined && hist?.total_actual !== null;
+                          const good = hasAttainment && attPct >= 90;
                           const isViewing = viewGoalsMonth === m;
                           const isJustCopied = copySuccessMonth === m;
                           return (
@@ -1324,13 +1327,13 @@ function InsightsPanel({ selectedMonth, onMonthChange, subcategories = {}, avail
                             <tr style={{ borderBottom: isViewing ? 'none' : '1px solid #f0f0f0', background: isViewing ? '#f0f9ff' : 'transparent' }}>
                               <td style={{ padding: '8px 12px', fontWeight: 600 }}>{m}</td>
                               <td style={{ padding: '8px 12px', textAlign: 'right', color: '#475569' }}>
-                                {hist?.total_goal !== null ? `$${hist.total_goal.toFixed(2)}` : '—'}
+                                {hasTotalGoal ? `$${hist.total_goal.toFixed(2)}` : '—'}
                               </td>
-                              <td style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 600, color: good ? '#16a34a' : attPct !== null ? '#dc2626' : '#0f172a' }}>
-                                {hist?.total_actual !== null ? `$${hist.total_actual.toFixed(2)}` : '—'}
+                              <td style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 600, color: good ? '#16a34a' : hasAttainment ? '#dc2626' : '#0f172a' }}>
+                                {hasTotalActual ? `$${hist.total_actual.toFixed(2)}` : '—'}
                               </td>
                               <td style={{ padding: '8px 12px', textAlign: 'center' }}>
-                                {attPct !== null
+                                {hasAttainment
                                   ? <span style={{ fontWeight: 700, color: good ? '#16a34a' : '#dc2626' }}>{attPct}%</span>
                                   : <span style={{ color: '#cbd5e1' }}>—</span>
                                 }
